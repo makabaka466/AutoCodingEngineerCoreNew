@@ -92,7 +92,16 @@ D:\python\python.exe -m autocoding_agent.interfaces.cli sessions
 
 ## 对话 UI
 
-在项目根目录快速启动：
+直接双击项目根目录中的 `start.cmd` 即可启动 UI。它会自动调用 PowerShell、绕过脚本执行
+策略，并在启动失败时保留窗口显示错误信息。
+
+也可以在终端运行同一个双击脚本：
+
+```powershell
+.\start.cmd
+```
+
+需要自定义参数时，可以直接调用底层 PowerShell 脚本：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\start.ps1
