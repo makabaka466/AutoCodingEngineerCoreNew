@@ -339,16 +339,14 @@ class SystemSettingsDialog:
     def _build_knowledge_tab(self) -> None:
         tab = self.knowledge_tab
         tab.grid_columnconfigure(0, weight=1)
-        tab.grid_rowconfigure(5, weight=1)
+        tab.grid_rowconfigure(4, weight=1)
         self.knowledge_workspace_var = tk.StringVar(value=self.knowledge_workspace)
         self.knowledge_domain_var = tk.StringVar(value="开发")
         self.knowledge_branch_var = tk.StringVar()
         self.knowledge_new_branch_var = tk.StringVar()
-        self.knowledge_document_var = tk.StringVar()
-        self.knowledge_new_document_var = tk.StringVar()
         self.knowledge_path_var = tk.StringVar()
         self.knowledge_status_var = tk.StringVar()
-        self._loaded_knowledge: tuple[str, str, str] | None = None
+        self._loaded_knowledge: tuple[str, str] | None = None
 
         self.knowledge_status_label = self._status(tab, self.knowledge_status_var, 0)
 
@@ -410,37 +408,10 @@ class SystemSettingsDialog:
         )
         self.knowledge_add_branch_button.grid(row=0, column=6, padx=(8, 0))
 
-        document_row = tk.Frame(tab, bg=CARD)
-        document_row.grid(row=3, column=0, sticky="ew", padx=26, pady=(0, 6))
-        document_row.grid_columnconfigure(3, weight=1)
-        self._inline_row_label(document_row, "MD 文件", 0)
-        self.knowledge_document_combo = ttk.Combobox(
-            document_row,
-            textvariable=self.knowledge_document_var,
-            state="readonly",
-            width=30,
-            font=("Microsoft YaHei UI", 9),
-        )
-        self.knowledge_document_combo.grid(row=0, column=1, padx=(8, 16), ipady=4)
-        self.knowledge_document_combo.bind(
-            "<<ComboboxSelected>>", self._on_knowledge_document_changed
-        )
-        self._inline_row_label(document_row, "新文件", 2)
-        self.knowledge_new_document_entry = self._entry(
-            document_row, self.knowledge_new_document_var
-        )
-        self.knowledge_new_document_entry.grid(
-            row=0, column=3, sticky="ew", padx=(8, 0), ipady=5
-        )
-        self.knowledge_add_document_button = self._button(
-            document_row, "新建 MD", self._add_knowledge_document, PANEL, TEXT
-        )
-        self.knowledge_add_document_button.grid(row=0, column=4, padx=(8, 0))
-
         path_row = tk.Frame(tab, bg=CARD)
-        path_row.grid(row=4, column=0, sticky="ew", padx=26, pady=(0, 6))
+        path_row.grid(row=3, column=0, sticky="ew", padx=26, pady=(0, 6))
         path_row.grid_columnconfigure(1, weight=1)
-        self._inline_row_label(path_row, "保存路径", 0)
+        self._inline_row_label(path_row, "分支文档路径", 0)
         self.knowledge_path_entry = self._entry(path_row, self.knowledge_path_var)
         self.knowledge_path_entry.grid(
             row=0, column=1, sticky="ew", padx=(8, 0), ipady=4
@@ -448,7 +419,7 @@ class SystemSettingsDialog:
         self.knowledge_path_entry.configure(state="readonly", readonlybackground=PANEL)
 
         editor_frame = tk.Frame(tab, bg=CARD)
-        editor_frame.grid(row=5, column=0, sticky="nsew", padx=26, pady=(0, 12))
+        editor_frame.grid(row=4, column=0, sticky="nsew", padx=26, pady=(0, 12))
         editor_frame.grid_columnconfigure(0, weight=1)
         editor_frame.grid_rowconfigure(0, weight=1)
         self.knowledge_editor = tk.Text(
@@ -637,7 +608,6 @@ class SystemSettingsDialog:
         self,
         *,
         preferred_branch: str = "",
-        preferred_document: str = "",
         confirm_discard: bool = False,
     ) -> None:
         if confirm_discard and not self._confirm_discard_knowledge():
@@ -652,48 +622,25 @@ class SystemSettingsDialog:
             if selected_branch not in branches:
                 selected_branch = branches[0] if branches else ""
             self.knowledge_branch_var.set(selected_branch)
-            documents = (
-                self.knowledge_service.list_documents(
-                    workspace, domain, selected_branch
-                )
-                if selected_branch
-                else []
-            )
-            document_names = [item.name for item in documents]
-            self.knowledge_document_combo.configure(values=document_names)
-            selected_document = preferred_document or self.knowledge_document_var.get()
-            if selected_document not in document_names:
-                selected_document = document_names[0] if document_names else ""
-            self.knowledge_document_var.set(selected_document)
-            if selected_document:
-                self._load_knowledge_document()
+            if selected_branch:
+                self._load_knowledge_branch()
             else:
                 self._clear_knowledge_editor()
-                if selected_branch:
-                    branch_path = self.knowledge_service.branch_path(
-                        workspace, domain, selected_branch
-                    )
-                    self.knowledge_path_var.set(str(branch_path))
-                    self._set_knowledge_status("当前分支还没有 Markdown 文件。", MUTED)
-                else:
-                    self.knowledge_path_var.set("")
-                    self._set_knowledge_status("请先添加一个二级分支。", MUTED)
+                self.knowledge_path_var.set("")
+                self._set_knowledge_status("请先添加一个二级分支。", MUTED)
         except Exception as exc:
             self.knowledge_branch_combo.configure(values=[])
-            self.knowledge_document_combo.configure(values=[])
             self.knowledge_branch_var.set("")
-            self.knowledge_document_var.set("")
             self.knowledge_path_var.set("")
             self._clear_knowledge_editor()
             self._set_knowledge_status(f"无法读取 Markdown 配置：{exc}", DANGER)
 
-    def _load_knowledge_document(self) -> None:
+    def _load_knowledge_branch(self) -> None:
         try:
             domain = self._knowledge_domain()
             branch = self.knowledge_branch_var.get()
-            document = self.knowledge_document_var.get()
-            path, content = self.knowledge_service.load_document(
-                self.knowledge_workspace_var.get(), domain, branch, document
+            path, content = self.knowledge_service.load_branch(
+                self.knowledge_workspace_var.get(), domain, branch
             )
         except Exception as exc:
             self._set_knowledge_status(f"无法读取 Markdown：{exc}", DANGER)
@@ -702,8 +649,8 @@ class SystemSettingsDialog:
         self.knowledge_editor.insert("1.0", content)
         self.knowledge_editor.edit_modified(False)
         self.knowledge_path_var.set(str(path))
-        self._loaded_knowledge = (domain.value, branch, document)
-        self._set_knowledge_status("已加载，可直接编辑后保存。", SUCCESS)
+        self._loaded_knowledge = (domain.value, branch)
+        self._set_knowledge_status("已加载该二级分支的唯一文档，可直接编辑。", SUCCESS)
 
     def _clear_knowledge_editor(self) -> None:
         self.knowledge_editor.delete("1.0", "end")
@@ -725,43 +672,18 @@ class SystemSettingsDialog:
             messagebox.showerror("添加分支失败", str(exc), parent=self.window)
             return
         self.knowledge_new_branch_var.set("")
-        self._refresh_knowledge(preferred_branch=path.name)
-        self._set_knowledge_status(f"已添加二级分支：{path.name}", SUCCESS)
-
-    def _add_knowledge_document(self) -> None:
-        if not self._confirm_discard_knowledge():
-            return
-        branch = self.knowledge_branch_var.get()
-        if not branch:
-            messagebox.showinfo("先添加分支", "请先添加或选择一个二级分支。", parent=self.window)
-            return
-        try:
-            path = self.knowledge_service.create_document(
-                self.knowledge_workspace_var.get(),
-                self._knowledge_domain(),
-                branch,
-                self.knowledge_new_document_var.get(),
-            )
-        except WorkspaceKnowledgeError as exc:
-            messagebox.showerror("无法新建 Markdown", str(exc), parent=self.window)
-            return
-        except Exception as exc:
-            messagebox.showerror("新建 Markdown 失败", str(exc), parent=self.window)
-            return
-        self.knowledge_new_document_var.set("")
-        self._refresh_knowledge(
-            preferred_branch=branch,
-            preferred_document=path.name,
+        self._refresh_knowledge(preferred_branch=path.stem)
+        self._set_knowledge_status(
+            f"已添加二级分支 {path.stem}，并创建唯一 Markdown 文档。", SUCCESS
         )
         self.knowledge_editor.focus_set()
 
     def _save_knowledge(self) -> bool:
         try:
-            path = self.knowledge_service.save_document(
+            path = self.knowledge_service.save_branch(
                 self.knowledge_workspace_var.get(),
                 self._knowledge_domain(),
                 self.knowledge_branch_var.get(),
-                self.knowledge_document_var.get(),
                 self.knowledge_editor.get("1.0", "end-1c"),
             )
         except WorkspaceKnowledgeError as exc:
@@ -775,9 +697,8 @@ class SystemSettingsDialog:
         self._loaded_knowledge = (
             self._knowledge_domain().value,
             self.knowledge_branch_var.get(),
-            self.knowledge_document_var.get(),
         )
-        self._set_knowledge_status("Markdown 已保存，能力索引已更新。", SUCCESS)
+        self._set_knowledge_status("分支 Markdown 已保存，能力索引已更新。", SUCCESS)
         return True
 
     def _browse_knowledge_workspace(self) -> None:
@@ -794,24 +715,16 @@ class SystemSettingsDialog:
         if selected:
             self.knowledge_workspace_var.set(str(Path(selected).resolve()))
             self.knowledge_branch_var.set("")
-            self.knowledge_document_var.set("")
             self._refresh_knowledge()
 
     def _on_knowledge_domain_changed(self, _event: tk.Event[tk.Misc]) -> None:
         self._refresh_knowledge(confirm_discard=True)
 
     def _on_knowledge_branch_changed(self, _event: tk.Event[tk.Misc]) -> None:
-        self.knowledge_document_var.set("")
         self._refresh_knowledge(
             preferred_branch=self.knowledge_branch_var.get(),
             confirm_discard=True,
         )
-
-    def _on_knowledge_document_changed(self, _event: tk.Event[tk.Misc]) -> None:
-        if not self._confirm_discard_knowledge():
-            self._restore_loaded_knowledge_selection()
-            return
-        self._load_knowledge_document()
 
     def _on_knowledge_modified(self, _event: tk.Event[tk.Misc]) -> None:
         if self.knowledge_editor.edit_modified():
@@ -829,10 +742,9 @@ class SystemSettingsDialog:
     def _restore_loaded_knowledge_selection(self) -> None:
         if self._loaded_knowledge is None:
             return
-        domain, branch, document = self._loaded_knowledge
+        domain, branch = self._loaded_knowledge
         self.knowledge_domain_var.set("异常处理" if domain == "incident" else "开发")
         self.knowledge_branch_var.set(branch)
-        self.knowledge_document_var.set(document)
 
     def _set_knowledge_status(self, message: str, color: str) -> None:
         self.knowledge_status_var.set(message)
