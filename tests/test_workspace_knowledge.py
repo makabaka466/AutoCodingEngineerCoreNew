@@ -37,13 +37,13 @@ def test_markdown_knowledge_is_separate_by_domain_and_branch(tmp_path: Path) -> 
     ]
     assert service.list_branches(workspace, KnowledgeDomain.INCIDENT) == ["生物"]
     development_index = (
-        development_document.parent.parent / "CAPABILITIES.md"
+        development_document.parents[2] / "CAPABILITIES.md"
     ).read_text(encoding="utf-8")
-    incident_index = (incident_document.parent.parent / "CAPABILITIES.md").read_text(
+    incident_index = (incident_document.parents[2] / "CAPABILITIES.md").read_text(
         encoding="utf-8"
     )
-    assert "pinned/生物.md" in development_index
-    assert "pinned/生物.md" in incident_index
+    assert "pinned/生物/生物.md" in development_index
+    assert "pinned/生物/生物.md" in incident_index
     assert development_document != incident_document
 
 
@@ -60,26 +60,23 @@ def test_markdown_knowledge_rejects_unsafe_branch_names(
         service.create_branch(workspace, KnowledgeDomain.DEVELOPMENT, unsafe)
 
 
-def test_legacy_branch_directory_collapses_to_one_branch_document(tmp_path: Path) -> None:
+def test_flat_branch_document_moves_into_its_named_secondary_path(tmp_path: Path) -> None:
     workspace = tmp_path / "project"
     workspace.mkdir()
     service = MarkdownKnowledgeService(tmp_path / "state")
     pinned = service.refresh_index(workspace, KnowledgeDomain.DEVELOPMENT) / "pinned"
-    legacy_directory = pinned / "生物"
-    legacy_directory.mkdir()
-    legacy = legacy_directory / "project-guide.md"
+    legacy = pinned / "生物.md"
     legacy.write_text("# Legacy guide\n", encoding="utf-8")
 
-    moved = service.migrate_directory_branch(
+    moved = service.migrate_flat_branch(
         workspace,
         KnowledgeDomain.DEVELOPMENT,
         "生物",
     )
 
-    assert moved == pinned / "生物.md"
+    assert moved == pinned / "生物" / "生物.md"
     assert not legacy.exists()
-    assert not legacy_directory.exists()
     assert "# Legacy guide" in moved.read_text(encoding="utf-8")
-    assert "pinned/生物.md" in (
+    assert "pinned/生物/生物.md" in (
         pinned.parent / "CAPABILITIES.md"
     ).read_text(encoding="utf-8")

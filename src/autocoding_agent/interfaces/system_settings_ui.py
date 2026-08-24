@@ -339,8 +339,7 @@ class SystemSettingsDialog:
     def _build_knowledge_tab(self) -> None:
         tab = self.knowledge_tab
         tab.grid_columnconfigure(0, weight=1)
-        tab.grid_rowconfigure(4, weight=1)
-        self.knowledge_workspace_var = tk.StringVar(value=self.knowledge_workspace)
+        tab.grid_rowconfigure(3, weight=1)
         self.knowledge_domain_var = tk.StringVar(value="开发")
         self.knowledge_branch_var = tk.StringVar()
         self.knowledge_new_branch_var = tk.StringVar()
@@ -350,26 +349,8 @@ class SystemSettingsDialog:
 
         self.knowledge_status_label = self._status(tab, self.knowledge_status_var, 0)
 
-        workspace_row = tk.Frame(tab, bg=CARD)
-        workspace_row.grid(row=1, column=0, sticky="ew", padx=26, pady=(2, 6))
-        workspace_row.grid_columnconfigure(1, weight=1)
-        self._inline_row_label(workspace_row, "项目路径", 0)
-        self.knowledge_workspace_entry = self._entry(
-            workspace_row, self.knowledge_workspace_var
-        )
-        self.knowledge_workspace_entry.grid(
-            row=0, column=1, sticky="ew", padx=(10, 8), ipady=5
-        )
-        self.knowledge_workspace_entry.configure(
-            state="readonly", readonlybackground="#FFFFFF"
-        )
-        self.knowledge_workspace_button = self._button(
-            workspace_row, "切换…", self._browse_knowledge_workspace, PANEL, TEXT
-        )
-        self.knowledge_workspace_button.grid(row=0, column=2)
-
         branch_row = tk.Frame(tab, bg=CARD)
-        branch_row.grid(row=2, column=0, sticky="ew", padx=26, pady=(0, 6))
+        branch_row.grid(row=1, column=0, sticky="ew", padx=26, pady=(2, 8))
         branch_row.grid_columnconfigure(5, weight=1)
         self._inline_row_label(branch_row, "流程", 0)
         self.knowledge_domain_combo = ttk.Combobox(
@@ -384,7 +365,7 @@ class SystemSettingsDialog:
         self.knowledge_domain_combo.bind(
             "<<ComboboxSelected>>", self._on_knowledge_domain_changed
         )
-        self._inline_row_label(branch_row, "二级分支", 2)
+        self._inline_row_label(branch_row, "二级路径", 2)
         self.knowledge_branch_combo = ttk.Combobox(
             branch_row,
             textvariable=self.knowledge_branch_var,
@@ -396,7 +377,7 @@ class SystemSettingsDialog:
         self.knowledge_branch_combo.bind(
             "<<ComboboxSelected>>", self._on_knowledge_branch_changed
         )
-        self._inline_row_label(branch_row, "新分支", 4)
+        self._inline_row_label(branch_row, "新增路径名", 4)
         self.knowledge_new_branch_entry = self._entry(
             branch_row, self.knowledge_new_branch_var
         )
@@ -404,14 +385,14 @@ class SystemSettingsDialog:
             row=0, column=5, sticky="ew", padx=(8, 0), ipady=5
         )
         self.knowledge_add_branch_button = self._button(
-            branch_row, "添加分支", self._add_knowledge_branch, PANEL, TEXT
+            branch_row, "添加", self._add_knowledge_branch, PANEL, TEXT
         )
         self.knowledge_add_branch_button.grid(row=0, column=6, padx=(8, 0))
 
         path_row = tk.Frame(tab, bg=CARD)
-        path_row.grid(row=3, column=0, sticky="ew", padx=26, pady=(0, 6))
+        path_row.grid(row=2, column=0, sticky="ew", padx=26, pady=(0, 6))
         path_row.grid_columnconfigure(1, weight=1)
-        self._inline_row_label(path_row, "分支文档路径", 0)
+        self._inline_row_label(path_row, "MD 文档路径", 0)
         self.knowledge_path_entry = self._entry(path_row, self.knowledge_path_var)
         self.knowledge_path_entry.grid(
             row=0, column=1, sticky="ew", padx=(8, 0), ipady=4
@@ -419,7 +400,7 @@ class SystemSettingsDialog:
         self.knowledge_path_entry.configure(state="readonly", readonlybackground=PANEL)
 
         editor_frame = tk.Frame(tab, bg=CARD)
-        editor_frame.grid(row=4, column=0, sticky="nsew", padx=26, pady=(0, 12))
+        editor_frame.grid(row=3, column=0, sticky="nsew", padx=26, pady=(0, 12))
         editor_frame.grid_columnconfigure(0, weight=1)
         editor_frame.grid_rowconfigure(0, weight=1)
         self.knowledge_editor = tk.Text(
@@ -614,7 +595,7 @@ class SystemSettingsDialog:
             self._restore_loaded_knowledge_selection()
             return
         try:
-            workspace = self.knowledge_workspace_var.get()
+            workspace = self.knowledge_workspace
             domain = self._knowledge_domain()
             branches = self.knowledge_service.list_branches(workspace, domain)
             self.knowledge_branch_combo.configure(values=branches)
@@ -640,7 +621,7 @@ class SystemSettingsDialog:
             domain = self._knowledge_domain()
             branch = self.knowledge_branch_var.get()
             path, content = self.knowledge_service.load_branch(
-                self.knowledge_workspace_var.get(), domain, branch
+                self.knowledge_workspace, domain, branch
             )
         except Exception as exc:
             self._set_knowledge_status(f"无法读取 Markdown：{exc}", DANGER)
@@ -663,7 +644,7 @@ class SystemSettingsDialog:
         name = self.knowledge_new_branch_var.get()
         try:
             path = self.knowledge_service.create_branch(
-                self.knowledge_workspace_var.get(), self._knowledge_domain(), name
+                self.knowledge_workspace, self._knowledge_domain(), name
             )
         except WorkspaceKnowledgeError as exc:
             messagebox.showerror("无法添加二级分支", str(exc), parent=self.window)
@@ -681,7 +662,7 @@ class SystemSettingsDialog:
     def _save_knowledge(self) -> bool:
         try:
             path = self.knowledge_service.save_branch(
-                self.knowledge_workspace_var.get(),
+                self.knowledge_workspace,
                 self._knowledge_domain(),
                 self.knowledge_branch_var.get(),
                 self.knowledge_editor.get("1.0", "end-1c"),
@@ -700,22 +681,6 @@ class SystemSettingsDialog:
         )
         self._set_knowledge_status("分支 Markdown 已保存，能力索引已更新。", SUCCESS)
         return True
-
-    def _browse_knowledge_workspace(self) -> None:
-        if not self._confirm_discard_knowledge():
-            return
-        current = Path(self.knowledge_workspace_var.get()).expanduser()
-        initial = str(current if current.is_dir() else Path.cwd())
-        selected = filedialog.askdirectory(
-            title="选择 Markdown 所属项目",
-            initialdir=initial,
-            mustexist=True,
-            parent=self.window,
-        )
-        if selected:
-            self.knowledge_workspace_var.set(str(Path(selected).resolve()))
-            self.knowledge_branch_var.set("")
-            self._refresh_knowledge()
 
     def _on_knowledge_domain_changed(self, _event: tk.Event[tk.Misc]) -> None:
         self._refresh_knowledge(confirm_discard=True)

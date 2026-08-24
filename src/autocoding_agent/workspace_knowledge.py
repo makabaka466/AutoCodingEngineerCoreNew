@@ -37,7 +37,11 @@ class MarkdownKnowledgeService:
         if not root.is_dir():
             return []
         return sorted(
-            (item.stem for item in root.glob("*.md") if item.is_file()),
+            (
+                item.name
+                for item in root.iterdir()
+                if item.is_dir() and (item / f"{item.name}.md").is_file()
+            ),
             key=str.casefold,
         )
 
@@ -48,9 +52,9 @@ class MarkdownKnowledgeService:
         name: str,
     ) -> Path:
         path = self.branch_path(workspace, domain, name)
-        if path.exists():
+        if path.parent.exists():
             raise WorkspaceKnowledgeError(f"二级分支已经存在：{path.stem}")
-        path.parent.mkdir(parents=True, exist_ok=True)
+        path.parent.mkdir(parents=True)
         self._atomic_text(path, f"# {path.stem}\n\n")
         self.refresh_index(workspace, domain)
         return path
@@ -62,7 +66,11 @@ class MarkdownKnowledgeService:
         branch: str,
     ) -> Path:
         root = self._pinned_root(workspace, domain)
-        return root / f"{_safe_segment(branch, '二级分支')}.md"
+        cleaned = _safe_segment(branch, "二级分支")
+        directory = (root / cleaned).resolve()
+        if not directory.is_relative_to(root.resolve()):
+            raise WorkspaceKnowledgeError("二级路径超出能力目录。")
+        return directory / f"{cleaned}.md"
 
     def load_branch(
         self,
@@ -91,31 +99,24 @@ class MarkdownKnowledgeService:
         self.refresh_index(workspace, domain)
         return path
 
-    def migrate_directory_branch(
+    def migrate_flat_branch(
         self,
         workspace: str | Path,
         domain: KnowledgeDomain,
         branch: str,
     ) -> Path:
-        """Collapse legacy pinned/<branch>/*.md into pinned/<branch>.md."""
+        """Move legacy pinned/<branch>.md into pinned/<branch>/<branch>.md."""
 
         target = self.branch_path(workspace, domain, branch)
         if target.exists():
             return target
-        legacy_directory = self._pinned_root(workspace, domain) / _safe_segment(
-            branch, "二级分支"
+        source = self._pinned_root(workspace, domain) / (
+            f"{_safe_segment(branch, '二级分支')}.md"
         )
-        sources = sorted(legacy_directory.glob("*.md"))
-        if len(sources) != 1:
-            raise WorkspaceKnowledgeError(
-                f"旧分支 {branch} 应当包含且仅包含一份 Markdown，实际为 {len(sources)} 份。"
-            )
-        target.parent.mkdir(parents=True, exist_ok=True)
-        sources[0].replace(target)
-        try:
-            legacy_directory.rmdir()
-        except OSError:
-            pass
+        if not source.is_file():
+            raise WorkspaceKnowledgeError(f"旧分支文档不存在：{source}")
+        target.parent.mkdir(parents=True)
+        source.replace(target)
         self.refresh_index(workspace, domain)
         return target
 

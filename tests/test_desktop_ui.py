@@ -415,8 +415,11 @@ def test_system_settings_combines_model_and_shared_database_without_revealing_se
     dialog._sync_footer_actions()
     root.update_idletasks()
     assert dialog.knowledge_save_button.winfo_manager() == "pack"
+    assert not hasattr(dialog, "knowledge_workspace_entry")
     assert dialog.knowledge_branch_var.get() == "生物"
-    assert dialog.knowledge_path_var.get().endswith("development\\pinned\\生物.md")
+    assert dialog.knowledge_path_var.get().endswith(
+        "development\\pinned\\生物\\生物.md"
+    )
     dialog.knowledge_editor.delete("1.0", "end")
     dialog.knowledge_editor.insert("1.0", "# Updated guide\n")
     assert dialog._save_knowledge() is True
@@ -428,7 +431,9 @@ def test_system_settings_combines_model_and_shared_database_without_revealing_se
     dialog.knowledge_new_branch_var.set("生物")
     dialog._add_knowledge_branch()
     assert dialog.knowledge_branch_var.get() == "生物"
-    assert dialog.knowledge_path_var.get().endswith("incident\\pinned\\生物.md")
+    assert dialog.knowledge_path_var.get().endswith(
+        "incident\\pinned\\生物\\生物.md"
+    )
     dialog._close()
 
 

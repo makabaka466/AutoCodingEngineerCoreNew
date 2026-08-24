@@ -36,9 +36,9 @@
 
 能力记忆不会暗中修改目标仓库，也不会覆盖项目已有的 `CLAUDE.md`。开发与异常维护分别写入
 `~/.autocoding-agent/workspaces/<workspace-id>/development/` 和 `incident/`，各自维护独立的
-`CAPABILITIES.md`、`pinned/<二级分支>.md` 基础知识、任务记录和能力文档，避免两类经验
-互相污染。系统配置中的“MD 能力配置”可切换开发/异常处理并添加二级分支；每个二级分支
-唯一对应一份可编辑 Markdown，并显示该文档的真实本地路径。
+`CAPABILITIES.md`、`pinned/<二级路径>/<二级路径名>.md` 基础知识、任务记录和能力文档，避免
+两类经验互相污染。系统配置中的“MD 能力配置”可切换开发/异常处理并添加二级路径；每个
+二级路径唯一对应一份同名、可编辑的 Markdown，并显示该文档的真实本地路径。
 
 ## 异常处理流程（首版框架）
 
@@ -76,7 +76,7 @@ D:\python\python.exe -m pip install -e ".[dev,ui]"
 API 地址、模型名或 API Key 任一项未就绪，会先显示“系统配置”。同一个窗口包含“模型与
 Claude Code”“SQL Server”“MD 能力配置”三个页签：模型页支持自动检测和手动选择
 `claude.exe`；数据库页可以测试、保存和随时更换两套流程共用的只读连接；MD 页按工作区、
-流程和二级分支管理可编辑知识，每个二级分支就是一份 Markdown。API Key 与数据库密码都不会回填显示。
+流程和二级路径管理可编辑知识，点击添加会创建路径及其同名 Markdown。API Key 与数据库密码都不会回填显示。
 
 当前默认值适用于 DeepSeek Anthropic 兼容接口：
 
