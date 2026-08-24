@@ -1,6 +1,6 @@
 # AutoCoding Engineer 接口与数据契约
 
-本文记录当前 `0.3.0` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
+本文记录当前 `0.3.1` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
 Runtime、持久化和状态契约。
 设计动机和运行流程见[架构说明](ARCHITECTURE.md)。
 
@@ -395,6 +395,8 @@ JSON 内容是 `AgentSession.model_dump(mode="json")` 的完整结果。
 开发 `CapabilityStore` 与异常 `IncidentCapabilityStore` 当前由各自 Engine 直接调用，没有单独
 Protocol。两者根目录分别是
 `<data_dir>/workspaces/<workspace-id>/development/` 与 `incident/`。
+每个领域目录可包含 `pinned/*.md` 用户基础知识；`prepare()` 会把这些文档链接写入本领域索引，
+并保证开发与异常内容互不混用。
 
 ```python
 prepare(workspace: str | Path) -> Path
@@ -513,7 +515,7 @@ autocoding-agent-client
 - 顶部胶囊式“开发 / 异常处理”选择器，蓝底表示当前流程；
 - 两套流程各自的当前 session、最近会话、欢迎提示、状态和结果渲染；
 - 白色浅色主题，输入框上方的项目路径选择，以及左侧最近会话；
-- 异常模式下的页面线索、共用 SQL Server 连接状态和“配置连接”入口；
+- 异常模式下只额外显示页面线索；SQL Server 不重复占用输入区，统一从“系统配置”管理；
 - 统一系统配置和本地滚动日志目录快捷入口；
 - 新任务、持久化聊天记录及同一 session 的多轮补充；
 - `approval_required` 的完整修改方案、当前/目标状态、影响、验证计划、预览，以及批准或调整；

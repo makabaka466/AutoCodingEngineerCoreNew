@@ -30,9 +30,9 @@ class CapabilityStore:
         directory = self._workspace_dir(workspace)
         self._migrate_legacy(directory)
         (directory / "capabilities").mkdir(parents=True, exist_ok=True)
+        (directory / "pinned").mkdir(parents=True, exist_ok=True)
         (directory / "tasks").mkdir(parents=True, exist_ok=True)
-        if not (directory / "CAPABILITIES.md").exists():
-            self._rebuild_index(directory)
+        self._rebuild_index(directory)
         return directory
 
     def record(
@@ -174,6 +174,7 @@ completed_at: {json.dumps(session.updated_at.isoformat())}
 """
 
     def _rebuild_index(self, directory: Path) -> None:
+        pinned = pinned_markdown_entries(directory)
         entries: list[str] = []
         for record_file in sorted((directory / "tasks").glob("*.json")):
             record = json.loads(record_file.read_text(encoding="utf-8"))
@@ -186,6 +187,14 @@ completed_at: {json.dumps(session.updated_at.isoformat())}
 
 This index contains historical, model-distilled guidance for this workspace. It may be stale. Read
 only entries relevant to the current task and verify them against current repository evidence.
+
+## 固定工作区知识
+
+"""
+            + ("\n".join(pinned) if pinned else "No pinned workspace guidance yet.")
+            + """
+
+## 已完成开发任务
 
 """
             + ("\n".join(entries) if entries else "No completed-task capabilities yet.")
@@ -205,6 +214,17 @@ def _markdown_title(content: str) -> str:
         if line.startswith("# "):
             return line[2:].strip()
     return "Untitled capability"
+
+
+def pinned_markdown_entries(directory: Path) -> list[str]:
+    """Return stable links for user-maintained workspace guidance."""
+
+    entries: list[str] = []
+    for document in sorted((directory / "pinned").glob("*.md")):
+        title = _markdown_title(document.read_text(encoding="utf-8"))
+        relative = document.relative_to(directory).as_posix()
+        entries.append(f"- [{title}]({relative}) — 用户维护的当前工作区基础知识。")
+    return entries
 
 
 def sanitize_text(value: str, workspace: str) -> str:

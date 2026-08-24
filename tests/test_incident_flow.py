@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from autocoding_agent.adapters.capability_store import CapabilityStore
 from autocoding_agent.adapters.json_incident_store import JsonIncidentStore
 from autocoding_agent.adapters.sqlite_database import (
     ReadOnlyQueryError,
@@ -68,6 +69,32 @@ def _page() -> LocatedPage:
         related_paths=["src/api/orders.py"],
         explanation="The route and request handler match the report.",
     )
+
+
+def test_pinned_workspace_guidance_stays_separate_by_flow(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    state = tmp_path / "data"
+    development = CapabilityStore(state)
+    incident = IncidentCapabilityStore(state)
+    development_dir = development.prepare(workspace)
+    incident_dir = incident.prepare(workspace)
+    (development_dir / "pinned" / "project.md").write_text(
+        "# Development project guide\n", encoding="utf-8"
+    )
+    (incident_dir / "pinned" / "project.md").write_text(
+        "# Incident project guide\n", encoding="utf-8"
+    )
+
+    development.prepare(workspace)
+    incident.prepare(workspace)
+
+    development_index = (development_dir / "CAPABILITIES.md").read_text(encoding="utf-8")
+    incident_index = (incident_dir / "CAPABILITIES.md").read_text(encoding="utf-8")
+    assert "[Development project guide](pinned/project.md)" in development_index
+    assert "Incident project guide" not in development_index
+    assert "[Incident project guide](pinned/project.md)" in incident_index
+    assert "Development project guide" not in incident_index
 
 
 def test_incident_flow_locates_page_queries_data_and_diagnoses(tmp_path: Path) -> None:

@@ -9,6 +9,7 @@ from typing import Any
 
 from autocoding_agent.adapters.capability_store import (
     CapabilityReceipt,
+    pinned_markdown_entries,
     sanitize_text,
 )
 from autocoding_agent.incident.models import IncidentDecision, IncidentSession
@@ -23,9 +24,9 @@ class IncidentCapabilityStore:
     def prepare(self, workspace: str | Path) -> Path:
         directory = self._workspace_dir(workspace)
         (directory / "capabilities").mkdir(parents=True, exist_ok=True)
+        (directory / "pinned").mkdir(parents=True, exist_ok=True)
         (directory / "tasks").mkdir(parents=True, exist_ok=True)
-        if not (directory / "CAPABILITIES.md").exists():
-            self._rebuild_index(directory)
+        self._rebuild_index(directory)
         return directory
 
     def record(
@@ -150,6 +151,7 @@ completed_at: {json.dumps(session.updated_at.isoformat())}
 """
 
     def _rebuild_index(self, directory: Path) -> None:
+        pinned = pinned_markdown_entries(directory)
         entries: list[str] = []
         for record_file in sorted((directory / "tasks").glob("*.json")):
             record = json.loads(record_file.read_text(encoding="utf-8"))
@@ -169,6 +171,14 @@ completed_at: {json.dumps(session.updated_at.isoformat())}
 
 This index contains historical diagnostic guidance for this workspace. It may be stale. Read only
 entries relevant to the current incident and verify them against current code and authorized data.
+
+## 固定工作区知识
+
+"""
+            + ("\n".join(pinned) if pinned else "No pinned workspace guidance yet.")
+            + """
+
+## 已完成异常诊断
 
 """
             + ("\n".join(entries) if entries else "No completed-incident capabilities yet.")

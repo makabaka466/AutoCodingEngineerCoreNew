@@ -285,9 +285,6 @@ class DesktopClient:
 
         self.workspace_var = tk.StringVar(value=str(Path.cwd()))
         self.page_hint_var = tk.StringVar()
-        self.database_var = tk.StringVar(
-            value=self._active_incident_database_reference or "未配置 SQL Server"
-        )
         self.status_var = tk.StringVar(value="就绪")
         self.task_title_var = tk.StringVar(value="新开发任务")
 
@@ -649,38 +646,7 @@ class DesktopClient:
             highlightbackground=COLORS["border"],
             highlightcolor=COLORS["accent"],
         )
-        self.page_hint_entry.grid(row=0, column=1, columnspan=2, sticky="ew", ipady=6, pady=(0, 4))
-        tk.Label(
-            self.incident_context_frame,
-            text="SQL Server",
-            font=("Microsoft YaHei UI", 8, "bold"),
-            fg=COLORS["muted"],
-            bg=COLORS["input"],
-        ).grid(row=1, column=0, sticky="w", padx=(0, 9))
-        self.database_entry = tk.Entry(
-            self.incident_context_frame,
-            textvariable=self.database_var,
-            font=("Microsoft YaHei UI", 9),
-            fg=COLORS["text"],
-            bg=COLORS["panel"],
-            insertbackground=COLORS["text"],
-            selectbackground="#BFDBFE",
-            relief="flat",
-            highlightthickness=1,
-            highlightbackground=COLORS["border"],
-            highlightcolor=COLORS["accent"],
-            state="readonly",
-            readonlybackground=COLORS["panel"],
-        )
-        self.database_entry.grid(row=1, column=1, sticky="ew", ipady=6)
-        self.database_browse_button = self._button(
-            self.incident_context_frame,
-            "配置连接…",
-            lambda: self._open_system_settings("database"),
-            background=COLORS["panel"],
-            active_background=COLORS["panel_hover"],
-        )
-        self.database_browse_button.grid(row=1, column=2, padx=(8, 0), sticky="ns")
+        self.page_hint_entry.grid(row=0, column=1, sticky="ew", ipady=6)
 
         self.prompt_input = tk.Text(
             self.composer_frame,
@@ -837,8 +803,8 @@ class DesktopClient:
             self.task_title_var.set("新异常诊断")
             message = (
                 "你好，我会协助定位和诊断应用异常。\n\n"
-                "请填写项目路径，尽量提供异常页面、路由或标题；如需查询业务数据，请配置 "
-                "SQL Server 只读连接。当前流程只读取代码和数据，不会修改文件或数据库。"
+                "请填写项目路径，尽量提供异常页面、路由或标题。需要业务数据时会使用系统"
+                "配置中的共用只读连接；当前流程不会修改文件或数据库。"
             )
         else:
             self.task_title_var.set("新开发任务")
@@ -958,11 +924,6 @@ class DesktopClient:
         self._replace_transcript(entries)
         self.workspace_var.set(session.workspace)
         self.page_hint_var.set(session.page_hint or "")
-        database_reference = getattr(session, "database_reference", None)
-        if database_reference:
-            self.database_var.set(database_reference)
-        else:
-            self.database_var.set("未配置 SQL Server")
         title = " ".join(session.problem.split()) or "未命名异常"
         self.task_title_var.set(title[:64] + ("…" if len(title) > 64 else ""))
         self._hide_approval()
@@ -1165,8 +1126,6 @@ class DesktopClient:
         reader = self.sqlserver_service.reader()
         reference = reader.reference if reader is not None else None
         self._active_incident_database_reference = reference
-        if hasattr(self, "database_var"):
-            self.database_var.set(reference or "未配置 SQL Server")
         return build_incident_application(
             database=reader,
             database_reference=reference,
@@ -1380,16 +1339,6 @@ class DesktopClient:
             else "disabled"
         )
         self.page_hint_entry.configure(state=incident_input_state)
-        self.database_entry.configure(
-            state="readonly" if incident_input_state == "normal" else "disabled"
-        )
-        self.database_browse_button.configure(
-            state=(
-                "normal"
-                if not self._busy and self.flow == FlowKind.INCIDENT
-                else "disabled"
-            )
-        )
         self.prompt_input.configure(state="normal" if can_send else "disabled")
         self.send_button.configure(state="normal" if can_send else "disabled")
         self.approve_button.configure(

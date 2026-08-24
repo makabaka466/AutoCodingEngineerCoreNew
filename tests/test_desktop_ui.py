@@ -438,7 +438,8 @@ def test_flow_selector_shows_active_flow_and_reveals_incident_fields(
     assert client.incident_context_frame.winfo_manager() == "grid"
     assert "异常诊断" in client.new_task_button.cget("text")
     assert client.task_title_var.get() == "新异常诊断"
-    assert "配置连接" in client.database_browse_button.cget("text")
+    assert client.page_hint_entry.winfo_manager() == "grid"
+    assert not hasattr(client, "database_browse_button")
 
 
 def test_incident_flow_routes_problem_and_page_to_incident_application(
