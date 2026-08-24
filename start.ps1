@@ -1,8 +1,10 @@
 param(
     [ValidateRange(1, 65535)]
     [int]$Port = 8501,
+    [switch]$Web,
     [switch]$NoBrowser,
-    [switch]$ForceInstall
+    [switch]$ForceInstall,
+    [switch]$Wait
 )
 
 $ErrorActionPreference = "Stop"
@@ -58,20 +60,57 @@ else {
 
 Push-Location $projectRoot
 try {
-    & $pythonExe -c "import autocoding_agent, streamlit" 2>$null
+    if ($Web) {
+        & $pythonExe -c "import autocoding_agent, keyring, pyodbc, streamlit" 2>$null
+    }
+    else {
+        & $pythonExe -c "import autocoding_agent, keyring, pyodbc, tkinter" 2>$null
+    }
     $dependenciesReady = $LASTEXITCODE -eq 0
     if ($ForceInstall -or -not $dependenciesReady) {
-        Write-Host "Installing the project and UI dependencies..." -ForegroundColor Cyan
-        & $pythonExe -m pip install -e ".[ui]"
+        if ($Web) {
+            $installTarget = ".[ui]"
+        }
+        else {
+            $installTarget = "."
+        }
+        Write-Host "Installing AutoCoding Engineer dependencies..." -ForegroundColor Cyan
+        & $pythonExe -m pip install -e $installTarget
         if ($LASTEXITCODE -ne 0) {
             throw "Project dependency installation failed."
         }
     }
 
-    $hasAuthToken = -not [string]::IsNullOrWhiteSpace($env:ANTHROPIC_AUTH_TOKEN)
-    $hasApiKey = -not [string]::IsNullOrWhiteSpace($env:ANTHROPIC_API_KEY)
-    if (-not $hasAuthToken -and -not $hasApiKey) {
-        Write-Warning "No model API key was detected. Run scripts\configure_deepseek.ps1 before submitting a task."
+    if (-not $Web) {
+        & $pythonExe -c "import tkinter; from autocoding_agent.interfaces.desktop_ui import main" 2>$null
+        if ($LASTEXITCODE -ne 0) {
+            throw "The desktop client could not be loaded. Ensure this Python installation includes tkinter."
+        }
+    }
+
+    if (-not $Web) {
+        Write-Host "Starting the AutoCoding Engineer desktop client..." -ForegroundColor Green
+        if ($Wait) {
+            & $pythonExe -m autocoding_agent.interfaces.desktop_ui
+            exit $LASTEXITCODE
+        }
+
+        $pythonwExe = Join-Path (Split-Path -Parent $pythonExe) "pythonw.exe"
+        if (-not (Test-Path -LiteralPath $pythonwExe -PathType Leaf)) {
+            $pythonwExe = $pythonExe
+        }
+        $clientProcess = Start-Process `
+            -FilePath $pythonwExe `
+            -ArgumentList @("-m", "autocoding_agent.interfaces.desktop_ui") `
+            -WorkingDirectory $projectRoot `
+            -WindowStyle Normal `
+            -PassThru
+        Start-Sleep -Milliseconds 800
+        if ($clientProcess.HasExited -and $clientProcess.ExitCode -ne 0) {
+            throw "The desktop client exited during startup with code $($clientProcess.ExitCode)."
+        }
+        Write-Host "Desktop client started (PID $($clientProcess.Id))."
+        exit 0
     }
 
     $uiFile = Join-Path $projectRoot "src\autocoding_agent\interfaces\streamlit_ui.py"
@@ -89,8 +128,8 @@ try {
         $streamlitArgs += @("--server.headless", "true")
     }
 
-    Write-Host "Starting AutoCoding Engineer: http://localhost:$Port" -ForegroundColor Green
-    Write-Host "Press Ctrl+C to stop the service."
+    Write-Host "Starting the optional Web UI: http://localhost:$Port" -ForegroundColor Green
+    Write-Host "Press Ctrl+C to stop the Web service."
     & $pythonExe @streamlitArgs
     exit $LASTEXITCODE
 }

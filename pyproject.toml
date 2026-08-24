@@ -4,14 +4,22 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "auto-coding-engineer-core-new"
-version = "0.2.1"
+version = "0.3.0"
 description = "A platform-independent software-development agent powered by Claude Code."
 requires-python = ">=3.12"
-dependencies = ["pydantic>=2.8,<3", "pydantic-settings>=2.3,<3", "typer>=0.16,<1"]
+dependencies = [
+    "keyring>=25,<27",
+    "pydantic>=2.8,<3",
+    "pydantic-settings>=2.3,<3",
+    "pyodbc>=5.3,<6",
+    "typer>=0.16,<1",
+]
 
 [project.scripts]
 autocoding-agent = "autocoding_agent.interfaces.cli:app"
+autocoding-agent-client = "autocoding_agent.interfaces.desktop_ui:main"
 autocoding-agent-ui = "autocoding_agent.interfaces.streamlit_ui:run"
+autocoding-incident = "autocoding_agent.interfaces.incident_cli:app"
 
 [project.optional-dependencies]
 dev = ["pytest>=8.2,<9", "ruff>=0.5,<1"]

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,7 @@ class CapabilityStore:
 
     def prepare(self, workspace: str | Path) -> Path:
         directory = self._workspace_dir(workspace)
+        self._migrate_legacy(directory)
         (directory / "capabilities").mkdir(parents=True, exist_ok=True)
         (directory / "tasks").mkdir(parents=True, exist_ok=True)
         if not (directory / "CAPABILITIES.md").exists():
@@ -56,7 +58,7 @@ class CapabilityStore:
             )
 
         workspace = str(Path(session.workspace).resolve())
-        safe = lambda value: _sanitize(value, workspace)  # noqa: E731 - local renderer helper
+        safe = lambda value: sanitize_text(value, workspace)  # noqa: E731 - renderer helper
         markdown = self._render_markdown(session, decision, draft, model, safe)
         self._atomic_text(document, markdown)
 
@@ -65,7 +67,7 @@ class CapabilityStore:
             "schema_version": 1,
             "task_id": session.id,
             "session_id": session.id,
-            "workspace_id": directory.name,
+            "workspace_id": directory.parent.name,
             "goal": safe(session.goal),
             "outcome": safe(decision.message),
             "changed_files": [safe(path) for path in decision.changed_files],
@@ -85,7 +87,23 @@ class CapabilityStore:
     def _workspace_dir(self, workspace: str | Path) -> Path:
         canonical = str(Path(workspace).resolve()).casefold()
         workspace_id = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
-        return self.root / workspace_id
+        return self.root / workspace_id / "development"
+
+    @staticmethod
+    def _migrate_legacy(directory: Path) -> None:
+        """Copy pre-domain capability files once, preserving the original layout."""
+
+        if directory.exists():
+            return
+        legacy = directory.parent
+        if not (legacy / "CAPABILITIES.md").is_file():
+            return
+        directory.mkdir(parents=True, exist_ok=True)
+        for name in ("capabilities", "tasks"):
+            source = legacy / name
+            if source.is_dir():
+                shutil.copytree(source, directory / name, dirs_exist_ok=True)
+        shutil.copy2(legacy / "CAPABILITIES.md", directory / "CAPABILITIES.md")
 
     @staticmethod
     def _fallback_draft(session: AgentSession, decision: AgentDecision) -> CapabilityDraft:
@@ -164,7 +182,7 @@ completed_at: {json.dumps(session.updated_at.isoformat())}
             summary = str(record.get("outcome", "")).replace("\n", " ").strip()
             entries.append(f"- [{title}]({record['document']}) — {summary[:240]}")
         content = (
-            """# Workspace Capabilities
+            """# Development Capabilities
 
 This index contains historical, model-distilled guidance for this workspace. It may be stale. Read
 only entries relevant to the current task and verify them against current repository evidence.
@@ -189,7 +207,7 @@ def _markdown_title(content: str) -> str:
     return "Untitled capability"
 
 
-def _sanitize(value: str, workspace: str) -> str:
+def sanitize_text(value: str, workspace: str) -> str:
     text = re.sub(re.escape(workspace), "<WORKSPACE>", str(value), flags=re.IGNORECASE)
     text = re.sub(re.escape(str(Path.home())), "<USER_HOME>", text, flags=re.IGNORECASE)
     # Bearer must be removed before the generic key/value rule sees only its prefix.

@@ -6,8 +6,10 @@ from collections import deque
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from autocoding_agent.adapters.capability_store import CapabilityStore
+from autocoding_agent.adapters.json_session_store import JsonSessionStore
 from autocoding_agent.application import AgentApplication, build_application
 from autocoding_agent.config import Settings
 from autocoding_agent.core.models import (
@@ -18,10 +20,13 @@ from autocoding_agent.core.models import (
     ApprovalRequest,
     ApprovalScope,
     CapabilityDraft,
+    ChangeProposal,
     EventType,
+    ProposedChange,
     RuntimeResult,
     RuntimeTurn,
 )
+from autocoding_agent.database_models import DataQuery, QueryResult
 
 
 class ScriptedRuntime:
@@ -39,6 +44,23 @@ class ScriptedRuntime:
         return RuntimeResult(
             decision=self._decisions.popleft(),
             runtime_session_id=self.runtime_session_id,
+        )
+
+
+class FakeDatabase:
+    def __init__(self) -> None:
+        self.queries: list[DataQuery] = []
+
+    def describe_schema(self) -> str:
+        return "orders(id INTEGER, status TEXT)"
+
+    def execute(self, query: DataQuery) -> QueryResult:
+        self.queries.append(query)
+        return QueryResult(
+            query_name=query.name,
+            columns=["id", "status"],
+            rows=[{"id": 42, "status": "stuck"}],
+            returned_rows=1,
         )
 
 
@@ -78,6 +100,25 @@ def _completed(message: str = "Task completed.", *, changed: bool = False) -> Ag
 
 
 def _approval(scope: ApprovalScope) -> AgentDecision:
+    proposal = (
+        ChangeProposal(
+            summary="Make the upload write atomic without changing the public API.",
+            changes=[
+                ProposedChange(
+                    path="src/upload_service.py",
+                    area="upload persistence",
+                    current="The two related writes can succeed independently.",
+                    proposed="Write both records within one transaction boundary.",
+                )
+            ],
+            expected_result="A failed second write cannot leave partial upload state.",
+            impact=["The public upload response remains unchanged."],
+            validation=["Exercise success and second-write failure cases."],
+            preview_markdown="`save_primary()` and `save_metadata()` run in one transaction.",
+        )
+        if scope == ApprovalScope.MODIFY
+        else None
+    )
     return AgentDecision(
         status=AgentStatus.APPROVAL_REQUIRED,
         message=f"Approval is needed for {scope.value}.",
@@ -85,6 +126,7 @@ def _approval(scope: ApprovalScope) -> AgentDecision:
             scope=scope,
             reason="The next step has a side effect.",
             proposed_actions=["Perform the exact requested action."],
+            proposal=proposal,
         ),
     )
 
@@ -124,6 +166,49 @@ def test_multi_turn_clarification_preserves_full_history(tmp_path: Path) -> None
     assert event_types.count(EventType.INPUT_REQUIRED) == 2
     assert event_types.count(EventType.TASK_COMPLETED) == 1
     assert event_types.count(EventType.CAPABILITY_SAVED) == 1
+
+
+def test_development_flow_can_use_shared_read_only_database(tmp_path: Path) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    state = tmp_path / "state"
+    query = DataQuery(
+        name="order_status",
+        purpose="Confirm the persisted order state before proposing a code change.",
+        sql="SELECT id, status FROM orders WHERE id = :id",
+        parameters={"id": 42},
+    )
+    runtime = ScriptedRuntime(
+        AgentDecision(
+            status=AgentStatus.QUERY_REQUIRED,
+            message="The code path is located; one bounded data check is needed.",
+            queries=[query],
+        ),
+        _completed("The persisted state confirms the code-path diagnosis."),
+    )
+    database = FakeDatabase()
+    reference = "sqlserver://sql.internal:1433/orders"
+    app = build_application(
+        settings=_settings(state),
+        runtime=runtime,
+        database=database,
+        database_reference=reference,
+    )
+
+    outcome = app.start(workspace, "Investigate order 42 in src/orders.py")
+
+    assert outcome.status == AgentStatus.COMPLETED
+    assert database.queries == [query]
+    assert outcome.query_observations[0].returned_rows == 1
+    assert len(runtime.turns) == 2
+    assert "orders(id INTEGER, status TEXT)" in runtime.turns[0].system_prompt
+    assert '"status": "stuck"' in runtime.turns[1].user_message
+    session = app.get_session(outcome.session_id)
+    assert session.database_reference == reference
+    session_file = state / "sessions" / f"{outcome.session_id}.json"
+    assert '"status": "stuck"' not in session_file.read_text(encoding="utf-8")
+    assert outcome.capability_document is not None
+    assert Path(outcome.capability_document).parent.parent.name == "development"
 
 
 @pytest.mark.parametrize(
@@ -182,6 +267,121 @@ def test_rejection_resumes_read_only_and_carries_reason(tmp_path: Path) -> None:
     assert "Write" not in rejected_turn.tools
     assert "I only want a diagnosis" in rejected_turn.user_message
     assert rejected_turn.runtime_session_id == "runtime-1"
+
+
+def test_modify_approval_requires_a_structured_proposal(tmp_path: Path) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    runtime = ScriptedRuntime(
+        AgentDecision(
+            status=AgentStatus.APPROVAL_REQUIRED,
+            message="I want to edit the file now.",
+            approval=ApprovalRequest(
+                scope=ApprovalScope.MODIFY,
+                reason="A code change is needed.",
+            ),
+        )
+    )
+    app = _app(tmp_path / "state", runtime)
+
+    outcome = app.start(workspace, "Fix the upload bug.")
+
+    assert outcome.status == AgentStatus.FAILED
+    assert outcome.approval is None
+    assert "must include the change proposal" in outcome.message
+
+
+def test_modify_proposal_is_shown_before_implementation_and_survives_approval(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    pending_decision = _approval(ApprovalScope.MODIFY)
+    runtime = ScriptedRuntime(pending_decision, _completed(changed=True))
+    app = _app(tmp_path / "state", runtime)
+
+    pending = app.start(workspace, "Fix the upload consistency bug.")
+
+    assert pending.status == AgentStatus.APPROVAL_REQUIRED
+    assert pending.approval is not None
+    assert pending.approval.proposal == pending_decision.approval.proposal
+    assert runtime.turns[0].mode == AgentMode.INSPECT
+    assert "Edit" not in runtime.turns[0].tools
+
+    completed = app.approve(pending.session_id)
+    assert completed.status == AgentStatus.COMPLETED
+    assert runtime.turns[1].mode == AgentMode.IMPLEMENT
+    assert "exact proposal" in runtime.turns[1].user_message
+
+
+def test_legacy_modify_approval_loads_but_cannot_bypass_proposal_review(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "state"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    legacy_approval = ApprovalRequest(
+        scope=ApprovalScope.MODIFY,
+        reason="Legacy edit request.",
+        proposed_actions=["Edit the file."],
+    )
+    legacy_decision = AgentDecision(
+        status=AgentStatus.APPROVAL_REQUIRED,
+        message="Legacy approval.",
+        approval=legacy_approval,
+    )
+    session = AgentSession(
+        workspace=str(workspace),
+        goal="Legacy task",
+        status=AgentStatus.APPROVAL_REQUIRED,
+        pending_approval=legacy_approval,
+        last_decision=legacy_decision,
+    )
+    payload = session.model_dump(mode="json")
+    payload["pending_approval"].pop("proposal")
+    payload["last_decision"]["approval"].pop("proposal")
+    restored = AgentSession.model_validate(payload)
+    assert restored.pending_approval is not None
+    assert restored.pending_approval.proposal is None
+    JsonSessionStore(state).create(restored)
+    app = _app(state, ScriptedRuntime(_completed(changed=True)))
+
+    with pytest.raises(ValueError, match="predates change proposals"):
+        app.approve(restored.id)
+
+
+def test_change_proposal_rejects_blank_required_explanations() -> None:
+    with pytest.raises(ValidationError):
+        ChangeProposal(
+            summary="   ",
+            changes=[
+                ProposedChange(
+                    area="upload",
+                    current="separate writes",
+                    proposed="one transaction",
+                )
+            ],
+            expected_result="consistent data",
+        )
+
+
+@pytest.mark.parametrize("unsafe_path", [r"C:src\upload.py", r"\src\upload.py"])
+def test_change_proposal_rejects_windows_paths_outside_workspace(
+    tmp_path: Path,
+    unsafe_path: str,
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    decision = _approval(ApprovalScope.MODIFY)
+    assert decision.approval is not None
+    assert decision.approval.proposal is not None
+    decision.approval.proposal.changes[0].path = unsafe_path
+    app = _app(tmp_path / "state", ScriptedRuntime(decision))
+
+    outcome = app.start(workspace, "Fix the upload bug.")
+
+    assert outcome.status == AgentStatus.FAILED
+    assert "out-of-workspace path" in outcome.message
 
 
 def test_session_can_resume_after_application_restart(tmp_path: Path) -> None:
@@ -297,7 +497,7 @@ def test_non_completed_outcomes_do_not_write_capabilities(
 
     assert outcome.status == decision.status
     assert outcome.capability_document is None
-    workspace_memory = next((state / "workspaces").iterdir())
+    workspace_memory = next((state / "workspaces").iterdir()) / "development"
     assert list((workspace_memory / "capabilities").glob("*.md")) == []
     assert list((workspace_memory / "tasks").glob("*.json")) == []
     assert "No completed-task capabilities yet." in (

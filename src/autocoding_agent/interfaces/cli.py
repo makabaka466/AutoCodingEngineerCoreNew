@@ -100,6 +100,15 @@ def _print_outcome(outcome: AgentOutcome) -> None:
     typer.echo(outcome.message)
     if outcome.approval:
         typer.echo(f"approval: {outcome.approval.scope.value} — {outcome.approval.reason}")
+        proposal = outcome.approval.proposal
+        if proposal:
+            typer.echo(f"proposal: {proposal.summary}")
+            for change in proposal.changes:
+                location = change.path or change.area
+                typer.echo(f"- {location}: {change.current} -> {change.proposed}")
+            typer.echo(f"expected: {proposal.expected_result}")
+            if proposal.preview_markdown:
+                typer.echo(f"preview:\n{proposal.preview_markdown}")
     if outcome.capability_document:
         typer.echo(f"capability: {outcome.capability_document}")
 

@@ -1,6 +1,7 @@
 # AutoCoding Engineer 接口与数据契约
 
-本文记录当前 `0.2.0` 已实现的 Python、CLI、Streamlit、Runtime、持久化和状态契约。
+本文记录当前 `0.3.0` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
+Runtime、持久化和状态契约。
 设计动机和运行流程见[架构说明](ARCHITECTURE.md)。
 
 ## 1. 公共 Python API
@@ -22,13 +23,18 @@ from autocoding_agent import (
 def build_application(
     settings: Settings | None = None,
     runtime: AgentRuntime | None = None,
+    database: DatabaseReader | None = None,
+    database_reference: str | None = None,
 ) -> AgentApplication
 ```
 
 - 未传 `settings` 时使用进程缓存的 `get_settings()`。
 - 未传 `runtime` 时创建 `ClaudeCodeRuntime`。
 - 创建数据目录，并使用 JSON 会话存储和文件型能力存储。
+- 配置本地滚动日志，并通过 `AgentApplication.log_path` 暴露日志文件路径。
 - `runtime` 参数可用于测试或替换模型执行适配器。
+- `database` 与无凭据 `database_reference` 可把同一只读数据源注入开发流程；模型仅能在
+  `inspect` 返回查询计划，不能直接获得数据库工具。
 
 ### 1.2 `AgentApplication`
 
@@ -61,6 +67,7 @@ def build_application(
 | 值 | 含义 |
 | --- | --- |
 | `needs_input` | 信息不足，需要用户再提供一条消息 |
+| `query_required` | 开发调查需要主机执行一组受限只读查询；内部循环通常不会直接返回给 UI |
 | `approval_required` | 需要用户批准修改或验证范围 |
 | `completed` | 当前任务已如实到达终态 |
 | `failed` | Runtime、输出契约或策略检查失败 |
@@ -82,7 +89,7 @@ def build_application(
 - `MessageRole`：`user`、`assistant`、`system`；当前 Engine 追加的是 user/assistant。
 - `EventType`：`turn_started`、`runtime_finished`、`input_required`、
   `approval_required`、`task_completed`、`task_failed`、`capability_saved`、
-  `capability_failed`。
+  `capability_failed`、`database_queries_executed`。
 
 ## 3. 结构化模型契约
 
@@ -107,11 +114,31 @@ Evidence
 校验文件是否存在。
 
 ```text
+ProposedChange
+  path: str | None = None
+  area: non-empty str
+  current: non-empty str
+  proposed: non-empty str
+
+ChangeProposal
+  summary: non-empty str
+  changes: list[ProposedChange] (至少一项)
+  expected_result: non-empty str
+  impact: list[non-empty str] = []
+  validation: list[non-empty str] = []
+  preview_markdown: non-empty str | None = None
+
 ApprovalRequest
   scope: ApprovalScope
   reason: str
   proposed_actions: list[str] = []
+  proposal: ChangeProposal | None
 ```
+
+`proposal` 键在 Runtime JSON Schema 中必须存在。`modify` 必须传完整对象，`verify` 传
+`null`。`preview_markdown` 由模型在适合时提供界面线框、API/数据示例、伪代码或行为前后
+对比；不适合时保持 `null`，UI 会明确说明无法可靠预览。存储加载器兼容旧 JSON 中完全缺少
+`proposal` 键的会话，但旧修改审批不能直接执行。
 
 ### 3.2 能力草稿
 
@@ -139,6 +166,7 @@ AgentDecision
   changed_files: list[str] = []
   test_summary: str | None = None
   capability: CapabilityDraft | None = None
+  queries: list[DataQuery] = []
 ```
 
 这是 Claude Code 可以返回的唯一业务决定格式，也是传给 `--json-schema` 的 Schema 来源。
@@ -147,11 +175,14 @@ AgentDecision
 
 - `status=approval_required` 时必须存在 `approval`；
 - 其他状态不允许携带 `approval`；
+- `modify` 审批必须包含 `ChangeProposal`，否则 Engine 把该轮标记为失败；
 - `inspect` 模式不允许非空 `changed_files`；
-- 所有 `changed_files` 和非空 evidence path 必须是安全的相对路径。
+- `query_required` 必须包含 1–5 条查询，其他状态不得携带查询；查询只允许出现在 `inspect`；
+- 所有 `changed_files`、非空 evidence path 和 proposal path 必须是安全的相对路径。
 
 `message` 是用户可见的 Markdown 文本。`next_actions`、`evidence`、`changed_files` 和
-`test_summary` 是机器可读补充；当前 CLI/UI 主要展示 `message`，不会单独完整渲染所有字段。
+`test_summary` 是机器可读补充；桌面客户端会额外展示 evidence、changed files、测试摘要和
+能力文档路径。桌面与 Web UI 都会完整展示结构化修改方案和预览，CLI 输出其关键字段。
 
 ### 3.4 使用量与事件
 
@@ -199,6 +230,9 @@ AgentSession
   last_decision: AgentDecision | None = None
   last_usage: AgentUsage = empty usage
   capability_document: str | None = None
+  database_reference: str | None = None
+  query_observations: list[QueryObservation] = []
+  query_rounds: int = 0
   messages: list[ChatMessage] = []
   events: list[AgentEvent] = []
   created_at: datetime
@@ -222,6 +256,7 @@ AgentOutcome
   changed_files: list[str] = []
   test_summary: str | None = None
   capability_document: str | None = None
+  query_observations: list[QueryObservation] = []
   usage: AgentUsage
   events: list[AgentEvent] = []
 ```
@@ -265,6 +300,20 @@ RuntimeResult
 Engine 期望 `run()` 完成一轮并阻塞到有结果。自定义 Runtime 应遵守 `tools`、
 `allowed_tools` 和 `permission_mode`；Engine 仍会执行模式与路径二次校验。
 
+异常流程使用通用结构化端口：
+
+```python
+class StructuredRuntime(Protocol):
+    def run_structured(
+        self,
+        turn: RuntimeTurn,
+        response_model: type[StructuredOutputT],
+    ) -> StructuredRuntimeResult[StructuredOutputT]: ...
+```
+
+`ClaudeCodeRuntime.run()` 是对 `run_structured(turn, AgentDecision)` 的兼容封装；异常引擎传入
+`IncidentDecision`，因此两个领域共享 Claude Code 进程协议和错误处理，但不共享业务状态。
+
 ### 4.2 Claude Code 命令
 
 默认适配器构造的命令等价于：
@@ -290,6 +339,9 @@ claude -p
 ```
 
 子进程工作目录固定为 `RuntimeTurn.workspace`。适配器要求 stdout 是一个 JSON envelope：
+
+Windows 运行时还会传入隐藏 `STARTUPINFO` 和 `CREATE_NO_WINDOW`，避免每轮 Claude Code 调用
+弹出控制台。Runtime 日志只记录调用元数据、usage 和脱敏错误，不记录完整 prompt。
 
 ```json
 {
@@ -340,7 +392,9 @@ JSON 内容是 `AgentSession.model_dump(mode="json")` 的完整结果。
 
 ## 6. 能力存储接口与文件格式
 
-`CapabilityStore` 当前由 Engine 直接调用，没有单独的 Protocol。
+开发 `CapabilityStore` 与异常 `IncidentCapabilityStore` 当前由各自 Engine 直接调用，没有单独
+Protocol。两者根目录分别是
+`<data_dir>/workspaces/<workspace-id>/development/` 与 `incident/`。
 
 ```python
 prepare(workspace: str | Path) -> Path
@@ -432,13 +486,57 @@ session: <uuid>
 status: <status>
 <model message>
 [approval: <scope> — <reason>]
+[proposal: <summary>]
+[- <path-or-area>: <current> -> <proposed>]
+[expected: <expected-result>]
+[preview: <preview-markdown>]
 [capability: <absolute document path>]
 ```
 
 `sessions` 输出 JSON 数组，每项包含 `session_id`、`status`、`workspace`、`goal`、
 `updated_at`。接口操作抛错时 CLI 向 stderr 输出 `Error: ...` 并以退出码 1 结束。
 
-## 8. Streamlit UI
+## 8. 原生桌面客户端
+
+安装项目后，桌面入口为：
+
+```powershell
+autocoding-agent-client
+```
+
+也可以运行 `python -m autocoding_agent.interfaces.desktop_ui`。根目录 `start.cmd` 默认通过
+`pythonw.exe` 启动该入口，因此不会启动本地 HTTP 服务或浏览器。
+
+客户端直接调用 `AgentApplication` 与 `IncidentApplication`，提供：
+
+- 启动前自动检测 Claude Code 和模型配置；未就绪时先显示配置页；
+- 顶部胶囊式“开发 / 异常处理”选择器，蓝底表示当前流程；
+- 两套流程各自的当前 session、最近会话、欢迎提示、状态和结果渲染；
+- 白色浅色主题，输入框上方的项目路径选择，以及左侧最近会话；
+- 异常模式下的页面线索、共用 SQL Server 连接状态和“配置连接”入口；
+- 统一系统配置和本地滚动日志目录快捷入口；
+- 新任务、持久化聊天记录及同一 session 的多轮补充；
+- `approval_required` 的完整修改方案、当前/目标状态、影响、验证计划、预览，以及批准或调整；
+- evidence、changed files、测试摘要和能力文档路径；
+- `needs_input`、`approval_required`、`completed`、`failed` 状态提示。
+
+应用方法是同步接口，因此客户端用一个后台工作线程执行每一轮，并通过 Tk 的事件队列回到
+主线程渲染。忙碌期间会禁用发送、会话切换和重复审批。当前 Runtime 没有取消端口；任务运行
+期间客户端会阻止关闭，而不是显示无法兑现的“停止”操作。Windows 下还会使用当前登录
+会话内的命名互斥量保持单实例，避免两个桌面窗口并发写同一会话存储。
+
+系统配置是一个窗口、两个页签。模型页字段为 Claude Code 路径、API 地址、模型名称和 API
+Key。Claude 路径会通过
+`--version` 验证；Key 控件始终为空并以密码形式输入，`has_api_key=true` 时留空保存表示保留
+原密钥。保存成功后当前进程立即生效，并重建两套 Runtime，但不删除已有会话。
+
+SQL Server 页包含服务器、端口、数据库、已安装 ODBC 驱动、Windows/SQL Server 认证、
+用户名、密码、加密和信任证书选项，并提供后台“测试连接”。非密钥字段保存在
+`<data_dir>/database/sqlserver.json`；密码通过 Windows Credential Manager 保存，不进入 JSON、
+日志、模型提示词或会话。两套流程共享连接；连接可随时更换，已有开发或异常会话保持原连接，
+新配置从对应流程的下一项任务开始。
+
+## 9. Streamlit Web UI
 
 UI 是 `AgentApplication` 的薄适配层，控制台入口为：
 
@@ -458,9 +556,14 @@ autocoding-agent-ui
 用户需点击“新建任务”。UI 当前没有独立展示完整 evidence、usage、event timeline，也没有
 流式 token 或后台任务接口。
 
-## 9. 环境配置
+`start.cmd -Web` 或 `start.ps1 -Web` 才会启动该页面；`-Port` 与 `-NoBrowser` 仅作用于
+Web 模式。
+
+## 10. 环境配置
 
 `Settings` 使用 `.env` 和环境变量，前缀为 `AUTO_CODING_`。
+桌面入口默认通过 `ClaudeModelSetupService` 管理 Claude 路径和模型服务变量；`.env` 主要用于
+无界面部署和高级覆盖。
 
 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- |
@@ -469,6 +572,105 @@ autocoding-agent-ui
 | `AUTO_CODING_CLAUDE_TIMEOUT_SECONDS` | `600` | 单轮超时，最小 10 秒 |
 | `AUTO_CODING_MAX_BUDGET_USD` | `None` | 可选单轮 Claude Code 预算参数，必须大于 0 |
 | `AUTO_CODING_DATA_DIR` | `~/.autocoding-agent` | 会话与能力数据根目录 |
+| `AUTO_CODING_INCIDENT_SQLITE_PATH` | `None` | 可选的异常诊断 SQLite 文件路径；连接始终以只读模式打开 |
+| `AUTO_CODING_DATABASE_MAX_ROWS` | `50` | 两套流程每条查询的主机返回行数上限，范围 1–1000 |
+| `AUTO_CODING_DATABASE_QUERY_TIMEOUT_SECONDS` | `5` | SQL Server/SQLite 单条查询超时，范围 1–60 秒 |
+| `AUTO_CODING_DATABASE_MAX_QUERY_ROUNDS` | `2` | 每个开发或异常会话最多自动查询轮次，范围 1–5 |
 
 `ANTHROPIC_BASE_URL`、`ANTHROPIC_AUTH_TOKEN` 等模型服务环境变量不由 `Settings` 解析，
-但会由 Claude Code 子进程继承。不要把真实密钥提交到项目 `.env` 或能力文档。
+但会由 Claude Code 子进程继承。桌面配置页把它们保存为 Windows 当前用户环境变量；API Key
+不会进入 `ModelSetupState`，也不会回填到界面。不要把真实密钥提交到项目 `.env` 或能力文档。
+
+## 11. 异常诊断接口
+
+### 11.1 `IncidentApplication`
+
+```python
+from autocoding_agent.incident.application import build_incident_application
+from autocoding_agent.sqlserver_service import SQLServerConnectionService
+
+connections = SQLServerConnectionService()
+reader = connections.reader()
+incidents = build_incident_application(
+    database=reader,
+    database_reference=reader.reference if reader else None,
+)
+outcome = incidents.start(
+    workspace=r"D:\repo",
+    problem="订单 42 一直停留在处理中",
+    page_hint="/orders/42",
+    source="manual",
+    external_reference=None,
+)
+```
+
+| 方法 | 行为 |
+| --- | --- |
+| `start(workspace, problem, page_hint=None, *, source="manual", external_reference=None)` | 创建异常会话，定位页面，必要时查询数据库并诊断 |
+| `send(session_id, message)` | 回答模型澄清问题或补充异常上下文 |
+| `outcome(session_id)` | 返回最新 `IncidentOutcome` |
+| `get_session(session_id)` | 返回完整 `IncidentSession`，但不包含原始数据库行 |
+| `list_sessions()` | 按更新时间倒序列出异常会话 |
+
+`source` 与 `external_reference` 为钉钉消息来源和外部消息/工单 ID 预留。当前调用是同步的；
+`completed` 会话不能继续发送消息。
+
+### 11.2 状态与结构化决定
+
+`IncidentStatus` 包含：
+
+- `needs_input`：问题或页面信息不足，`question` 必填；
+- `query_required`：页面已定位且需要数据，`page` 与至少一条 `queries` 必填；
+- `completed`：诊断结束，`page` 与 `diagnosis` 必填；
+- `failed`：Runtime、契约或数据库边界失败。
+
+模型返回的 `IncidentDecision` 主要字段为：
+
+```text
+status, message, question
+page: LocatedPage | None
+queries: list[DataQuery] (最多 5 条)
+diagnosis: str | None
+findings: list[IncidentFinding]
+recommended_actions: list[str]
+confidence: float | None (0..1)
+automation_candidate: bool
+```
+
+`LocatedPage` 保存名称、可选 route、页面源码路径、相关后端路径和定位依据。所有源码路径必须
+是安全的工作区相对路径。`DataQuery` 保存名称、用途、SQL、命名参数和 1–100 的请求行数；
+数据库适配器仍会应用更小的主机上限。
+
+`IncidentOutcome.query_observations` 只包含查询名称、用途、返回行数、截断标记和脱敏列。
+原始业务行不会写入 `~/.autocoding-agent/incidents/<session-id>.json`。
+`IncidentSession.database_reference` 保存该会话的无凭据数据源引用，例如
+`sqlserver://server:1433/database`；它不保存数据库账号、密码或业务数据。
+
+### 11.3 `DatabaseReader`
+
+```python
+class DatabaseReader(Protocol):
+    def describe_schema(self) -> str: ...
+    def execute(self, query: DataQuery) -> QueryResult: ...
+```
+
+桌面把同一个 `SQLServerDatabaseReader` 注入开发与异常流程，SQLite 适配器保留给异常 CLI
+和旧会话。适配器必须使用
+专用只读账号、强制超时/行数限制、拒绝多语句和写操作、参数绑定、脱敏结果，并只返回有限
+schema 元数据。
+
+### 11.4 异常 CLI
+
+安装后入口为 `autocoding-incident`。当前 CLI 的 `--database` 仍是 SQLite 兼容入口；SQL Server
+优先通过桌面连接页配置：
+
+| 命令 | 作用 |
+| --- | --- |
+| `check-db --database PATH` | 验证 SQLite 只读连接并显示有限 schema |
+| `start PROBLEM --workspace PATH [--page HINT] [--database PATH]` | 创建并运行异常调查 |
+| `send MESSAGE --session-id UUID [--database PATH]` | 补充信息并恢复同一模型会话 |
+| `show --session-id UUID` | 输出最新完整 JSON 结果 |
+| `sessions` | 列出最近异常会话 |
+
+未传 `--database` 时使用 `AUTO_CODING_INCIDENT_SQLITE_PATH`。如果页面已经定位且模型请求
+数据，但仍未配置数据库，该会话会得到可恢复、持久化的 `failed` 结果，而不会假装完成诊断。

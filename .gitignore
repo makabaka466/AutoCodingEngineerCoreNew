@@ -6,3 +6,5 @@ outputs/
 *.egg-info/
 dist/
 build/
+.agents/skills/developing-with-streamlit
+.claude/skills/developing-with-streamlit

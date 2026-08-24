@@ -11,6 +11,8 @@ from autocoding_agent.config import Settings, get_settings
 from autocoding_agent.core.engine import AgentEngine
 from autocoding_agent.core.models import AgentOutcome, AgentSession
 from autocoding_agent.core.policies import ExecutionPolicy
+from autocoding_agent.observability import configure_file_logging
+from autocoding_agent.ports.database import DatabaseReader
 from autocoding_agent.ports.runtime import AgentRuntime
 from autocoding_agent.skills import SkillRegistry
 
@@ -18,8 +20,9 @@ from autocoding_agent.skills import SkillRegistry
 class AgentApplication:
     """The stable API every delivery platform calls."""
 
-    def __init__(self, engine: AgentEngine) -> None:
+    def __init__(self, engine: AgentEngine, log_path: Path | None = None) -> None:
         self._engine = engine
+        self.log_path = log_path
 
     def start(self, workspace: str | Path, message: str) -> AgentOutcome:
         return self._engine.start(workspace, message)
@@ -46,9 +49,12 @@ class AgentApplication:
 def build_application(
     settings: Settings | None = None,
     runtime: AgentRuntime | None = None,
+    database: DatabaseReader | None = None,
+    database_reference: str | None = None,
 ) -> AgentApplication:
     configured = settings or get_settings()
     configured.data_dir.mkdir(parents=True, exist_ok=True)
+    log_path = configure_file_logging(configured.data_dir)
     engine = AgentEngine(
         runtime=runtime or ClaudeCodeRuntime(configured),
         sessions=JsonSessionStore(configured.data_dir),
@@ -56,5 +62,8 @@ def build_application(
         skills=SkillRegistry(),
         policy=ExecutionPolicy(),
         model=configured.claude_model,
+        database=database,
+        database_reference=database_reference,
+        max_query_rounds=configured.database_max_query_rounds,
     )
-    return AgentApplication(engine)
+    return AgentApplication(engine, log_path)

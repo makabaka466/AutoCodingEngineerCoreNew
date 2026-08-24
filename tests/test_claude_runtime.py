@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -11,6 +12,7 @@ import pytest
 from autocoding_agent.adapters.claude_code import ClaudeCodeError, ClaudeCodeRuntime
 from autocoding_agent.config import Settings
 from autocoding_agent.core.models import AgentMode, RuntimeTurn
+from autocoding_agent.incident.models import IncidentDecision, IncidentStatus
 
 
 def _settings(tmp_path: Path, **overrides: object) -> Settings:
@@ -81,6 +83,14 @@ def test_build_command_contains_structured_contract_and_new_session_id(tmp_path:
     schema = json.loads(_option_value(command, "--json-schema"))
     assert "status" in schema["properties"]
     assert "message" in schema["properties"]
+    proposal_schema = schema["$defs"]["ChangeProposal"]
+    change_schema = schema["$defs"]["ProposedChange"]
+    approval_schema = schema["$defs"]["ApprovalRequest"]
+    assert set(proposal_schema["required"]) == {"summary", "changes", "expected_result"}
+    assert proposal_schema["properties"]["changes"]["minItems"] == 1
+    assert "preview_markdown" not in proposal_schema["required"]
+    assert set(change_schema["required"]) == {"area", "current", "proposed"}
+    assert "proposal" in approval_schema["required"]
 
 
 def test_build_command_resumes_exact_runtime_session(tmp_path: Path) -> None:
@@ -92,6 +102,40 @@ def test_build_command_resumes_exact_runtime_session(tmp_path: Path) -> None:
     assert _option_value(command, "--resume") == "claude-runtime-session"
     assert "--session-id" not in command
     assert "--max-budget-usd" not in command
+
+
+def test_generic_structured_runtime_uses_incident_schema(tmp_path: Path) -> None:
+    captured: dict[str, object] = {}
+
+    def runner(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured["command"] = command
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=json.dumps(
+                {
+                    "session_id": "runtime-incident",
+                    "structured_output": {
+                        "status": "needs_input",
+                        "message": "Need the affected route.",
+                        "question": "Which page shows the problem?",
+                    },
+                }
+            ),
+            stderr="",
+        )
+
+    runtime = ClaudeCodeRuntime(_settings(tmp_path), runner=runner)
+
+    result = runtime.run_structured(_turn(tmp_path), IncidentDecision)
+
+    assert result.output.status == IncidentStatus.NEEDS_INPUT
+    assert result.runtime_session_id == "runtime-incident"
+    command = captured["command"]
+    assert isinstance(command, list)
+    schema = json.loads(_option_value(command, "--json-schema"))
+    assert "queries" in schema["properties"]
+    assert "diagnosis" in schema["properties"]
 
 
 @pytest.mark.parametrize(
@@ -186,6 +230,11 @@ def test_runtime_invocation_uses_workspace_timeout_and_utf8(tmp_path: Path) -> N
     assert captured["cwd"] == _turn(tmp_path).workspace
     assert captured["timeout"] == 45
     assert captured["encoding"] == "utf-8"
+    if os.name == "nt":
+        assert captured["creationflags"] & subprocess.CREATE_NO_WINDOW
+        startupinfo = captured["startupinfo"]
+        assert isinstance(startupinfo, subprocess.STARTUPINFO)
+        assert startupinfo.dwFlags & subprocess.STARTF_USESHOWWINDOW
 
 
 def test_runtime_error_redacts_provider_credentials(tmp_path: Path) -> None:
