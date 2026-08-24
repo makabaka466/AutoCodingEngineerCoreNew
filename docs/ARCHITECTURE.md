@@ -1,6 +1,6 @@
 # AutoCoding Engineer 架构说明
 
-本文描述当前 `0.3.1` 代码已经实现的架构。数据字段、公共方法和命令行参数见
+本文描述当前 `0.3.2` 代码已经实现的架构。数据字段、公共方法和命令行参数见
 [接口与数据契约](INTERFACES.md)。
 
 ## 1. 项目目标
@@ -58,7 +58,7 @@ flowchart TD
 | 层 | 目录或模块 | 当前职责 |
 | --- | --- | --- |
 | 交付接口 | `interfaces/` | 把桌面客户端、CLI、Streamlit 操作转换成统一应用调用 |
-| 系统配置 | `model_setup.py`、`sqlserver_service.py` | 统一管理 Claude Code、模型服务与两套流程共用的 SQL Server 连接 |
+| 系统配置 | `model_setup.py`、`sqlserver_service.py`、`workspace_knowledge.py` | 统一管理 Claude Code、模型服务、共用 SQL Server 与分流程 Markdown 知识 |
 | 应用门面 | `application.py` | 组装依赖并暴露稳定的任务 API |
 | 异常领域 | `incident/` | 页面定位、只读查询计划、数据诊断及独立会话状态机 |
 | 核心 | `core/` | 会话状态机、执行模式、数据模型、权限校验 |
@@ -297,8 +297,9 @@ Manager。配置页只获取两个 `has_*` 布尔值，已有密钥和密码都�
 
 能力记忆位于 `Settings.data_dir/workspaces/<workspace_id>/`，不会写入目标仓库。其下按领域
 分成 `development/` 与 `incident/`；两边各有自己的索引、task JSON 和 Markdown，不会互读。
-`pinned/` 保存用户维护的工作区基础知识，索引每轮重建时都会保留其链接；自动完成任务产生的
-文档仍进入 `capabilities/`。
+`pinned/<二级分支>/` 保存用户维护的工作区基础知识，索引每轮重建时都会保留递归链接；自动
+完成任务产生的文档仍进入 `capabilities/`。开发与异常处理拥有各自的二级分支树，同名分支也
+不会共享文件。`MarkdownKnowledgeService` 校验 Windows 文件名、限定路径范围并执行原子保存。
 `workspace_id` 是规范化工作区绝对路径（不区分大小写）计算出的 SHA-256 前 16 位，因此
 不同路径的项目默认隔离。
 
@@ -325,12 +326,12 @@ flowchart LR
 └─ workspaces/<workspace-id>/
    ├─ development/
    │  ├─ CAPABILITIES.md
-   │  ├─ pinned/<workspace-guide>.md
+   │  ├─ pinned/<二级分支>/<workspace-guide>.md
    │  ├─ tasks/<session-id>.json
    │  └─ capabilities/<session-id>.md
    └─ incident/
       ├─ CAPABILITIES.md
-      ├─ pinned/<workspace-guide>.md
+      ├─ pinned/<二级分支>/<workspace-guide>.md
       ├─ tasks/<session-id>.json
       └─ capabilities/<session-id>.md
 ```

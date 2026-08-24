@@ -220,7 +220,7 @@ def pinned_markdown_entries(directory: Path) -> list[str]:
     """Return stable links for user-maintained workspace guidance."""
 
     entries: list[str] = []
-    for document in sorted((directory / "pinned").glob("*.md")):
+    for document in sorted((directory / "pinned").rglob("*.md")):
         title = _markdown_title(document.read_text(encoding="utf-8"))
         relative = document.relative_to(directory).as_posix()
         entries.append(f"- [{title}]({relative}) — 用户维护的当前工作区基础知识。")

@@ -36,7 +36,9 @@
 
 能力记忆不会暗中修改目标仓库，也不会覆盖项目已有的 `CLAUDE.md`。开发与异常维护分别写入
 `~/.autocoding-agent/workspaces/<workspace-id>/development/` 和 `incident/`，各自维护独立的
-`CAPABILITIES.md`、`pinned/` 基础知识、任务记录和 Markdown 文档，避免两类经验互相污染。
+`CAPABILITIES.md`、`pinned/<二级分支>/` 基础知识、任务记录和 Markdown 文档，避免两类经验
+互相污染。系统配置中的“MD 能力配置”可切换开发/异常处理、添加二级分支、新建和编辑 MD，
+并显示当前文件的真实本地路径。
 
 ## 异常处理流程（首版框架）
 
@@ -72,8 +74,9 @@ D:\python\python.exe -m pip install -e ".[dev,ui]"
 
 随后直接双击 `start.cmd`。客户端会先搜索并运行真实 `claude.exe --version`：如果 Claude Code、
 API 地址、模型名或 API Key 任一项未就绪，会先显示“系统配置”。同一个窗口包含“模型与
-Claude Code”和“SQL Server”两个页签：模型页支持自动检测和手动选择 `claude.exe`；数据库页
-可以测试、保存和随时更换两套流程共用的只读连接。API Key 与数据库密码都不会回填显示。
+Claude Code”“SQL Server”“MD 能力配置”三个页签：模型页支持自动检测和手动选择
+`claude.exe`；数据库页可以测试、保存和随时更换两套流程共用的只读连接；MD 页按工作区、
+流程和二级分支管理可编辑知识。API Key 与数据库密码都不会回填显示。
 
 当前默认值适用于 DeepSeek Anthropic 兼容接口：
 
@@ -82,7 +85,7 @@ ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic
 AUTO_CODING_CLAUDE_MODEL=deepseek-v4-pro
 ```
 
-主界面左侧的“系统配置”可随时更换端点、模型、密钥或 SQL Server 连接。`.env.example` 和旧的 PowerShell
+主界面左侧的“系统配置”可随时更换端点、模型、密钥、SQL Server 连接或 MD 能力配置。`.env.example` 和旧的 PowerShell
 配置脚本仍保留给自动化或高级部署使用，不再是桌面客户端的必需步骤：
 
 ```powershell

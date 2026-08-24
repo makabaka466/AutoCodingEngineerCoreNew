@@ -1028,11 +1028,11 @@ class DesktopClient:
             self._settings_dialog is not None
             and self._settings_dialog.window.winfo_exists()
         ):
-            self._settings_dialog.notebook.select(
-                self._settings_dialog.database_tab
-                if section == "database"
-                else self._settings_dialog.model_tab
-            )
+            selected_tab = {
+                "database": self._settings_dialog.database_tab,
+                "knowledge": self._settings_dialog.knowledge_tab,
+            }.get(section, self._settings_dialog.model_tab)
+            self._settings_dialog.notebook.select(selected_tab)
             self._settings_dialog.window.lift()
             self._settings_dialog.window.focus_force()
             return
@@ -1041,6 +1041,7 @@ class DesktopClient:
             self.setup_service,
             self.sqlserver_service,
             initial_section=section,
+            workspace=self.workspace_var.get(),
             on_model_saved=self._apply_model_configuration,
             on_database_saved=self._apply_sqlserver_configuration,
         )

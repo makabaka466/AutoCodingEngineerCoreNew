@@ -6,8 +6,10 @@ import queue
 import threading
 import tkinter as tk
 from collections.abc import Callable
+from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
+from autocoding_agent.config import get_settings
 from autocoding_agent.model_setup import (
     ClaudeModelSetupService,
     ModelSetupError,
@@ -21,6 +23,11 @@ from autocoding_agent.sqlserver_config import (
 from autocoding_agent.sqlserver_service import (
     SQLServerConnectionService,
     build_connection_config,
+)
+from autocoding_agent.workspace_knowledge import (
+    KnowledgeDomain,
+    MarkdownKnowledgeService,
+    WorkspaceKnowledgeError,
 )
 
 WINDOW = "#F7F8FA"
@@ -44,6 +51,8 @@ class SystemSettingsDialog:
         database_service: SQLServerConnectionService,
         *,
         initial_section: str = "model",
+        workspace: str | Path | None = None,
+        knowledge_service: MarkdownKnowledgeService | None = None,
         required_model_setup: bool = False,
         on_model_saved: Callable[[ModelSetupState], None] | None = None,
         on_database_saved: Callable[[SQLServerConfigState], None] | None = None,
@@ -51,6 +60,10 @@ class SystemSettingsDialog:
         self.parent = parent
         self.model_service = model_service
         self.database_service = database_service
+        self.knowledge_service = knowledge_service or MarkdownKnowledgeService(
+            get_settings().data_dir
+        )
+        self.knowledge_workspace = str(Path(workspace or Path.cwd()).expanduser().resolve())
         self.on_model_saved = on_model_saved
         self.on_database_saved = on_database_saved
         self.required_model_setup = required_model_setup
@@ -62,9 +75,9 @@ class SystemSettingsDialog:
         self.window = tk.Toplevel(parent)
         self.window.title("系统配置 · AutoCoding Engineer")
         self.window.configure(bg=WINDOW)
-        width, height, geometry = self._geometry(760, 720)
+        width, height, geometry = self._geometry(980, 720)
         self.window.geometry(geometry)
-        self.window.minsize(min(680, width), min(580, height))
+        self.window.minsize(min(760, width), min(580, height))
         self.window.protocol("WM_DELETE_WINDOW", self._close)
         if parent.winfo_viewable():
             self.window.transient(parent)
@@ -72,7 +85,11 @@ class SystemSettingsDialog:
         self._build()
         self._load_model_state(self.model_state)
         self._load_database_state(self.database_state)
-        self.notebook.select(self.database_tab if initial_section == "database" else self.model_tab)
+        selected_tab = {
+            "database": self.database_tab,
+            "knowledge": self.knowledge_tab,
+        }.get(initial_section, self.model_tab)
+        self.notebook.select(selected_tab)
         self._sync_footer_actions()
         self.window.grab_set()
         self.window.focus_force()
@@ -80,7 +97,7 @@ class SystemSettingsDialog:
     def _geometry(self, width: int, height: int) -> tuple[int, int, str]:
         screen_width = self.parent.winfo_screenwidth()
         screen_height = self.parent.winfo_screenheight()
-        width = min(width, max(680, screen_width - 40))
+        width = min(width, max(760, screen_width - 40))
         height = min(height, max(580, screen_height - 70))
         left = max(0, (screen_width - width) // 2)
         top = max(0, (screen_height - height) // 2)
@@ -100,7 +117,7 @@ class SystemSettingsDialog:
         ).pack(anchor="w")
         tk.Label(
             header,
-            text="模型与数据库配置由开发、异常维护流程共同使用。",
+            text="模型、数据库和工作区 Markdown 知识在这里统一管理。",
             font=("Microsoft YaHei UI", 9),
             fg=MUTED,
             bg=WINDOW,
@@ -120,10 +137,13 @@ class SystemSettingsDialog:
         self.notebook.grid(row=1, column=0, sticky="nsew", padx=30, pady=(0, 12))
         self.model_tab = tk.Frame(self.notebook, bg=CARD)
         self.database_tab = tk.Frame(self.notebook, bg=CARD)
+        self.knowledge_tab = tk.Frame(self.notebook, bg=CARD)
         self.notebook.add(self.model_tab, text="模型与 Claude Code")
         self.notebook.add(self.database_tab, text="SQL Server")
+        self.notebook.add(self.knowledge_tab, text="MD 能力配置")
         self._build_model_tab()
         self._build_database_tab()
+        self._build_knowledge_tab()
 
         footer = tk.Frame(self.window, bg=WINDOW)
         footer.grid(row=2, column=0, sticky="ew", padx=30, pady=(0, 18))
@@ -136,6 +156,9 @@ class SystemSettingsDialog:
         )
         self.database_save_button = self._button(
             footer, "保存数据库配置", self._save_database, ACCENT, "#FFFFFF"
+        )
+        self.knowledge_save_button = self._button(
+            footer, "保存 Markdown", self._save_knowledge, ACCENT, "#FFFFFF"
         )
         self.notebook.bind("<<NotebookTabChanged>>", self._sync_footer_actions)
         self._sync_footer_actions()
@@ -313,18 +336,159 @@ class SystemSettingsDialog:
             button.pack(side="left", padx=(0, 18))
             self.db_option_buttons.append(button)
 
+    def _build_knowledge_tab(self) -> None:
+        tab = self.knowledge_tab
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(5, weight=1)
+        self.knowledge_workspace_var = tk.StringVar(value=self.knowledge_workspace)
+        self.knowledge_domain_var = tk.StringVar(value="开发")
+        self.knowledge_branch_var = tk.StringVar()
+        self.knowledge_new_branch_var = tk.StringVar()
+        self.knowledge_document_var = tk.StringVar()
+        self.knowledge_new_document_var = tk.StringVar()
+        self.knowledge_path_var = tk.StringVar()
+        self.knowledge_status_var = tk.StringVar()
+        self._loaded_knowledge: tuple[str, str, str] | None = None
+
+        self.knowledge_status_label = self._status(tab, self.knowledge_status_var, 0)
+
+        workspace_row = tk.Frame(tab, bg=CARD)
+        workspace_row.grid(row=1, column=0, sticky="ew", padx=26, pady=(2, 6))
+        workspace_row.grid_columnconfigure(1, weight=1)
+        self._inline_row_label(workspace_row, "项目路径", 0)
+        self.knowledge_workspace_entry = self._entry(
+            workspace_row, self.knowledge_workspace_var
+        )
+        self.knowledge_workspace_entry.grid(
+            row=0, column=1, sticky="ew", padx=(10, 8), ipady=5
+        )
+        self.knowledge_workspace_entry.configure(
+            state="readonly", readonlybackground="#FFFFFF"
+        )
+        self.knowledge_workspace_button = self._button(
+            workspace_row, "切换…", self._browse_knowledge_workspace, PANEL, TEXT
+        )
+        self.knowledge_workspace_button.grid(row=0, column=2)
+
+        branch_row = tk.Frame(tab, bg=CARD)
+        branch_row.grid(row=2, column=0, sticky="ew", padx=26, pady=(0, 6))
+        branch_row.grid_columnconfigure(5, weight=1)
+        self._inline_row_label(branch_row, "流程", 0)
+        self.knowledge_domain_combo = ttk.Combobox(
+            branch_row,
+            textvariable=self.knowledge_domain_var,
+            values=["开发", "异常处理"],
+            state="readonly",
+            width=10,
+            font=("Microsoft YaHei UI", 9),
+        )
+        self.knowledge_domain_combo.grid(row=0, column=1, padx=(8, 16), ipady=4)
+        self.knowledge_domain_combo.bind(
+            "<<ComboboxSelected>>", self._on_knowledge_domain_changed
+        )
+        self._inline_row_label(branch_row, "二级分支", 2)
+        self.knowledge_branch_combo = ttk.Combobox(
+            branch_row,
+            textvariable=self.knowledge_branch_var,
+            state="readonly",
+            width=16,
+            font=("Microsoft YaHei UI", 9),
+        )
+        self.knowledge_branch_combo.grid(row=0, column=3, padx=(8, 16), ipady=4)
+        self.knowledge_branch_combo.bind(
+            "<<ComboboxSelected>>", self._on_knowledge_branch_changed
+        )
+        self._inline_row_label(branch_row, "新分支", 4)
+        self.knowledge_new_branch_entry = self._entry(
+            branch_row, self.knowledge_new_branch_var
+        )
+        self.knowledge_new_branch_entry.grid(
+            row=0, column=5, sticky="ew", padx=(8, 0), ipady=5
+        )
+        self.knowledge_add_branch_button = self._button(
+            branch_row, "添加分支", self._add_knowledge_branch, PANEL, TEXT
+        )
+        self.knowledge_add_branch_button.grid(row=0, column=6, padx=(8, 0))
+
+        document_row = tk.Frame(tab, bg=CARD)
+        document_row.grid(row=3, column=0, sticky="ew", padx=26, pady=(0, 6))
+        document_row.grid_columnconfigure(3, weight=1)
+        self._inline_row_label(document_row, "MD 文件", 0)
+        self.knowledge_document_combo = ttk.Combobox(
+            document_row,
+            textvariable=self.knowledge_document_var,
+            state="readonly",
+            width=30,
+            font=("Microsoft YaHei UI", 9),
+        )
+        self.knowledge_document_combo.grid(row=0, column=1, padx=(8, 16), ipady=4)
+        self.knowledge_document_combo.bind(
+            "<<ComboboxSelected>>", self._on_knowledge_document_changed
+        )
+        self._inline_row_label(document_row, "新文件", 2)
+        self.knowledge_new_document_entry = self._entry(
+            document_row, self.knowledge_new_document_var
+        )
+        self.knowledge_new_document_entry.grid(
+            row=0, column=3, sticky="ew", padx=(8, 0), ipady=5
+        )
+        self.knowledge_add_document_button = self._button(
+            document_row, "新建 MD", self._add_knowledge_document, PANEL, TEXT
+        )
+        self.knowledge_add_document_button.grid(row=0, column=4, padx=(8, 0))
+
+        path_row = tk.Frame(tab, bg=CARD)
+        path_row.grid(row=4, column=0, sticky="ew", padx=26, pady=(0, 6))
+        path_row.grid_columnconfigure(1, weight=1)
+        self._inline_row_label(path_row, "保存路径", 0)
+        self.knowledge_path_entry = self._entry(path_row, self.knowledge_path_var)
+        self.knowledge_path_entry.grid(
+            row=0, column=1, sticky="ew", padx=(8, 0), ipady=4
+        )
+        self.knowledge_path_entry.configure(state="readonly", readonlybackground=PANEL)
+
+        editor_frame = tk.Frame(tab, bg=CARD)
+        editor_frame.grid(row=5, column=0, sticky="nsew", padx=26, pady=(0, 12))
+        editor_frame.grid_columnconfigure(0, weight=1)
+        editor_frame.grid_rowconfigure(0, weight=1)
+        self.knowledge_editor = tk.Text(
+            editor_frame,
+            wrap="word",
+            undo=True,
+            font=("Consolas", 10),
+            fg=TEXT,
+            bg="#FFFFFF",
+            insertbackground=TEXT,
+            selectbackground="#BFDBFE",
+            relief="solid",
+            borderwidth=1,
+            padx=10,
+            pady=8,
+        )
+        self.knowledge_editor.grid(row=0, column=0, sticky="nsew")
+        knowledge_scroll = ttk.Scrollbar(
+            editor_frame, orient="vertical", command=self.knowledge_editor.yview
+        )
+        knowledge_scroll.grid(row=0, column=1, sticky="ns")
+        self.knowledge_editor.configure(yscrollcommand=knowledge_scroll.set)
+        self.knowledge_editor.bind("<<Modified>>", self._on_knowledge_modified)
+        self._refresh_knowledge()
+
     def _sync_footer_actions(self, _event: tk.Event[tk.Misc] | None = None) -> None:
         for button in (
             self.close_button,
             self.model_save_button,
             self.database_test_button,
             self.database_save_button,
+            self.knowledge_save_button,
         ):
             button.pack_forget()
         self.close_button.pack(side="right")
         if self.notebook.select() == str(self.database_tab):
             self.database_save_button.pack(side="right", padx=(0, 8))
             self.database_test_button.pack(side="right", padx=(0, 8))
+        elif self.notebook.select() == str(self.knowledge_tab):
+            self.knowledge_save_button.pack(side="right", padx=(0, 8))
         else:
             self.model_save_button.pack(side="right", padx=(0, 8))
 
@@ -462,6 +626,218 @@ class SystemSettingsDialog:
         if self.on_database_saved:
             self.on_database_saved(state)
 
+    def _knowledge_domain(self) -> KnowledgeDomain:
+        return (
+            KnowledgeDomain.INCIDENT
+            if self.knowledge_domain_var.get() == "异常处理"
+            else KnowledgeDomain.DEVELOPMENT
+        )
+
+    def _refresh_knowledge(
+        self,
+        *,
+        preferred_branch: str = "",
+        preferred_document: str = "",
+        confirm_discard: bool = False,
+    ) -> None:
+        if confirm_discard and not self._confirm_discard_knowledge():
+            self._restore_loaded_knowledge_selection()
+            return
+        try:
+            workspace = self.knowledge_workspace_var.get()
+            domain = self._knowledge_domain()
+            branches = self.knowledge_service.list_branches(workspace, domain)
+            self.knowledge_branch_combo.configure(values=branches)
+            selected_branch = preferred_branch or self.knowledge_branch_var.get()
+            if selected_branch not in branches:
+                selected_branch = branches[0] if branches else ""
+            self.knowledge_branch_var.set(selected_branch)
+            documents = (
+                self.knowledge_service.list_documents(
+                    workspace, domain, selected_branch
+                )
+                if selected_branch
+                else []
+            )
+            document_names = [item.name for item in documents]
+            self.knowledge_document_combo.configure(values=document_names)
+            selected_document = preferred_document or self.knowledge_document_var.get()
+            if selected_document not in document_names:
+                selected_document = document_names[0] if document_names else ""
+            self.knowledge_document_var.set(selected_document)
+            if selected_document:
+                self._load_knowledge_document()
+            else:
+                self._clear_knowledge_editor()
+                if selected_branch:
+                    branch_path = self.knowledge_service.branch_path(
+                        workspace, domain, selected_branch
+                    )
+                    self.knowledge_path_var.set(str(branch_path))
+                    self._set_knowledge_status("当前分支还没有 Markdown 文件。", MUTED)
+                else:
+                    self.knowledge_path_var.set("")
+                    self._set_knowledge_status("请先添加一个二级分支。", MUTED)
+        except Exception as exc:
+            self.knowledge_branch_combo.configure(values=[])
+            self.knowledge_document_combo.configure(values=[])
+            self.knowledge_branch_var.set("")
+            self.knowledge_document_var.set("")
+            self.knowledge_path_var.set("")
+            self._clear_knowledge_editor()
+            self._set_knowledge_status(f"无法读取 Markdown 配置：{exc}", DANGER)
+
+    def _load_knowledge_document(self) -> None:
+        try:
+            domain = self._knowledge_domain()
+            branch = self.knowledge_branch_var.get()
+            document = self.knowledge_document_var.get()
+            path, content = self.knowledge_service.load_document(
+                self.knowledge_workspace_var.get(), domain, branch, document
+            )
+        except Exception as exc:
+            self._set_knowledge_status(f"无法读取 Markdown：{exc}", DANGER)
+            return
+        self.knowledge_editor.delete("1.0", "end")
+        self.knowledge_editor.insert("1.0", content)
+        self.knowledge_editor.edit_modified(False)
+        self.knowledge_path_var.set(str(path))
+        self._loaded_knowledge = (domain.value, branch, document)
+        self._set_knowledge_status("已加载，可直接编辑后保存。", SUCCESS)
+
+    def _clear_knowledge_editor(self) -> None:
+        self.knowledge_editor.delete("1.0", "end")
+        self.knowledge_editor.edit_modified(False)
+        self._loaded_knowledge = None
+
+    def _add_knowledge_branch(self) -> None:
+        if not self._confirm_discard_knowledge():
+            return
+        name = self.knowledge_new_branch_var.get()
+        try:
+            path = self.knowledge_service.create_branch(
+                self.knowledge_workspace_var.get(), self._knowledge_domain(), name
+            )
+        except WorkspaceKnowledgeError as exc:
+            messagebox.showerror("无法添加二级分支", str(exc), parent=self.window)
+            return
+        except Exception as exc:
+            messagebox.showerror("添加分支失败", str(exc), parent=self.window)
+            return
+        self.knowledge_new_branch_var.set("")
+        self._refresh_knowledge(preferred_branch=path.name)
+        self._set_knowledge_status(f"已添加二级分支：{path.name}", SUCCESS)
+
+    def _add_knowledge_document(self) -> None:
+        if not self._confirm_discard_knowledge():
+            return
+        branch = self.knowledge_branch_var.get()
+        if not branch:
+            messagebox.showinfo("先添加分支", "请先添加或选择一个二级分支。", parent=self.window)
+            return
+        try:
+            path = self.knowledge_service.create_document(
+                self.knowledge_workspace_var.get(),
+                self._knowledge_domain(),
+                branch,
+                self.knowledge_new_document_var.get(),
+            )
+        except WorkspaceKnowledgeError as exc:
+            messagebox.showerror("无法新建 Markdown", str(exc), parent=self.window)
+            return
+        except Exception as exc:
+            messagebox.showerror("新建 Markdown 失败", str(exc), parent=self.window)
+            return
+        self.knowledge_new_document_var.set("")
+        self._refresh_knowledge(
+            preferred_branch=branch,
+            preferred_document=path.name,
+        )
+        self.knowledge_editor.focus_set()
+
+    def _save_knowledge(self) -> bool:
+        try:
+            path = self.knowledge_service.save_document(
+                self.knowledge_workspace_var.get(),
+                self._knowledge_domain(),
+                self.knowledge_branch_var.get(),
+                self.knowledge_document_var.get(),
+                self.knowledge_editor.get("1.0", "end-1c"),
+            )
+        except WorkspaceKnowledgeError as exc:
+            messagebox.showerror("Markdown 未保存", str(exc), parent=self.window)
+            return False
+        except Exception as exc:
+            messagebox.showerror("保存 Markdown 失败", str(exc), parent=self.window)
+            return False
+        self.knowledge_editor.edit_modified(False)
+        self.knowledge_path_var.set(str(path))
+        self._loaded_knowledge = (
+            self._knowledge_domain().value,
+            self.knowledge_branch_var.get(),
+            self.knowledge_document_var.get(),
+        )
+        self._set_knowledge_status("Markdown 已保存，能力索引已更新。", SUCCESS)
+        return True
+
+    def _browse_knowledge_workspace(self) -> None:
+        if not self._confirm_discard_knowledge():
+            return
+        current = Path(self.knowledge_workspace_var.get()).expanduser()
+        initial = str(current if current.is_dir() else Path.cwd())
+        selected = filedialog.askdirectory(
+            title="选择 Markdown 所属项目",
+            initialdir=initial,
+            mustexist=True,
+            parent=self.window,
+        )
+        if selected:
+            self.knowledge_workspace_var.set(str(Path(selected).resolve()))
+            self.knowledge_branch_var.set("")
+            self.knowledge_document_var.set("")
+            self._refresh_knowledge()
+
+    def _on_knowledge_domain_changed(self, _event: tk.Event[tk.Misc]) -> None:
+        self._refresh_knowledge(confirm_discard=True)
+
+    def _on_knowledge_branch_changed(self, _event: tk.Event[tk.Misc]) -> None:
+        self.knowledge_document_var.set("")
+        self._refresh_knowledge(
+            preferred_branch=self.knowledge_branch_var.get(),
+            confirm_discard=True,
+        )
+
+    def _on_knowledge_document_changed(self, _event: tk.Event[tk.Misc]) -> None:
+        if not self._confirm_discard_knowledge():
+            self._restore_loaded_knowledge_selection()
+            return
+        self._load_knowledge_document()
+
+    def _on_knowledge_modified(self, _event: tk.Event[tk.Misc]) -> None:
+        if self.knowledge_editor.edit_modified():
+            self._set_knowledge_status("内容已修改，尚未保存。", ACCENT)
+
+    def _confirm_discard_knowledge(self) -> bool:
+        if not self.knowledge_editor.edit_modified():
+            return True
+        return messagebox.askyesno(
+            "尚未保存",
+            "当前 Markdown 有未保存修改，是否放弃这些修改？",
+            parent=self.window,
+        )
+
+    def _restore_loaded_knowledge_selection(self) -> None:
+        if self._loaded_knowledge is None:
+            return
+        domain, branch, document = self._loaded_knowledge
+        self.knowledge_domain_var.set("异常处理" if domain == "incident" else "开发")
+        self.knowledge_branch_var.set(branch)
+        self.knowledge_document_var.set(document)
+
+    def _set_knowledge_status(self, message: str, color: str) -> None:
+        self.knowledge_status_var.set(message)
+        self.knowledge_status_label.configure(fg=color)
+
     def _sync_database_auth(self) -> None:
         sql_auth = self.db_auth_var.get() == SQLServerAuthentication.SQL_PASSWORD.value
         state = "normal" if sql_auth and not self._testing_database else "disabled"
@@ -532,6 +908,17 @@ class SystemSettingsDialog:
         ).grid(row=0, column=column, sticky="w", pady=(0, 4))
 
     @staticmethod
+    def _inline_row_label(parent: tk.Misc, text: str, column: int) -> None:
+        tk.Label(
+            parent,
+            text=text,
+            font=("Microsoft YaHei UI", 8, "bold"),
+            fg=TEXT,
+            bg=CARD,
+            anchor="w",
+        ).grid(row=0, column=column, sticky="w")
+
+    @staticmethod
     def _entry(
         parent: tk.Misc,
         variable: tk.StringVar,
@@ -578,6 +965,8 @@ class SystemSettingsDialog:
 
     def _close(self) -> None:
         if self._testing_database:
+            return
+        if not self._confirm_discard_knowledge():
             return
         if self.required_model_setup and not self.model_service.inspect().ready:
             self.window.grab_release()

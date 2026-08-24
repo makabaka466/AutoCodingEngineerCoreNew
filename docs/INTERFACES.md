@@ -1,6 +1,6 @@
 # AutoCoding Engineer 接口与数据契约
 
-本文记录当前 `0.3.1` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
+本文记录当前 `0.3.2` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
 Runtime、持久化和状态契约。
 设计动机和运行流程见[架构说明](ARCHITECTURE.md)。
 
@@ -395,8 +395,9 @@ JSON 内容是 `AgentSession.model_dump(mode="json")` 的完整结果。
 开发 `CapabilityStore` 与异常 `IncidentCapabilityStore` 当前由各自 Engine 直接调用，没有单独
 Protocol。两者根目录分别是
 `<data_dir>/workspaces/<workspace-id>/development/` 与 `incident/`。
-每个领域目录可包含 `pinned/*.md` 用户基础知识；`prepare()` 会把这些文档链接写入本领域索引，
-并保证开发与异常内容互不混用。
+每个领域目录可包含 `pinned/<二级分支>/*.md` 用户基础知识；`prepare()` 会递归把这些文档链接
+写入本领域索引，并保证开发与异常内容互不混用。`MarkdownKnowledgeService` 提供二级分支
+列表/创建、MD 列表/创建/读取/原子保存、旧顶层 pinned 文档迁移与索引刷新。
 
 ```python
 prepare(workspace: str | Path) -> Path
@@ -527,7 +528,7 @@ autocoding-agent-client
 期间客户端会阻止关闭，而不是显示无法兑现的“停止”操作。Windows 下还会使用当前登录
 会话内的命名互斥量保持单实例，避免两个桌面窗口并发写同一会话存储。
 
-系统配置是一个窗口、两个页签。模型页字段为 Claude Code 路径、API 地址、模型名称和 API
+系统配置是一个窗口、三个页签。模型页字段为 Claude Code 路径、API 地址、模型名称和 API
 Key。Claude 路径会通过
 `--version` 验证；Key 控件始终为空并以密码形式输入，`has_api_key=true` 时留空保存表示保留
 原密钥。保存成功后当前进程立即生效，并重建两套 Runtime，但不删除已有会话。
@@ -537,6 +538,11 @@ SQL Server 页包含服务器、端口、数据库、已安装 ODBC 驱动、Win
 `<data_dir>/database/sqlserver.json`；密码通过 Windows Credential Manager 保存，不进入 JSON、
 日志、模型提示词或会话。两套流程共享连接；连接可随时更换，已有开发或异常会话保持原连接，
 新配置从对应流程的下一项任务开始。
+
+“MD 能力配置”页显示项目路径，并按“开发/异常处理 → 二级分支 → MD 文件”导航。用户可以
+切换项目、添加二级分支、新建 MD、直接编辑并保存；只读路径框显示实际落盘位置。未保存内容
+在切换文档或关闭窗口前会得到确认。分支名和文件名不能包含路径分隔符、`..`、Windows 保留
+字符或设备名。
 
 ## 9. Streamlit Web UI
 
