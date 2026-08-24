@@ -137,7 +137,12 @@ def test_incident_flow_locates_page_queries_data_and_diagnoses(tmp_path: Path) -
         model="test-model",
     )
 
-    outcome = engine.start(workspace, "Order 42 never completes", "/orders/42")
+    outcome = engine.start(
+        workspace,
+        "Order 42 never completes",
+        "/orders/42",
+        project="生物",
+    )
 
     assert outcome.status == IncidentStatus.COMPLETED
     assert outcome.page == _page()
@@ -148,6 +153,8 @@ def test_incident_flow_locates_page_queries_data_and_diagnoses(tmp_path: Path) -
     assert runtime.turns[0].runtime_session_id is None
     assert runtime.turns[1].runtime_session_id == outcome.session_id
     assert store.load(outcome.session_id).database_reference == database_reference
+    assert store.load(outcome.session_id).project == "生物"
+    assert "selected the knowledge project '生物'" in runtime.turns[0].system_prompt
     session_file = tmp_path / "data" / "incidents" / f"{outcome.session_id}.json"
     assert '"status": "stuck"' not in session_file.read_text(encoding="utf-8")
     assert outcome.capability_document is not None

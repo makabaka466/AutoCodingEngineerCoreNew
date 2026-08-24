@@ -53,6 +53,7 @@ class SystemSettingsDialog:
         required_model_setup: bool = False,
         on_model_saved: Callable[[ModelSetupState], None] | None = None,
         on_database_saved: Callable[[SQLServerConfigState], None] | None = None,
+        on_knowledge_changed: Callable[[], None] | None = None,
     ) -> None:
         self.parent = parent
         self.model_service = model_service
@@ -60,6 +61,7 @@ class SystemSettingsDialog:
         self.knowledge_service = knowledge_service or MarkdownKnowledgeService()
         self.on_model_saved = on_model_saved
         self.on_database_saved = on_database_saved
+        self.on_knowledge_changed = on_knowledge_changed
         self.required_model_setup = required_model_setup
         self.model_state = model_service.inspect()
         self.database_state = database_service.inspect()
@@ -646,6 +648,8 @@ class SystemSettingsDialog:
         self._set_knowledge_status(
             f"已添加二级分支 {path.stem}，并创建唯一 Markdown 文档。", SUCCESS
         )
+        if self.on_knowledge_changed:
+            self.on_knowledge_changed()
         self.knowledge_editor.focus_set()
 
     def _save_knowledge(self) -> bool:

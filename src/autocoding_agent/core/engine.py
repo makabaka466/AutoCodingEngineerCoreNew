@@ -60,7 +60,12 @@ class AgentEngine:
         self.database_reference = database_reference
         self.max_query_rounds = max_query_rounds
 
-    def start(self, workspace: str | Path, message: str) -> AgentOutcome:
+    def start(
+        self,
+        workspace: str | Path,
+        message: str,
+        project: str | None = None,
+    ) -> AgentOutcome:
         canonical = Path(workspace).expanduser().resolve(strict=True)
         if not canonical.is_dir():
             raise ValueError(f"Workspace is not a directory: {canonical}")
@@ -69,6 +74,7 @@ class AgentEngine:
         session = AgentSession(
             workspace=str(canonical),
             goal=message.strip(),
+            project=project.strip() if project and project.strip() else None,
             database_reference=self.database_reference,
         )
         self.sessions.create(session)
@@ -153,7 +159,7 @@ class AgentEngine:
         session.updated_at = utc_now()
         self.sessions.save(session)
 
-        capability_dir = self.capabilities.prepare(session.workspace)
+        capability_dir = self.capabilities.prepare(session.workspace, session.project)
         profile = self.policy.profile(mode)
         # The memory directory is outside the target workspace. Mount it only when no
         # write/command tool exists; resumed modes retain anything already read.
@@ -184,6 +190,7 @@ class AgentEngine:
                         mode,
                         readable_capability_dir,
                         database_schema,
+                        session.project,
                     ),
                     tools=list(profile.tools),
                     allowed_tools=list(profile.allowed_tools),

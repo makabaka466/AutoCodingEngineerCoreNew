@@ -24,14 +24,16 @@ class IncidentCapabilityStore:
         self.root = self.data_dir / "workspaces"
         self.knowledge_root = knowledge_root.resolve() if knowledge_root else None
 
-    def prepare(self, workspace: str | Path) -> Path:
+    def prepare(self, workspace: str | Path, project: str | None = None) -> Path:
         directory = self._workspace_dir(workspace)
         (directory / "capabilities").mkdir(parents=True, exist_ok=True)
         (directory / "pinned").mkdir(parents=True, exist_ok=True)
         (directory / "tasks").mkdir(parents=True, exist_ok=True)
         if self.knowledge_root is not None:
-            sync_knowledge_documents(self.knowledge_root, directory / "pinned")
-        self._rebuild_index(directory)
+            sync_knowledge_documents(
+                self.knowledge_root, directory / "pinned", project
+            )
+        self._rebuild_index(directory, project)
         return directory
 
     def record(
@@ -40,13 +42,13 @@ class IncidentCapabilityStore:
         decision: IncidentDecision,
         model: str,
     ) -> CapabilityReceipt:
-        directory = self.prepare(session.workspace)
+        directory = self.prepare(session.workspace, session.project)
         document = directory / "capabilities" / f"{session.id}.md"
         task_record = directory / "tasks" / f"{session.id}.json"
         index_file = directory / "CAPABILITIES.md"
         if task_record.exists():
             stored = json.loads(task_record.read_text(encoding="utf-8"))
-            self._rebuild_index(directory)
+            self._rebuild_index(directory, session.project)
             return CapabilityReceipt(
                 document_path=str(directory / stored["document"]),
                 index_path=str(index_file),
@@ -63,6 +65,7 @@ class IncidentCapabilityStore:
             "task_id": session.id,
             "session_id": session.id,
             "workspace_id": directory.parent.name,
+            "project": session.project,
             "problem": safe(session.problem),
             "outcome": safe(decision.message),
             "document": relative_document,
@@ -70,7 +73,7 @@ class IncidentCapabilityStore:
             "completed_at": session.updated_at.isoformat(),
         }
         self._atomic_text(task_record, json.dumps(record, ensure_ascii=False, indent=2))
-        self._rebuild_index(directory)
+        self._rebuild_index(directory, session.project)
         return CapabilityReceipt(
             document_path=str(document),
             index_path=str(index_file),
@@ -155,8 +158,8 @@ completed_at: {json.dumps(session.updated_at.isoformat())}
 - 复用前必须以当前代码、当前数据权限和最新业务状态重新验证。
 """
 
-    def _rebuild_index(self, directory: Path) -> None:
-        pinned = pinned_markdown_entries(directory)
+    def _rebuild_index(self, directory: Path, project: str | None = None) -> None:
+        pinned = pinned_markdown_entries(directory, project)
         entries: list[str] = []
         for record_file in sorted((directory / "tasks").glob("*.json")):
             record = json.loads(record_file.read_text(encoding="utf-8"))

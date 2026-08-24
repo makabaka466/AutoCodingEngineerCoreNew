@@ -86,6 +86,7 @@ class IncidentSession(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid4()))
     workspace: str
     problem: str
+    project: str | None = None
     page_hint: str | None = None
     database_reference: str | None = None
     source: str = "manual"

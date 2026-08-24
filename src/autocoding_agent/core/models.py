@@ -169,6 +169,7 @@ class AgentSession(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid4()))
     workspace: str
     goal: str
+    project: str | None = None
     runtime_session_id: str | None = None
     status: AgentStatus | None = None
     pending_approval: ApprovalRequest | None = None

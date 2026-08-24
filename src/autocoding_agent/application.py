@@ -25,8 +25,13 @@ class AgentApplication:
         self._engine = engine
         self.log_path = log_path
 
-    def start(self, workspace: str | Path, message: str) -> AgentOutcome:
-        return self._engine.start(workspace, message)
+    def start(
+        self,
+        workspace: str | Path,
+        message: str,
+        project: str | None = None,
+    ) -> AgentOutcome:
+        return self._engine.start(workspace, message, project)
 
     def send(self, session_id: str, message: str) -> AgentOutcome:
         return self._engine.send(session_id, message)

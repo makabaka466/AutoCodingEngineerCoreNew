@@ -141,7 +141,7 @@ def test_multi_turn_clarification_preserves_full_history(tmp_path: Path) -> None
     )
     app = _app(tmp_path / "state", runtime)
 
-    first = app.start(workspace, "Please optimize this project.")
+    first = app.start(workspace, "Please optimize this project.", project="生物")
     second = app.send(first.session_id, "The upload behavior is wrong.")
     final = app.send(first.session_id, "POST /upload succeeds but testMod is missing.")
 
@@ -166,6 +166,8 @@ def test_multi_turn_clarification_preserves_full_history(tmp_path: Path) -> None
     assert event_types.count(EventType.INPUT_REQUIRED) == 2
     assert event_types.count(EventType.TASK_COMPLETED) == 1
     assert event_types.count(EventType.CAPABILITY_SAVED) == 1
+    assert app.get_session(first.session_id).project == "生物"
+    assert "selected the knowledge project '生物'" in runtime.turns[0].system_prompt
 
 
 def test_development_flow_can_use_shared_read_only_database(tmp_path: Path) -> None:

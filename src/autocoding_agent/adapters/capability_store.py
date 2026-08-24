@@ -28,15 +28,17 @@ class CapabilityStore:
         self.root = self.data_dir / "workspaces"
         self.knowledge_root = knowledge_root.resolve() if knowledge_root else None
 
-    def prepare(self, workspace: str | Path) -> Path:
+    def prepare(self, workspace: str | Path, project: str | None = None) -> Path:
         directory = self._workspace_dir(workspace)
         self._migrate_legacy(directory)
         (directory / "capabilities").mkdir(parents=True, exist_ok=True)
         (directory / "pinned").mkdir(parents=True, exist_ok=True)
         (directory / "tasks").mkdir(parents=True, exist_ok=True)
         if self.knowledge_root is not None:
-            sync_knowledge_documents(self.knowledge_root, directory / "pinned")
-        self._rebuild_index(directory)
+            sync_knowledge_documents(
+                self.knowledge_root, directory / "pinned", project
+            )
+        self._rebuild_index(directory, project)
         return directory
 
     def record(
@@ -45,7 +47,7 @@ class CapabilityStore:
         decision: AgentDecision,
         model: str,
     ) -> CapabilityReceipt:
-        directory = self.prepare(session.workspace)
+        directory = self.prepare(session.workspace, session.project)
         draft = decision.capability or self._fallback_draft(session, decision)
         # A UUID-only filename cannot leak a secret that the model placed in a title.
         document = directory / "capabilities" / f"{session.id}.md"
@@ -54,7 +56,7 @@ class CapabilityStore:
 
         if task_record.exists():
             stored = json.loads(task_record.read_text(encoding="utf-8"))
-            self._rebuild_index(directory)
+            self._rebuild_index(directory, session.project)
             return CapabilityReceipt(
                 document_path=str(directory / stored["document"]),
                 index_path=str(index_file),
@@ -72,6 +74,7 @@ class CapabilityStore:
             "task_id": session.id,
             "session_id": session.id,
             "workspace_id": directory.parent.name,
+            "project": session.project,
             "goal": safe(session.goal),
             "outcome": safe(decision.message),
             "changed_files": [safe(path) for path in decision.changed_files],
@@ -81,7 +84,7 @@ class CapabilityStore:
             "completed_at": session.updated_at.isoformat(),
         }
         self._atomic_text(task_record, json.dumps(record, ensure_ascii=False, indent=2))
-        self._rebuild_index(directory)
+        self._rebuild_index(directory, session.project)
         return CapabilityReceipt(
             document_path=str(document),
             index_path=str(index_file),
@@ -177,8 +180,8 @@ completed_at: {json.dumps(session.updated_at.isoformat())}
 - 变更文件：{", ".join(safe(path) for path in decision.changed_files) or "无"}
 """
 
-    def _rebuild_index(self, directory: Path) -> None:
-        pinned = pinned_markdown_entries(directory)
+    def _rebuild_index(self, directory: Path, project: str | None = None) -> None:
+        pinned = pinned_markdown_entries(directory, project)
         entries: list[str] = []
         for record_file in sorted((directory / "tasks").glob("*.json")):
             record = json.loads(record_file.read_text(encoding="utf-8"))
@@ -220,23 +223,42 @@ def _markdown_title(content: str) -> str:
     return "Untitled capability"
 
 
-def pinned_markdown_entries(directory: Path) -> list[str]:
+def pinned_markdown_entries(directory: Path, project: str | None = None) -> list[str]:
     """Return stable links for user-maintained workspace guidance."""
 
     entries: list[str] = []
-    for document in sorted((directory / "pinned").rglob("*.md")):
+    pinned_root = directory / "pinned"
+    if project:
+        selected = (pinned_root / project / f"{project}.md").resolve()
+        documents = [selected] if selected.is_relative_to(pinned_root.resolve()) else []
+    else:
+        documents = sorted(pinned_root.rglob("*.md"))
+    for document in documents:
+        if not document.is_file():
+            continue
         title = _markdown_title(document.read_text(encoding="utf-8"))
         relative = document.relative_to(directory).as_posix()
         entries.append(f"- [{title}]({relative}) — 用户维护的当前工作区基础知识。")
     return entries
 
 
-def sync_knowledge_documents(source_root: Path, pinned_root: Path) -> None:
+def sync_knowledge_documents(
+    source_root: Path,
+    pinned_root: Path,
+    project: str | None = None,
+) -> None:
     """Copy project-level knowledge into a workspace's read-only memory view."""
 
     if not source_root.is_dir():
         return
-    for source in source_root.rglob("*.md"):
+    if project:
+        selected = (source_root / project / f"{project}.md").resolve()
+        if not selected.is_relative_to(source_root.resolve()) or not selected.is_file():
+            raise ValueError(f"Selected knowledge project does not exist: {project}")
+        sources = [selected]
+    else:
+        sources = list(source_root.rglob("*.md"))
+    for source in sources:
         target = pinned_root / source.relative_to(source_root)
         target.parent.mkdir(parents=True, exist_ok=True)
         content = source.read_text(encoding="utf-8")

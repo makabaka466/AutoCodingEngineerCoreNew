@@ -35,6 +35,10 @@ from autocoding_agent.interfaces.system_settings_ui import SystemSettingsDialog
 from autocoding_agent.model_setup import ClaudeModelSetupService, ModelSetupState
 from autocoding_agent.sqlserver_config import SQLServerConfigState
 from autocoding_agent.sqlserver_service import SQLServerConnectionService
+from autocoding_agent.workspace_knowledge import (
+    KnowledgeDomain,
+    MarkdownKnowledgeService,
+)
 
 COLORS = {
     "window": "#F7F8FA",
@@ -249,10 +253,12 @@ class DesktopClient:
         incident_application: IncidentApplication | None = None,
         setup_service: ClaudeModelSetupService | None = None,
         sqlserver_service: SQLServerConnectionService | None = None,
+        knowledge_service: MarkdownKnowledgeService | None = None,
     ) -> None:
         self.root = root
         self.setup_service = setup_service or ClaudeModelSetupService()
         self.sqlserver_service = sqlserver_service or SQLServerConnectionService()
+        self.knowledge_service = knowledge_service or MarkdownKnowledgeService()
         self._applications_injected = application is not None or incident_application is not None
         self._settings_dialog: SystemSettingsDialog | None = None
         self._active_development_database_reference: str | None = None
@@ -282,8 +288,14 @@ class DesktopClient:
         self._busy_tick = 0
         self._current_status: AgentStatus | IncidentStatus | None = None
         self._approval_can_execute = True
+        self._flow_projects: dict[FlowKind, str] = {
+            FlowKind.DEVELOPMENT: "",
+            FlowKind.INCIDENT: "",
+        }
 
         self.workspace_var = tk.StringVar(value=str(Path.cwd()))
+        self.project_var = tk.StringVar()
+        self.project_path_var = tk.StringVar()
         self.page_hint_var = tk.StringVar()
         self.status_var = tk.StringVar(value="就绪")
         self.task_title_var = tk.StringVar(value="新开发任务")
@@ -583,8 +595,37 @@ class DesktopClient:
         )
         self.composer_frame.grid(row=3, column=0, sticky="ew", padx=34, pady=(14, 8))
         self.composer_frame.grid_columnconfigure(0, weight=1)
+
+        project_row = tk.Frame(self.composer_frame, bg=COLORS["input"])
+        project_row.grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 4))
+        project_row.grid_columnconfigure(2, weight=1)
+        tk.Label(
+            project_row,
+            text="项目",
+            font=("Microsoft YaHei UI", 8, "bold"),
+            fg=COLORS["muted"],
+            bg=COLORS["input"],
+        ).grid(row=0, column=0, sticky="w", padx=(0, 9))
+        self.project_combo = ttk.Combobox(
+            project_row,
+            textvariable=self.project_var,
+            state="readonly",
+            width=20,
+            font=("Microsoft YaHei UI", 9),
+        )
+        self.project_combo.grid(row=0, column=1, sticky="w", ipady=5)
+        self.project_combo.bind("<<ComboboxSelected>>", self._on_project_selected)
+        tk.Label(
+            project_row,
+            textvariable=self.project_path_var,
+            font=("Microsoft YaHei UI", 8),
+            fg=COLORS["muted"],
+            bg=COLORS["input"],
+            anchor="w",
+        ).grid(row=0, column=2, sticky="ew", padx=(12, 0))
+
         workspace_row = tk.Frame(self.composer_frame, bg=COLORS["input"])
-        workspace_row.grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 4))
+        workspace_row.grid(row=1, column=0, sticky="ew", padx=12, pady=(2, 4))
         workspace_row.grid_columnconfigure(1, weight=1)
         tk.Label(
             workspace_row,
@@ -619,7 +660,7 @@ class DesktopClient:
 
         self.incident_context_frame = tk.Frame(self.composer_frame, bg=COLORS["input"])
         self.incident_context_frame.grid(
-            row=1,
+            row=2,
             column=0,
             sticky="ew",
             padx=12,
@@ -663,11 +704,11 @@ class DesktopClient:
             pady=10,
             undo=True,
         )
-        self.prompt_input.grid(row=2, column=0, sticky="ew")
+        self.prompt_input.grid(row=3, column=0, sticky="ew")
         self.prompt_input.bind("<Return>", self._on_return)
         self.prompt_input.bind("<Control-Return>", self._on_control_return)
         action_row = tk.Frame(self.composer_frame, bg=COLORS["input"])
-        action_row.grid(row=3, column=0, sticky="ew", padx=10, pady=(0, 9))
+        action_row.grid(row=4, column=0, sticky="ew", padx=10, pady=(0, 9))
         action_row.grid_columnconfigure(0, weight=1)
         tk.Label(
             action_row,
@@ -780,6 +821,36 @@ class DesktopClient:
             self.incident_context_frame.grid_remove()
         else:
             self.incident_context_frame.grid()
+        self._refresh_project_options()
+
+    def _knowledge_domain(self) -> KnowledgeDomain:
+        return (
+            KnowledgeDomain.DEVELOPMENT
+            if self.flow == FlowKind.DEVELOPMENT
+            else KnowledgeDomain.INCIDENT
+        )
+
+    def _refresh_project_options(self) -> None:
+        projects = self.knowledge_service.list_branches(self._knowledge_domain())
+        self.project_combo.configure(values=projects)
+        selected = self._flow_projects[self.flow]
+        if selected not in projects:
+            selected = projects[0] if projects else ""
+        self.project_var.set(selected)
+        self._flow_projects[self.flow] = selected
+        self._refresh_project_path()
+
+    def _on_project_selected(self, _event: tk.Event[tk.Misc]) -> None:
+        self._flow_projects[self.flow] = self.project_var.get()
+        self._refresh_project_path()
+
+    def _refresh_project_path(self) -> None:
+        project = self.project_var.get()
+        if not project:
+            self.project_path_var.set("请先在系统配置中添加项目")
+            return
+        path = self.knowledge_service.branch_path(self._knowledge_domain(), project)
+        self.project_path_var.set(self.knowledge_service.relative_path(path))
 
     def _active_application(self) -> AgentApplication | IncidentApplication:
         if self.flow == FlowKind.DEVELOPMENT:
@@ -861,6 +932,9 @@ class DesktopClient:
 
         self._replace_transcript(entries)
         self.workspace_var.set(session.workspace)
+        self.project_var.set(session.project or "")
+        self._flow_projects[FlowKind.DEVELOPMENT] = session.project or ""
+        self._refresh_project_path()
         title = " ".join(session.goal.split()) or "未命名任务"
         self.task_title_var.set(title[:64] + ("…" if len(title) > 64 else ""))
         self._set_status(session.status)
@@ -923,6 +997,9 @@ class DesktopClient:
 
         self._replace_transcript(entries)
         self.workspace_var.set(session.workspace)
+        self.project_var.set(session.project or "")
+        self._flow_projects[FlowKind.INCIDENT] = session.project or ""
+        self._refresh_project_path()
         self.page_hint_var.set(session.page_hint or "")
         title = " ".join(session.problem.split()) or "未命名异常"
         self.task_title_var.set(title[:64] + ("…" if len(title) > 64 else ""))
@@ -1005,6 +1082,7 @@ class DesktopClient:
             "新开发任务" if self.flow == FlowKind.DEVELOPMENT else "新异常诊断"
         )
         self._hide_approval()
+        self._refresh_project_options()
         self._render_welcome()
         self._sync_controls()
         self.prompt_input.focus_set()
@@ -1043,6 +1121,7 @@ class DesktopClient:
             initial_section=section,
             on_model_saved=self._apply_model_configuration,
             on_database_saved=self._apply_sqlserver_configuration,
+            on_knowledge_changed=self._refresh_project_options,
         )
 
     def _apply_sqlserver_configuration(self, state: SQLServerConfigState) -> None:
@@ -1149,6 +1228,10 @@ class DesktopClient:
             return
 
         if self.session_id is None:
+            project = self.project_var.get().strip()
+            if not project:
+                self.status_var.set("请先选择项目；可在系统配置中添加项目。")
+                return
             workspace = self.workspace_var.get().strip()
             if not workspace:
                 self.status_var.set("请先选择项目目录。")
@@ -1160,7 +1243,7 @@ class DesktopClient:
             if self.flow == FlowKind.DEVELOPMENT:
 
                 def operation() -> AgentOutcome | IncidentOutcome:
-                    return self.application.start(path, message)
+                    return self.application.start(path, message, project)
 
             else:
                 page_hint = self.page_hint_var.get().strip() or None
@@ -1168,7 +1251,7 @@ class DesktopClient:
 
                 def operation() -> AgentOutcome | IncidentOutcome:
                     application = self._incident_application_for_database(database_reference)
-                    return application.start(path, message, page_hint)
+                    return application.start(path, message, page_hint, project=project)
 
         else:
             session_id = self.session_id
@@ -1333,6 +1416,9 @@ class DesktopClient:
         self.new_task_button.configure(state="normal" if can_start_new else "disabled")
         self.workspace_entry.configure(state="normal" if can_choose_workspace else "disabled")
         self.browse_button.configure(state="normal" if can_choose_workspace else "disabled")
+        self.project_combo.configure(
+            state="readonly" if can_choose_workspace else "disabled"
+        )
         incident_input_state = (
             "normal"
             if can_choose_workspace and self.flow == FlowKind.INCIDENT

@@ -30,6 +30,7 @@ class IncidentApplication:
         problem: str,
         page_hint: str | None = None,
         *,
+        project: str | None = None,
         source: str = "manual",
         external_reference: str | None = None,
     ) -> IncidentOutcome:
@@ -37,6 +38,7 @@ class IncidentApplication:
             workspace,
             problem,
             page_hint,
+            project=project,
             source=source,
             external_reference=external_reference,
         )

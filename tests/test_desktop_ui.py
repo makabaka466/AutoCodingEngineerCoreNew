@@ -52,12 +52,18 @@ class FakeApplication:
     def get_session(self, session_id: str) -> AgentSession:
         return self.sessions[session_id]
 
-    def start(self, workspace: str | Path, message: str) -> AgentOutcome:
-        self.calls.append(("start", str(workspace), message))
+    def start(
+        self,
+        workspace: str | Path,
+        message: str,
+        project: str | None = None,
+    ) -> AgentOutcome:
+        self.calls.append(("start", str(workspace), message, project or ""))
         session = AgentSession(
             id=str(uuid4()),
             workspace=str(workspace),
             goal=message,
+            project=project,
             status=AgentStatus.NEEDS_INPUT,
         )
         self.sessions[session.id] = session
@@ -115,12 +121,17 @@ class FakeIncidentApplication:
         workspace: str | Path,
         problem: str,
         page_hint: str | None = None,
+        *,
+        project: str | None = None,
     ) -> IncidentOutcome:
-        self.calls.append(("start", str(workspace), problem, page_hint or ""))
+        self.calls.append(
+            ("start", str(workspace), problem, page_hint or "", project or "")
+        )
         session = IncidentSession(
             id=str(uuid4()),
             workspace=str(workspace),
             problem=problem,
+            project=project,
             page_hint=page_hint,
             status=IncidentStatus.NEEDS_INPUT,
         )
@@ -294,7 +305,9 @@ def test_new_task_routes_first_message_to_application_start(
     client._send_message()
     outcome = operations[0]()
 
-    assert application.calls == [("start", str(tmp_path), "调查 src/app.py 的报错")]
+    assert application.calls == [
+        ("start", str(tmp_path), "调查 src/app.py 的报错", "生物")
+    ]
     assert outcome.status == AgentStatus.NEEDS_INPUT
 
 
@@ -454,6 +467,8 @@ def test_flow_selector_shows_active_flow_and_reveals_incident_fields(
     assert client.development_flow_button.selected is True
     assert client.incident_flow_button.selected is False
     assert client.incident_context_frame.winfo_manager() == ""
+    assert client.project_var.get() == "生物"
+    assert client.project_path_var.get() == "knowledge/development/生物/生物.md"
 
     client._select_flow(FlowKind.INCIDENT)
 
@@ -465,6 +480,8 @@ def test_flow_selector_shows_active_flow_and_reveals_incident_fields(
     assert client.task_title_var.get() == "新异常诊断"
     assert client.page_hint_entry.winfo_manager() == "grid"
     assert not hasattr(client, "database_browse_button")
+    assert client.project_var.get() == "生物"
+    assert client.project_path_var.get() == "knowledge/incident/生物/生物.md"
 
 
 def test_incident_flow_routes_problem_and_page_to_incident_application(
@@ -488,7 +505,7 @@ def test_incident_flow_routes_problem_and_page_to_incident_application(
 
     assert outcome.status == IncidentStatus.NEEDS_INPUT
     assert incident_application.calls == [
-        ("start", str(tmp_path), "订单一直停留在处理中", "/orders/42")
+        ("start", str(tmp_path), "订单一直停留在处理中", "/orders/42", "生物")
     ]
 
 

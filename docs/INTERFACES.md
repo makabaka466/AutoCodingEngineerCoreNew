@@ -1,6 +1,6 @@
 # AutoCoding Engineer 接口与数据契约
 
-本文记录当前 `0.3.5` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
+本文记录当前 `0.3.6` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
 Runtime、持久化和状态契约。
 设计动机和运行流程见[架构说明](ARCHITECTURE.md)。
 
@@ -42,7 +42,7 @@ def build_application(
 
 | 方法 | 输入 | 行为和返回 |
 | --- | --- | --- |
-| `start(workspace, message)` | `str | Path`, `str` | 新建任务并执行首个只读轮次，返回 `AgentOutcome` |
+| `start(workspace, message, project=None)` | `str | Path`, `str`, `str | None` | 新建任务，保存所选知识项目并执行首个只读轮次，返回 `AgentOutcome` |
 | `send(session_id, message)` | `str`, `str` | 补充澄清或修订指令，以只读模式继续 |
 | `approve(session_id)` | `str` | 批准当前请求的精确 scope，并以对应模式继续 |
 | `reject(session_id, reason="")` | `str`, `str` | 拒绝当前请求，以只读模式继续并要求替代方案 |
@@ -53,6 +53,7 @@ def build_application(
 主要前置条件：
 
 - `start` 的工作区必须真实存在且为目录，任务消息不能为空；
+- `project` 对应当前流程 `knowledge/` 下的二级路径；桌面端要求新任务必须选择；
 - `send` 的消息不能为空，且不能继续已 `completed` 的任务；
 - `approve`、`reject` 只适用于存在 `pending_approval` 的会话；
 - session ID 必须是已保存的 UUID。
@@ -516,6 +517,7 @@ autocoding-agent-client
 
 - 启动前自动检测 Claude Code 和模型配置；未就绪时先显示配置页；
 - 顶部胶囊式“开发 / 异常处理”选择器，蓝底表示当前流程；
+- 对话输入区的“项目”选择框，只列出当前流程的二级路径并显示所用 MD 相对路径；
 - 两套流程各自的当前 session、最近会话、欢迎提示、状态和结果渲染；
 - 白色浅色主题，输入框上方的项目路径选择，以及左侧最近会话；
 - 异常模式下只额外显示页面线索；SQL Server 不重复占用输入区，统一从“系统配置”管理；
@@ -526,7 +528,7 @@ autocoding-agent-client
 - `needs_input`、`approval_required`、`completed`、`failed` 状态提示。
 
 应用方法是同步接口，因此客户端用一个后台工作线程执行每一轮，并通过 Tk 的事件队列回到
-主线程渲染。忙碌期间会禁用发送、会话切换和重复审批。当前 Runtime 没有取消端口；任务运行
+主线程渲染。任务建立后会锁定所选项目，忙碌期间会禁用发送、会话切换和重复审批。当前 Runtime 没有取消端口；任务运行
 期间客户端会阻止关闭，而不是显示无法兑现的“停止”操作。Windows 下还会使用当前登录
 会话内的命名互斥量保持单实例，避免两个桌面窗口并发写同一会话存储。
 
@@ -609,6 +611,7 @@ outcome = incidents.start(
     workspace=r"D:\repo",
     problem="订单 42 一直停留在处理中",
     page_hint="/orders/42",
+    project="生物",
     source="manual",
     external_reference=None,
 )
@@ -616,7 +619,7 @@ outcome = incidents.start(
 
 | 方法 | 行为 |
 | --- | --- |
-| `start(workspace, problem, page_hint=None, *, source="manual", external_reference=None)` | 创建异常会话，定位页面，必要时查询数据库并诊断 |
+| `start(workspace, problem, page_hint=None, *, project=None, source="manual", external_reference=None)` | 创建异常会话，保存所选知识项目，定位页面并在必要时查询数据库 |
 | `send(session_id, message)` | 回答模型澄清问题或补充异常上下文 |
 | `outcome(session_id)` | 返回最新 `IncidentOutcome` |
 | `get_session(session_id)` | 返回完整 `IncidentSession`，但不包含原始数据库行 |
