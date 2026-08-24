@@ -23,8 +23,10 @@ class CapabilityReceipt(BaseModel):
 class CapabilityStore:
     """Persist human-readable learning without touching the user's repository."""
 
-    def __init__(self, root: Path) -> None:
-        self.root = root.resolve() / "workspaces"
+    def __init__(self, root: Path, knowledge_root: Path | None = None) -> None:
+        self.data_dir = root.resolve()
+        self.root = self.data_dir / "workspaces"
+        self.knowledge_root = knowledge_root.resolve() if knowledge_root else None
 
     def prepare(self, workspace: str | Path) -> Path:
         directory = self._workspace_dir(workspace)
@@ -32,6 +34,8 @@ class CapabilityStore:
         (directory / "capabilities").mkdir(parents=True, exist_ok=True)
         (directory / "pinned").mkdir(parents=True, exist_ok=True)
         (directory / "tasks").mkdir(parents=True, exist_ok=True)
+        if self.knowledge_root is not None:
+            sync_knowledge_documents(self.knowledge_root, directory / "pinned")
         self._rebuild_index(directory)
         return directory
 
@@ -225,6 +229,22 @@ def pinned_markdown_entries(directory: Path) -> list[str]:
         relative = document.relative_to(directory).as_posix()
         entries.append(f"- [{title}]({relative}) — 用户维护的当前工作区基础知识。")
     return entries
+
+
+def sync_knowledge_documents(source_root: Path, pinned_root: Path) -> None:
+    """Copy project-level knowledge into a workspace's read-only memory view."""
+
+    if not source_root.is_dir():
+        return
+    for source in source_root.rglob("*.md"):
+        target = pinned_root / source.relative_to(source_root)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        content = source.read_text(encoding="utf-8")
+        if target.is_file() and target.read_text(encoding="utf-8") == content:
+            continue
+        temporary = target.with_suffix(target.suffix + ".tmp")
+        temporary.write_text(content, encoding="utf-8")
+        temporary.replace(target)
 
 
 def sanitize_text(value: str, workspace: str) -> str:

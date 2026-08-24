@@ -15,6 +15,7 @@ from autocoding_agent.observability import configure_file_logging
 from autocoding_agent.ports.database import DatabaseReader
 from autocoding_agent.ports.runtime import AgentRuntime
 from autocoding_agent.skills import SkillRegistry
+from autocoding_agent.workspace_knowledge import PROJECT_KNOWLEDGE_ROOT
 
 
 class AgentApplication:
@@ -58,7 +59,10 @@ def build_application(
     engine = AgentEngine(
         runtime=runtime or ClaudeCodeRuntime(configured),
         sessions=JsonSessionStore(configured.data_dir),
-        capabilities=CapabilityStore(configured.data_dir),
+        capabilities=CapabilityStore(
+            configured.data_dir,
+            knowledge_root=PROJECT_KNOWLEDGE_ROOT / "development",
+        ),
         skills=SkillRegistry(),
         policy=ExecutionPolicy(),
         model=configured.claude_model,

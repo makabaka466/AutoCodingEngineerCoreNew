@@ -34,11 +34,12 @@
   -> 完成时写入能力文档和 CAPABILITIES.md 索引
 ```
 
-能力记忆不会暗中修改目标仓库，也不会覆盖项目已有的 `CLAUDE.md`。开发与异常维护分别写入
-`~/.autocoding-agent/workspaces/<workspace-id>/development/` 和 `incident/`，各自维护独立的
-`CAPABILITIES.md`、`pinned/<二级路径>/<二级路径名>.md` 基础知识、任务记录和能力文档，避免
-两类经验互相污染。系统配置中的“MD 能力配置”可切换开发/异常处理并添加二级路径；每个
-二级路径唯一对应一份同名、可编辑的 Markdown，并显示该文档的真实本地路径。
+能力记忆不会覆盖目标仓库已有的 `CLAUDE.md`。用户维护的基础知识直接保存在本项目的
+`knowledge/development/` 和 `knowledge/incident/`，结构为
+`<二级路径>/<二级路径名>.md`。系统配置中的“MD 能力配置”可切换两套流程并添加二级路径；
+每个二级路径唯一对应一份同名 Markdown，页面显示项目相对路径。任务开始时，本流程知识会
+同步到 `~/.autocoding-agent/workspaces/<workspace-id>/` 的只读能力视图；任务记录与自动生成的
+能力文档仍按目标工作区、按流程分开保存。
 
 ## 异常处理流程（首版框架）
 

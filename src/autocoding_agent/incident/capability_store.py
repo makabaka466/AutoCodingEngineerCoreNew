@@ -11,6 +11,7 @@ from autocoding_agent.adapters.capability_store import (
     CapabilityReceipt,
     pinned_markdown_entries,
     sanitize_text,
+    sync_knowledge_documents,
 )
 from autocoding_agent.incident.models import IncidentDecision, IncidentSession
 
@@ -18,14 +19,18 @@ from autocoding_agent.incident.models import IncidentDecision, IncidentSession
 class IncidentCapabilityStore:
     """Write one sanitized diagnostic capability document per completed incident."""
 
-    def __init__(self, root: Path) -> None:
-        self.root = root.resolve() / "workspaces"
+    def __init__(self, root: Path, knowledge_root: Path | None = None) -> None:
+        self.data_dir = root.resolve()
+        self.root = self.data_dir / "workspaces"
+        self.knowledge_root = knowledge_root.resolve() if knowledge_root else None
 
     def prepare(self, workspace: str | Path) -> Path:
         directory = self._workspace_dir(workspace)
         (directory / "capabilities").mkdir(parents=True, exist_ok=True)
         (directory / "pinned").mkdir(parents=True, exist_ok=True)
         (directory / "tasks").mkdir(parents=True, exist_ok=True)
+        if self.knowledge_root is not None:
+            sync_knowledge_documents(self.knowledge_root, directory / "pinned")
         self._rebuild_index(directory)
         return directory
 

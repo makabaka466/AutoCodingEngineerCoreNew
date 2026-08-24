@@ -377,15 +377,12 @@ def test_system_settings_combines_model_and_shared_database_without_revealing_se
         def drivers(self) -> list[str]:
             return ["ODBC Driver 17 for SQL Server"]
 
-    workspace = tmp_path / "project"
-    workspace.mkdir()
     knowledge_service = MarkdownKnowledgeService(tmp_path / "state")
-    knowledge_service.create_branch(workspace, KnowledgeDomain.DEVELOPMENT, "生物")
+    knowledge_service.create_branch(KnowledgeDomain.DEVELOPMENT, "生物")
     dialog = SystemSettingsDialog(
         root,
         FakeModelService(),  # type: ignore[arg-type]
         FakeDatabaseService(),  # type: ignore[arg-type]
-        workspace=workspace,
         knowledge_service=knowledge_service,
     )
 
@@ -417,23 +414,19 @@ def test_system_settings_combines_model_and_shared_database_without_revealing_se
     assert dialog.knowledge_save_button.winfo_manager() == "pack"
     assert not hasattr(dialog, "knowledge_workspace_entry")
     assert dialog.knowledge_branch_var.get() == "生物"
-    assert dialog.knowledge_path_var.get().endswith(
-        "development\\pinned\\生物\\生物.md"
-    )
+    assert dialog.knowledge_path_var.get() == "knowledge/development/生物/生物.md"
     dialog.knowledge_editor.delete("1.0", "end")
     dialog.knowledge_editor.insert("1.0", "# Updated guide\n")
     assert dialog._save_knowledge() is True
-    assert "Updated guide" in Path(dialog.knowledge_path_var.get()).read_text(
-        encoding="utf-8"
-    )
+    assert "Updated guide" in knowledge_service.branch_path(
+        KnowledgeDomain.DEVELOPMENT, "生物"
+    ).read_text(encoding="utf-8")
     dialog.knowledge_domain_var.set("异常处理")
     dialog._refresh_knowledge()
     dialog.knowledge_new_branch_var.set("生物")
     dialog._add_knowledge_branch()
     assert dialog.knowledge_branch_var.get() == "生物"
-    assert dialog.knowledge_path_var.get().endswith(
-        "incident\\pinned\\生物\\生物.md"
-    )
+    assert dialog.knowledge_path_var.get() == "knowledge/incident/生物/生物.md"
     dialog._close()
 
 

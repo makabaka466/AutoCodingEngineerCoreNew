@@ -1041,7 +1041,6 @@ class DesktopClient:
             self.setup_service,
             self.sqlserver_service,
             initial_section=section,
-            workspace=self.workspace_var.get(),
             on_model_saved=self._apply_model_configuration,
             on_database_saved=self._apply_sqlserver_configuration,
         )

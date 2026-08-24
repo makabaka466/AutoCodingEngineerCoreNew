@@ -1,6 +1,6 @@
 # AutoCoding Engineer 架构说明
 
-本文描述当前 `0.3.4` 代码已经实现的架构。数据字段、公共方法和命令行参数见
+本文描述当前 `0.3.5` 代码已经实现的架构。数据字段、公共方法和命令行参数见
 [接口与数据契约](INTERFACES.md)。
 
 ## 1. 项目目标
@@ -297,10 +297,11 @@ Manager。配置页只获取两个 `has_*` 布尔值，已有密钥和密码都�
 
 能力记忆位于 `Settings.data_dir/workspaces/<workspace_id>/`，不会写入目标仓库。其下按领域
 分成 `development/` 与 `incident/`；两边各有自己的索引、task JSON 和 Markdown，不会互读。
-`pinned/<二级路径>/<二级路径名>.md` 保存用户维护的工作区基础知识，一个二级路径只对应
-一份同名 Markdown；索引每轮重建时都会保留这些链接，自动完成任务产生的文档仍进入
+项目根目录的 `knowledge/<development|incident>/<二级路径>/<二级路径名>.md` 保存用户维护的
+基础知识，一个二级路径只对应一份同名 Markdown。任务开始时，对应流程的项目知识会同步到
+当前工作区能力目录的 `pinned/` 只读视图，索引随后重建；自动完成任务产生的文档仍进入
 `capabilities/`。开发与异常处理拥有各自的二级路径，同名路径也不会共享文件。
-`MarkdownKnowledgeService` 校验 Windows 文件名、限定路径范围并执行原子保存。
+`MarkdownKnowledgeService` 校验 Windows 文件名、限定项目知识目录并执行原子保存。
 `workspace_id` 是规范化工作区绝对路径（不区分大小写）计算出的 SHA-256 前 16 位，因此
 不同路径的项目默认隔离。
 
@@ -335,6 +336,14 @@ flowchart LR
       ├─ pinned/<二级路径>/<二级路径名>.md
       ├─ tasks/<session-id>.json
       └─ capabilities/<session-id>.md
+```
+
+用户直接维护的源文件不在 `<data_dir>`，而在本项目：
+
+```text
+knowledge/
+├─ development/<二级路径>/<二级路径名>.md
+└─ incident/<二级路径>/<二级路径名>.md
 ```
 
 开发能力 Markdown 包含适用场景、方法、验证、风险、任务证据和来源任务；异常能力 Markdown

@@ -4,6 +4,8 @@ from pathlib import Path
 
 import pytest
 
+from autocoding_agent.adapters.capability_store import CapabilityStore
+from autocoding_agent.incident.capability_store import IncidentCapabilityStore
 from autocoding_agent.workspace_knowledge import (
     KnowledgeDomain,
     MarkdownKnowledgeService,
@@ -11,40 +13,54 @@ from autocoding_agent.workspace_knowledge import (
 )
 
 
-def test_markdown_knowledge_is_separate_by_domain_and_branch(tmp_path: Path) -> None:
-    workspace = tmp_path / "project"
-    workspace.mkdir()
+def test_markdown_knowledge_is_project_local_and_separate_by_domain(
+    tmp_path: Path,
+) -> None:
     service = MarkdownKnowledgeService(tmp_path / "state")
-    development_document = service.create_branch(
-        workspace, KnowledgeDomain.DEVELOPMENT, "生物"
-    )
-    service.create_branch(workspace, KnowledgeDomain.DEVELOPMENT, "组装")
-    incident_document = service.create_branch(
-        workspace, KnowledgeDomain.INCIDENT, "生物"
-    )
+    development_document = service.create_branch(KnowledgeDomain.DEVELOPMENT, "生物")
+    service.create_branch(KnowledgeDomain.DEVELOPMENT, "组装")
+    incident_document = service.create_branch(KnowledgeDomain.INCIDENT, "生物")
 
     saved = service.save_branch(
-        workspace,
         KnowledgeDomain.DEVELOPMENT,
         "生物",
         "# Development handoff\n\nCurrent facts.",
     )
 
     assert saved == development_document
-    assert service.list_branches(workspace, KnowledgeDomain.DEVELOPMENT) == [
-        "生物",
-        "组装",
-    ]
-    assert service.list_branches(workspace, KnowledgeDomain.INCIDENT) == ["生物"]
-    development_index = (
-        development_document.parents[2] / "CAPABILITIES.md"
-    ).read_text(encoding="utf-8")
-    incident_index = (incident_document.parents[2] / "CAPABILITIES.md").read_text(
+    assert service.list_branches(KnowledgeDomain.DEVELOPMENT) == ["生物", "组装"]
+    assert service.list_branches(KnowledgeDomain.INCIDENT) == ["生物"]
+    assert development_document == (
+        tmp_path / "state" / "knowledge" / "development" / "生物" / "生物.md"
+    )
+    assert incident_document == (
+        tmp_path / "state" / "knowledge" / "incident" / "生物" / "生物.md"
+    )
+
+
+def test_project_knowledge_is_synced_into_each_workspace_memory(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    service = MarkdownKnowledgeService(state)
+    service.create_branch(KnowledgeDomain.DEVELOPMENT, "生物")
+    service.create_branch(KnowledgeDomain.INCIDENT, "生物")
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+
+    development = CapabilityStore(
+        state, knowledge_root=service.knowledge_root / "development"
+    ).prepare(workspace)
+    incident = IncidentCapabilityStore(
+        state, knowledge_root=service.knowledge_root / "incident"
+    ).prepare(workspace)
+
+    assert (development / "pinned" / "生物" / "生物.md").is_file()
+    assert (incident / "pinned" / "生物" / "生物.md").is_file()
+    assert "pinned/生物/生物.md" in (development / "CAPABILITIES.md").read_text(
         encoding="utf-8"
     )
-    assert "pinned/生物/生物.md" in development_index
-    assert "pinned/生物/生物.md" in incident_index
-    assert development_document != incident_document
+    assert "pinned/生物/生物.md" in (incident / "CAPABILITIES.md").read_text(
+        encoding="utf-8"
+    )
 
 
 @pytest.mark.parametrize("unsafe", ["../escape", "bad/name", "CON", "name."])
@@ -52,31 +68,7 @@ def test_markdown_knowledge_rejects_unsafe_branch_names(
     tmp_path: Path,
     unsafe: str,
 ) -> None:
-    workspace = tmp_path / "project"
-    workspace.mkdir()
     service = MarkdownKnowledgeService(tmp_path / "state")
 
     with pytest.raises(WorkspaceKnowledgeError):
-        service.create_branch(workspace, KnowledgeDomain.DEVELOPMENT, unsafe)
-
-
-def test_flat_branch_document_moves_into_its_named_secondary_path(tmp_path: Path) -> None:
-    workspace = tmp_path / "project"
-    workspace.mkdir()
-    service = MarkdownKnowledgeService(tmp_path / "state")
-    pinned = service.refresh_index(workspace, KnowledgeDomain.DEVELOPMENT) / "pinned"
-    legacy = pinned / "生物.md"
-    legacy.write_text("# Legacy guide\n", encoding="utf-8")
-
-    moved = service.migrate_flat_branch(
-        workspace,
-        KnowledgeDomain.DEVELOPMENT,
-        "生物",
-    )
-
-    assert moved == pinned / "生物" / "生物.md"
-    assert not legacy.exists()
-    assert "# Legacy guide" in moved.read_text(encoding="utf-8")
-    assert "pinned/生物/生物.md" in (
-        pinned.parent / "CAPABILITIES.md"
-    ).read_text(encoding="utf-8")
+        service.create_branch(KnowledgeDomain.DEVELOPMENT, unsafe)

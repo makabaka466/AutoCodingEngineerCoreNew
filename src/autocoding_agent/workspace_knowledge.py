@@ -1,15 +1,11 @@
-"""Editable, workspace-scoped Markdown knowledge organized by workflow and branch."""
+"""Project-local Markdown knowledge organized by workflow and secondary path."""
 
 from __future__ import annotations
 
-import hashlib
 import re
 from enum import StrEnum
 from pathlib import Path
 from uuid import uuid4
-
-from autocoding_agent.adapters.capability_store import CapabilityStore
-from autocoding_agent.incident.capability_store import IncidentCapabilityStore
 
 
 class KnowledgeDomain(StrEnum):
@@ -21,19 +17,19 @@ class WorkspaceKnowledgeError(ValueError):
     """A safe validation error suitable for display in the settings UI."""
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_KNOWLEDGE_ROOT = PROJECT_ROOT / "knowledge"
+
+
 class MarkdownKnowledgeService:
-    """Manage one Markdown document per secondary workflow branch."""
+    """Manage one project-local Markdown document per workflow secondary path."""
 
-    def __init__(self, data_dir: str | Path) -> None:
-        self.data_dir = Path(data_dir).expanduser().resolve()
-        self.workspaces_root = self.data_dir / "workspaces"
+    def __init__(self, project_root: str | Path | None = None) -> None:
+        self.project_root = Path(project_root or PROJECT_ROOT).expanduser().resolve()
+        self.knowledge_root = self.project_root / "knowledge"
 
-    def list_branches(
-        self,
-        workspace: str | Path,
-        domain: KnowledgeDomain,
-    ) -> list[str]:
-        root = self._pinned_root(workspace, domain)
+    def list_branches(self, domain: KnowledgeDomain) -> list[str]:
+        root = self._domain_root(domain)
         if not root.is_dir():
             return []
         return sorted(
@@ -45,98 +41,53 @@ class MarkdownKnowledgeService:
             key=str.casefold,
         )
 
-    def create_branch(
-        self,
-        workspace: str | Path,
-        domain: KnowledgeDomain,
-        name: str,
-    ) -> Path:
-        path = self.branch_path(workspace, domain, name)
+    def create_branch(self, domain: KnowledgeDomain, name: str) -> Path:
+        path = self.branch_path(domain, name)
         if path.parent.exists():
-            raise WorkspaceKnowledgeError(f"二级分支已经存在：{path.stem}")
+            raise WorkspaceKnowledgeError(f"二级路径已经存在：{path.stem}")
         path.parent.mkdir(parents=True)
         self._atomic_text(path, f"# {path.stem}\n\n")
-        self.refresh_index(workspace, domain)
         return path
 
-    def branch_path(
-        self,
-        workspace: str | Path,
-        domain: KnowledgeDomain,
-        branch: str,
-    ) -> Path:
-        root = self._pinned_root(workspace, domain)
-        cleaned = _safe_segment(branch, "二级分支")
+    def branch_path(self, domain: KnowledgeDomain, branch: str) -> Path:
+        root = self._domain_root(domain)
+        cleaned = _safe_segment(branch, "二级路径")
         directory = (root / cleaned).resolve()
         if not directory.is_relative_to(root.resolve()):
             raise WorkspaceKnowledgeError("二级路径超出能力目录。")
         return directory / f"{cleaned}.md"
 
+    def relative_path(self, path: str | Path) -> str:
+        """Return a stable project-relative path for display and documentation."""
+
+        return Path(path).resolve().relative_to(self.project_root).as_posix()
+
     def load_branch(
         self,
-        workspace: str | Path,
         domain: KnowledgeDomain,
         branch: str,
     ) -> tuple[Path, str]:
-        path = self.branch_path(workspace, domain, branch)
+        path = self.branch_path(domain, branch)
         if not path.is_file():
-            raise WorkspaceKnowledgeError(f"二级分支不存在：{path.stem}")
+            raise WorkspaceKnowledgeError(f"二级路径不存在：{path.stem}")
         return path, path.read_text(encoding="utf-8")
 
     def save_branch(
         self,
-        workspace: str | Path,
         domain: KnowledgeDomain,
         branch: str,
         content: str,
     ) -> Path:
-        path = self.branch_path(workspace, domain, branch)
+        path = self.branch_path(domain, branch)
         if not path.is_file():
-            raise WorkspaceKnowledgeError("请先选择或添加一个二级分支。")
+            raise WorkspaceKnowledgeError("请先选择或添加一个二级路径。")
         if not content.strip():
             raise WorkspaceKnowledgeError("Markdown 内容不能为空。")
         self._atomic_text(path, content.rstrip() + "\n")
-        self.refresh_index(workspace, domain)
         return path
 
-    def migrate_flat_branch(
-        self,
-        workspace: str | Path,
-        domain: KnowledgeDomain,
-        branch: str,
-    ) -> Path:
-        """Move legacy pinned/<branch>.md into pinned/<branch>/<branch>.md."""
-
-        target = self.branch_path(workspace, domain, branch)
-        if target.exists():
-            return target
-        source = self._pinned_root(workspace, domain) / (
-            f"{_safe_segment(branch, '二级分支')}.md"
-        )
-        if not source.is_file():
-            raise WorkspaceKnowledgeError(f"旧分支文档不存在：{source}")
-        target.parent.mkdir(parents=True)
-        source.replace(target)
-        self.refresh_index(workspace, domain)
-        return target
-
-    def refresh_index(
-        self,
-        workspace: str | Path,
-        domain: KnowledgeDomain,
-    ) -> Path:
-        if domain == KnowledgeDomain.DEVELOPMENT:
-            return CapabilityStore(self.data_dir).prepare(workspace)
-        return IncidentCapabilityStore(self.data_dir).prepare(workspace)
-
-    def _pinned_root(self, workspace: str | Path, domain: KnowledgeDomain) -> Path:
-        canonical = Path(workspace).expanduser().resolve(strict=True)
-        if not canonical.is_dir():
-            raise WorkspaceKnowledgeError(f"项目路径不是目录：{canonical}")
-        workspace_id = hashlib.sha256(
-            str(canonical).casefold().encode("utf-8")
-        ).hexdigest()[:16]
-        return self.workspaces_root / workspace_id / domain.value / "pinned"
+    def _domain_root(self, domain: KnowledgeDomain) -> Path:
+        return self.knowledge_root / domain.value
 
     @staticmethod
     def _atomic_text(path: Path, content: str) -> None:

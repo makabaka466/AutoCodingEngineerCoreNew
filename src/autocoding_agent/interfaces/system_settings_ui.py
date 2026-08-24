@@ -6,10 +6,8 @@ import queue
 import threading
 import tkinter as tk
 from collections.abc import Callable
-from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from autocoding_agent.config import get_settings
 from autocoding_agent.model_setup import (
     ClaudeModelSetupService,
     ModelSetupError,
@@ -51,7 +49,6 @@ class SystemSettingsDialog:
         database_service: SQLServerConnectionService,
         *,
         initial_section: str = "model",
-        workspace: str | Path | None = None,
         knowledge_service: MarkdownKnowledgeService | None = None,
         required_model_setup: bool = False,
         on_model_saved: Callable[[ModelSetupState], None] | None = None,
@@ -60,10 +57,7 @@ class SystemSettingsDialog:
         self.parent = parent
         self.model_service = model_service
         self.database_service = database_service
-        self.knowledge_service = knowledge_service or MarkdownKnowledgeService(
-            get_settings().data_dir
-        )
-        self.knowledge_workspace = str(Path(workspace or Path.cwd()).expanduser().resolve())
+        self.knowledge_service = knowledge_service or MarkdownKnowledgeService()
         self.on_model_saved = on_model_saved
         self.on_database_saved = on_database_saved
         self.required_model_setup = required_model_setup
@@ -595,9 +589,8 @@ class SystemSettingsDialog:
             self._restore_loaded_knowledge_selection()
             return
         try:
-            workspace = self.knowledge_workspace
             domain = self._knowledge_domain()
-            branches = self.knowledge_service.list_branches(workspace, domain)
+            branches = self.knowledge_service.list_branches(domain)
             self.knowledge_branch_combo.configure(values=branches)
             selected_branch = preferred_branch or self.knowledge_branch_var.get()
             if selected_branch not in branches:
@@ -620,16 +613,14 @@ class SystemSettingsDialog:
         try:
             domain = self._knowledge_domain()
             branch = self.knowledge_branch_var.get()
-            path, content = self.knowledge_service.load_branch(
-                self.knowledge_workspace, domain, branch
-            )
+            path, content = self.knowledge_service.load_branch(domain, branch)
         except Exception as exc:
             self._set_knowledge_status(f"无法读取 Markdown：{exc}", DANGER)
             return
         self.knowledge_editor.delete("1.0", "end")
         self.knowledge_editor.insert("1.0", content)
         self.knowledge_editor.edit_modified(False)
-        self.knowledge_path_var.set(str(path))
+        self.knowledge_path_var.set(self.knowledge_service.relative_path(path))
         self._loaded_knowledge = (domain.value, branch)
         self._set_knowledge_status("已加载该二级分支的唯一文档，可直接编辑。", SUCCESS)
 
@@ -643,9 +634,7 @@ class SystemSettingsDialog:
             return
         name = self.knowledge_new_branch_var.get()
         try:
-            path = self.knowledge_service.create_branch(
-                self.knowledge_workspace, self._knowledge_domain(), name
-            )
+            path = self.knowledge_service.create_branch(self._knowledge_domain(), name)
         except WorkspaceKnowledgeError as exc:
             messagebox.showerror("无法添加二级分支", str(exc), parent=self.window)
             return
@@ -662,7 +651,6 @@ class SystemSettingsDialog:
     def _save_knowledge(self) -> bool:
         try:
             path = self.knowledge_service.save_branch(
-                self.knowledge_workspace,
                 self._knowledge_domain(),
                 self.knowledge_branch_var.get(),
                 self.knowledge_editor.get("1.0", "end-1c"),
@@ -674,7 +662,7 @@ class SystemSettingsDialog:
             messagebox.showerror("保存 Markdown 失败", str(exc), parent=self.window)
             return False
         self.knowledge_editor.edit_modified(False)
-        self.knowledge_path_var.set(str(path))
+        self.knowledge_path_var.set(self.knowledge_service.relative_path(path))
         self._loaded_knowledge = (
             self._knowledge_domain().value,
             self.knowledge_branch_var.get(),

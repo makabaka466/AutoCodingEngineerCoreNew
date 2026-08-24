@@ -14,6 +14,7 @@ from autocoding_agent.incident.models import IncidentOutcome, IncidentSession
 from autocoding_agent.observability import configure_file_logging
 from autocoding_agent.ports.database import DatabaseReader
 from autocoding_agent.ports.structured_runtime import StructuredRuntime
+from autocoding_agent.workspace_knowledge import PROJECT_KNOWLEDGE_ROOT
 
 
 class IncidentApplication:
@@ -80,7 +81,10 @@ def build_incident_application(
         database=selected_database,
         max_query_rounds=configured.database_max_query_rounds,
         database_reference=selected_reference,
-        capabilities=IncidentCapabilityStore(configured.data_dir),
+        capabilities=IncidentCapabilityStore(
+            configured.data_dir,
+            knowledge_root=PROJECT_KNOWLEDGE_ROOT / "incident",
+        ),
         model=configured.claude_model,
     )
     return IncidentApplication(engine, log_path)

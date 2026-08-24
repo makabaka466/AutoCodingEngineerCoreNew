@@ -1,6 +1,6 @@
 # AutoCoding Engineer 接口与数据契约
 
-本文记录当前 `0.3.4` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
+本文记录当前 `0.3.5` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
 Runtime、持久化和状态契约。
 设计动机和运行流程见[架构说明](ARCHITECTURE.md)。
 
@@ -395,9 +395,11 @@ JSON 内容是 `AgentSession.model_dump(mode="json")` 的完整结果。
 开发 `CapabilityStore` 与异常 `IncidentCapabilityStore` 当前由各自 Engine 直接调用，没有单独
 Protocol。两者根目录分别是
 `<data_dir>/workspaces/<workspace-id>/development/` 与 `incident/`。
-每个领域目录可包含 `pinned/<二级路径>/<二级路径名>.md` 用户基础知识；每个二级路径唯一
-对应一份同名文档。`prepare()` 会把这些文档链接写入本领域索引，并保证开发与异常内容互不
-混用。`MarkdownKnowledgeService` 提供二级路径列表/创建/读取/原子保存、旧扁平文档迁移与索引刷新。
+用户基础知识源文件位于项目根目录的
+`knowledge/<development|incident>/<二级路径>/<二级路径名>.md`，每个二级路径唯一对应一份
+同名文档。`prepare()` 会把当前流程的项目知识同步至工作区 `pinned/` 只读视图并写入本领域
+索引，保证开发与异常内容互不混用。`MarkdownKnowledgeService` 提供二级路径列表、创建、读取
+和原子保存。
 
 ```python
 prepare(workspace: str | Path) -> Path
@@ -539,9 +541,9 @@ SQL Server 页包含服务器、端口、数据库、已安装 ODBC 驱动、Win
 日志、模型提示词或会话。两套流程共享连接；连接可随时更换，已有开发或异常会话保持原连接，
 新配置从对应流程的下一项任务开始。
 
-“MD 能力配置”页不重复显示项目路径，直接按“开发/异常处理 → 二级路径”导航。点击添加时
-创建 `<二级路径>/<二级路径名>.md`，选择路径即可直接编辑并保存；只读路径框显示实际落盘
-位置。未保存内容在切换流程、路径或关闭窗口前会得到确认。路径名不能包含路径分隔符、
+“MD 能力配置”页不显示项目路径，直接按“开发/异常处理 → 二级路径”导航。点击添加时在项目
+`knowledge/` 下创建 `<二级路径>/<二级路径名>.md`，选择路径即可直接编辑并保存；只读路径框
+显示项目相对路径。未保存内容在切换流程、路径或关闭窗口前会得到确认。路径名不能包含路径分隔符、
 `..`、Windows 保留字符或设备名。
 
 ## 9. Streamlit Web UI
