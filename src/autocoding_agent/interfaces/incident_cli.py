@@ -10,6 +10,7 @@ from typing import Annotated
 import typer
 
 from autocoding_agent.adapters.sqlite_database import SQLiteDatabaseReader
+from autocoding_agent.core.recovery.models import RecoveryAction
 from autocoding_agent.incident.application import build_incident_application
 from autocoding_agent.incident.models import IncidentOutcome
 
@@ -59,6 +60,35 @@ def send(
 
 
 @app.command()
+def resume(
+    session_id: Annotated[str, typer.Option("--session-id", "-s")],
+    action: Annotated[
+        RecoveryAction,
+        typer.Option("--action", "-a", help="read_only_inspect, replan, or cancel."),
+    ] = RecoveryAction.READ_ONLY_INSPECT,
+    database: Annotated[
+        Path | None,
+        typer.Option("--database", "-d", help="Read-only SQLite database path."),
+    ] = None,
+) -> None:
+    """Resume a paused incident with an explicit safe action."""
+
+    _invoke(
+        lambda: build_incident_application(sqlite_path=database).resume(
+            session_id,
+            action,
+        )
+    )
+
+
+@app.command()
+def cancel(session_id: Annotated[str, typer.Option("--session-id", "-s")]) -> None:
+    """Cancel a non-terminal incident without running the model."""
+
+    _invoke(lambda: build_incident_application().cancel(session_id))
+
+
+@app.command()
 def show(session_id: Annotated[str, typer.Option("--session-id", "-s")]) -> None:
     """Show the latest durable incident outcome."""
 
@@ -80,6 +110,7 @@ def sessions_command() -> None:
                 {
                     "session_id": item.id,
                     "status": item.status,
+                    "task_state": item.task_state,
                     "problem": item.problem,
                     "page_hint": item.page_hint,
                     "source": item.source,

@@ -1322,7 +1322,10 @@ class DesktopClient:
         self.page_hint_var.set(session.page_hint or "")
         title = " ".join(session.problem.split()) or "未命名异常"
         self.task_title_var.set(title[:64] + ("…" if len(title) > 64 else ""))
-        self._hide_approval()
+        if session.task_state in {TaskState.PAUSED, TaskState.RECOVERY_REQUIRED}:
+            self._show_incident_recovery(session)
+        else:
+            self._hide_approval()
         self._set_status(session.status)
         if session.status == IncidentStatus.COMPLETED:
             self.status_var.set("异常诊断已完成。可以切换流程或新建另一项诊断。")
@@ -1331,7 +1334,10 @@ class DesktopClient:
         elif session.status == IncidentStatus.QUERY_REQUIRED:
             self.status_var.set("正在根据页面和只读数据继续诊断。")
         elif session.status == IncidentStatus.FAILED:
-            self.status_var.set("异常诊断失败，可补充信息重试；详情请查看本地日志。")
+            if session.task_state in {TaskState.PAUSED, TaskState.RECOVERY_REQUIRED}:
+                self.status_var.set("异常诊断已暂停，请选择继续只读调查、重新调查或取消。")
+            else:
+                self.status_var.set("异常诊断失败，可补充信息重试；详情请查看本地日志。")
         self._sync_controls()
 
     def _replace_transcript(self, entries: list[tuple[str, str]]) -> None:
@@ -1631,11 +1637,12 @@ class DesktopClient:
         )
 
     def _resume_recovery(self) -> None:
-        if self.flow != FlowKind.DEVELOPMENT or self._busy or not self.session_id:
+        if self._busy or not self.session_id:
             return
         session_id = self.session_id
+        application = self._active_application()
         self._run_in_background(
-            lambda: self.application.resume(
+            lambda: application.resume(
                 session_id,
                 RecoveryAction.READ_ONLY_INSPECT,
             ),
@@ -1643,26 +1650,32 @@ class DesktopClient:
         )
 
     def _replan_recovery(self) -> None:
-        if self.flow != FlowKind.DEVELOPMENT or self._busy or not self.session_id:
+        if self._busy or not self.session_id:
             return
         session_id = self.session_id
+        application = self._active_application()
         self._run_in_background(
-            lambda: self.application.resume(session_id, RecoveryAction.REPLAN),
+            lambda: application.resume(session_id, RecoveryAction.REPLAN),
             "Claude Code 正在重新调查并制定方案",
         )
 
     def _cancel_recovery(self) -> None:
-        if self.flow != FlowKind.DEVELOPMENT or self._busy or not self.session_id:
+        if self._busy or not self.session_id:
             return
         if not messagebox.askyesno(
             "取消任务",
-            "确认取消此任务？现有工作区内容不会被自动回滚。",
+            (
+                "确认取消此任务？现有工作区内容不会被自动回滚。"
+                if self.flow == FlowKind.DEVELOPMENT
+                else "确认取消此异常诊断？已读取的数据不会写回数据库。"
+            ),
             parent=self.root,
         ):
             return
         session_id = self.session_id
+        application = self._active_application()
         self._run_in_background(
-            lambda: self.application.cancel(session_id),
+            lambda: application.cancel(session_id),
             "正在取消任务",
         )
 
@@ -1775,9 +1788,11 @@ class DesktopClient:
         self.browse_button.configure(state="normal" if can_choose_workspace else "disabled")
         self.project_combo.configure(state="readonly" if can_choose_workspace else "disabled")
         recovery_state = False
-        if self.flow == FlowKind.DEVELOPMENT and self.session_id:
+        if self.session_id:
             try:
-                recovery_state = self.application.get_session(self.session_id).task_state in {
+                recovery_state = self._active_application().get_session(
+                    self.session_id
+                ).task_state in {
                     TaskState.PAUSED,
                     TaskState.RECOVERY_REQUIRED,
                 }
@@ -1837,7 +1852,9 @@ class DesktopClient:
             self.approval_text.configure(state="disabled")
             self.reject_button.configure(text="取消任务", command=self._cancel_recovery)
             self.approve_button.configure(text="只读检查", command=self._resume_recovery)
-            self.recovery_replan_button.configure(command=self._replan_recovery)
+            self.recovery_replan_button.configure(
+                text="重新规划", command=self._replan_recovery
+            )
             self.recovery_replan_button.grid(row=0, column=2, padx=4)
             self.approve_button.grid_configure(column=3)
             self.approval_frame.grid(row=2, column=0, sticky="ew", padx=48, pady=(10, 0))
@@ -1874,6 +1891,24 @@ class DesktopClient:
         self.approval_text.insert("1.0", format_approval_details(approval))
         self.approval_text.yview_moveto(0.0)
         self.approval_text.configure(state="disabled")
+        self.approval_frame.grid(row=2, column=0, sticky="ew", padx=48, pady=(10, 0))
+
+    def _show_incident_recovery(self, session: IncidentSession) -> None:
+        self._approval_can_execute = True
+        self.approval_title.configure(text="恢复异常诊断 · 只读查询不会自动重放")
+        self.approval_text.configure(state="normal")
+        self.approval_text.delete("1.0", "end")
+        self.approval_text.insert(
+            "1.0",
+            (session.last_decision.message if session.last_decision else "异常诊断已暂停。")
+            + "\n\n继续后 Agent 会重新核对代码和数据库 schema，并自行形成、执行最小只读 SQL。",
+        )
+        self.approval_text.configure(state="disabled")
+        self.reject_button.configure(text="取消诊断", command=self._cancel_recovery)
+        self.approve_button.configure(text="继续只读诊断", command=self._resume_recovery)
+        self.recovery_replan_button.configure(text="重新调查", command=self._replan_recovery)
+        self.recovery_replan_button.grid(row=0, column=2, padx=4)
+        self.approve_button.grid_configure(column=3)
         self.approval_frame.grid(row=2, column=0, sticky="ew", padx=48, pady=(10, 0))
 
     def _hide_approval(self) -> None:

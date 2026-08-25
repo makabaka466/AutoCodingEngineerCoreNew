@@ -47,7 +47,7 @@ from autocoding_agent.core.state_machine.models import (
     CommandReceipt,
     TaskState,
 )
-from autocoding_agent.database_models import QueryObservation, QueryResult
+from autocoding_agent.database_models import QueryObservation, QueryResult, sql_fingerprint
 from autocoding_agent.ports.database import DatabaseReader
 from autocoding_agent.ports.runtime import AgentRuntime, RuntimeInterruptedError
 from autocoding_agent.ports.session_store import SessionStore
@@ -556,7 +556,15 @@ class AgentEngine:
             session.status = decision.status
             session.pending_approval = decision.approval
             session.messages.append(
-                ChatMessage(role=MessageRole.ASSISTANT, content=decision.message)
+                ChatMessage(
+                    role=MessageRole.ASSISTANT,
+                    content=(
+                        "Agent formed a bounded read-only query plan. The host is executing it "
+                        "automatically; the user does not need to run SQL."
+                        if decision.status == AgentStatus.QUERY_REQUIRED
+                        else decision.message
+                    ),
+                )
             )
             session.events.append(
                 AgentEvent(
@@ -620,6 +628,9 @@ class AgentEngine:
                     command_id=command.id,
                     expected_version=session.version,
                 )
+                session.last_decision = None
+                session.status = None
+                session.pending_approval = None
                 self.sessions.save(session)
                 continue
 
@@ -872,6 +883,8 @@ class AgentEngine:
                     returned_rows=result.returned_rows,
                     truncated=result.truncated,
                     redacted_columns=result.redacted_columns,
+                    sql_fingerprint=sql_fingerprint(query.sql),
+                    parameter_names=sorted(query.parameters),
                 )
             )
         session.query_rounds += 1
@@ -888,7 +901,17 @@ class AgentEngine:
             AgentEvent(
                 type=EventType.DATABASE_QUERIES_EXECUTED,
                 message=f"Executed {len(results)} bounded read-only database queries.",
-                data={"query_round": session.query_rounds},
+                data={
+                    "query_round": session.query_rounds,
+                    "queries": [
+                        {
+                            "name": query.name,
+                            "sql_fingerprint": sql_fingerprint(query.sql),
+                            "parameter_names": sorted(query.parameters),
+                        }
+                        for query in decision.queries
+                    ],
+                },
             )
         )
 

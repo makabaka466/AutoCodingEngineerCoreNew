@@ -3,9 +3,20 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from datetime import datetime
+from typing import Protocol
 
-from autocoding_agent.core.models import AgentEvent, AgentSession, EventType, utc_now
+from autocoding_agent.core.models import AgentEvent, EventType, utc_now
 from autocoding_agent.core.state_machine.models import FailureClass, TaskState, TransitionRule
+
+
+class LifecycleSession(Protocol):
+    """Minimum aggregate surface required by the shared lifecycle machine."""
+
+    task_state: TaskState
+    version: int
+    events: list[AgentEvent]
+    updated_at: datetime
 
 
 class InvalidStateTransition(RuntimeError):
@@ -130,7 +141,7 @@ class AgentStateMachine:
 
     def transition(
         self,
-        session: AgentSession,
+        session: LifecycleSession,
         target: TaskState,
         *,
         reason: str,

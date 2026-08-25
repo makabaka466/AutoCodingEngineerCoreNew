@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import re
 from datetime import datetime, timezone
 from typing import Annotated, Any
 
@@ -40,4 +42,13 @@ class QueryObservation(BaseModel):
     returned_rows: int
     truncated: bool
     redacted_columns: list[str] = Field(default_factory=list)
+    sql_fingerprint: str | None = None
+    parameter_names: list[str] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+def sql_fingerprint(sql: str) -> str:
+    """Identify a query shape without storing SQL values or business result rows."""
+
+    normalized = re.sub(r"\s+", " ", sql).strip().casefold()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()

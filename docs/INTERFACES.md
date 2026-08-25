@@ -1,6 +1,6 @@
 # AutoCoding Engineer 接口与数据契约
 
-本文记录当前 `0.4.1` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
+本文记录当前 `0.5.0` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
 Runtime、持久化和状态契约。
 设计动机和运行流程见[架构说明](ARCHITECTURE.md)。
 
@@ -535,9 +535,11 @@ Artifact 正文由 `TaskArtifactStore` 保存到 `<data_dir>/tasks/<task-id>/art
 manifest 保存类型、哈希、来源和关联路径；正文经过凭据脱敏、大小限制和原子替换。工作区 observer
 采集 Git status、commit 与 staged/unstaged diff，不读取未跟踪文件正文。
 
-旧 `<data_dir>/sessions/*.json` 会在 SQLiteTaskStore 初始化时幂等导入，并补充可回放的 migration
-事件。`JsonSessionStore` 仍保留用于兼容和测试，但不再是开发应用默认写入目标。异常流程仍使用
-独立 `JsonIncidentStore`。
+旧 `<data_dir>/sessions/*.json` 会在 SQLiteTaskStore 初始化时幂等导入；旧
+`<data_dir>/incidents/*.json` 会由 `SQLiteIncidentStore` 幂等导入。两者都会补充可回放的
+migration 事件且不覆盖旧文件。`JsonSessionStore`/`JsonIncidentStore` 仅保留用于兼容和测试。
+异常表为 `incident_tasks`、`incident_events`、`incident_runs`、`incident_commands`，与开发表位于
+同一个 runtime 数据库并使用相同 sequence/revision/终态不可变约束。
 
 ## 6. 能力存储接口与文件格式
 
@@ -783,20 +785,24 @@ outcome = incidents.start(
 | 方法 | 行为 |
 | --- | --- |
 | `start(workspace, problem, page_hint=None, *, project=None, source="manual", external_reference=None)` | 创建异常会话，保存所选知识项目，定位页面并在必要时查询数据库 |
-| `send(session_id, message)` | 回答模型澄清问题或补充异常上下文 |
+| `send(session_id, message, command_id=None)` | 回答模型澄清问题或补充异常上下文；command ID 可幂等重试 |
+| `resume(session_id, action="read_only_inspect")` | 从 paused/recovery_required 明确继续或重新调查 |
+| `cancel(session_id)` | 取消非终态异常诊断，不运行模型或写数据库 |
 | `outcome(session_id)` | 返回最新 `IncidentOutcome` |
 | `get_session(session_id)` | 返回完整 `IncidentSession`，但不包含原始数据库行 |
 | `list_sessions()` | 按更新时间倒序列出异常会话 |
+| `events(session_id)` / `runs(session_id)` | 返回可审计事件与 Runtime Run |
 
 `source` 与 `external_reference` 为钉钉消息来源和外部消息/工单 ID 预留。当前调用是同步的；
-`completed` 会话不能继续发送消息。
+`completed` 会话不能继续发送消息。`recovery_scan` 给出本次应用启动发现并暂停的孤儿异常任务。
 
 ### 11.2 状态与结构化决定
 
 `IncidentStatus` 包含：
 
 - `needs_input`：问题或页面信息不足，`question` 必填；
-- `query_required`：页面已定位且需要数据，`page` 与至少一条 `queries` 必填；
+- `query_required`：需要页面映射或业务数据，至少一条 `queries` 必填；允许先查 Menu 等映射表，
+  因而 `page` 可以暂时为空；
 - `completed`：诊断结束，`page` 与 `diagnosis` 必填；
 - `failed`：Runtime、契约或数据库边界失败。
 
@@ -817,8 +823,9 @@ automation_candidate: bool
 是安全的工作区相对路径。`DataQuery` 保存名称、用途、SQL、命名参数和 1–100 的请求行数；
 数据库适配器仍会应用更小的主机上限。
 
-`IncidentOutcome.query_observations` 只包含查询名称、用途、返回行数、截断标记和脱敏列。
-原始业务行不会写入 `~/.autocoding-agent/incidents/<session-id>.json`。
+`IncidentOutcome.query_observations` 只包含查询名称、用途、SQL 指纹、参数名、返回行数、截断标记
+和脱敏列。SQL 参数值和原始业务行不会写入运行时数据库；结构化 SQL 只存在于当前模型决定和
+执行调用中，完成后的持久化审计使用指纹。
 `IncidentSession.database_reference` 保存该会话的无凭据数据源引用，例如
 `sqlserver://server:1433/database`；它不保存数据库账号、密码或业务数据。
 
@@ -845,8 +852,10 @@ schema 元数据。
 | `check-db --database PATH` | 验证 SQLite 只读连接并显示有限 schema |
 | `start PROBLEM --workspace PATH [--page HINT] [--database PATH]` | 创建并运行异常调查 |
 | `send MESSAGE --session-id UUID [--database PATH]` | 补充信息并恢复同一模型会话 |
+| `resume --session-id UUID [--action read_only_inspect|replan|cancel]` | 显式恢复暂停任务 |
+| `cancel --session-id UUID` | 取消非终态异常任务 |
 | `show --session-id UUID` | 输出最新完整 JSON 结果 |
 | `sessions` | 列出最近异常会话 |
 
-未传 `--database` 时使用 `AUTO_CODING_INCIDENT_SQLITE_PATH`。如果页面已经定位且模型请求
-数据，但仍未配置数据库，该会话会得到可恢复、持久化的 `failed` 结果，而不会假装完成诊断。
+未传 `--database` 时使用 `AUTO_CODING_INCIDENT_SQLITE_PATH`。如果模型请求数据但未配置数据库，
+该会话会得到可持久化的 `failed` 结果，而不会把 SQL 交给用户或假装完成诊断。

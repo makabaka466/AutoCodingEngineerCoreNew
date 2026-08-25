@@ -220,10 +220,19 @@ def test_development_flow_can_use_shared_read_only_database(tmp_path: Path) -> N
     assert outcome.query_observations[0].returned_rows == 1
     assert len(runtime.turns) == 2
     assert "orders(id INTEGER, status TEXT)" in runtime.turns[0].system_prompt
+    assert "Never ask the user to run SQL" in " ".join(
+        runtime.turns[0].system_prompt.split()
+    )
     assert '"status": "stuck"' in runtime.turns[1].user_message
     session = app.get_session(outcome.session_id)
     assert session.database_reference == reference
     assert '"status":"stuck"' not in session.model_dump_json()
+    assert all(
+        message.content != "The code path is located; one bounded data check is needed."
+        for message in session.messages
+    )
+    assert any("user does not need to run SQL" in message.content for message in session.messages)
+    assert session.query_observations[0].sql_fingerprint is not None
     assert (state / "runtime" / "agent-runtime.db").is_file()
     assert [
         event.data["to"] for event in outcome.events if event.type == EventType.STATE_TRANSITIONED

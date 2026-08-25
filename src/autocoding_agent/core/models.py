@@ -73,6 +73,7 @@ class EventType(StrEnum):
     CAPABILITY_SAVED = "capability_saved"
     CAPABILITY_FAILED = "capability_failed"
     DATABASE_QUERIES_EXECUTED = "database_queries_executed"
+    DATABASE_QUERY_FAILED = "database_query_failed"
 
 
 class ChatMessage(BaseModel):

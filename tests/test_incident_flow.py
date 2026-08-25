@@ -12,7 +12,8 @@ from autocoding_agent.adapters.sqlite_database import (
     ReadOnlyQueryError,
     SQLiteDatabaseReader,
 )
-from autocoding_agent.core.models import AgentUsage, RuntimeTurn
+from autocoding_agent.core.models import AgentUsage, EventType, RuntimeTurn
+from autocoding_agent.core.state_machine.models import TaskState
 from autocoding_agent.incident.capability_store import IncidentCapabilityStore
 from autocoding_agent.incident.engine import IncidentEngine
 from autocoding_agent.incident.models import (
@@ -145,6 +146,7 @@ def test_incident_flow_locates_page_queries_data_and_diagnoses(tmp_path: Path) -
     )
 
     assert outcome.status == IncidentStatus.COMPLETED
+    assert outcome.task_state == TaskState.COMPLETED
     assert outcome.page == _page()
     assert outcome.diagnosis == "Order 42 remains in the stuck state."
     assert outcome.query_observations[0].returned_rows == 1
@@ -161,6 +163,127 @@ def test_incident_flow_locates_page_queries_data_and_diagnoses(tmp_path: Path) -
     document = Path(outcome.capability_document)
     assert document.parent.parent.name == "incident"
     assert "Order 42 remains in the stuck state." in document.read_text(encoding="utf-8")
+    transitions = [
+        event.data["to"]
+        for event in outcome.events
+        if event.type == EventType.STATE_TRANSITIONED
+    ]
+    assert transitions == [
+        TaskState.INSPECTING.value,
+        TaskState.QUERYING_DATA.value,
+        TaskState.INSPECTING.value,
+        TaskState.COMPLETED.value,
+    ]
+    assert any(event.type == EventType.DATABASE_QUERIES_EXECUTED for event in outcome.events)
+
+
+def test_agent_resolves_page_with_host_executed_sql_before_page_is_known(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    menu_query = DataQuery(
+        name="menu_page_location",
+        purpose="Resolve the page title to its relative URL.",
+        sql="SELECT NAME, URL FROM Menu WHERE NAME LIKE :page_name",
+        parameters={"page_name": "良率上传%"},
+    )
+    runtime = ScriptedStructuredRuntime(
+        [
+            IncidentDecision(
+                status=IncidentStatus.QUERY_REQUIRED,
+                message="I will resolve the page through the configured menu mapping.",
+                queries=[menu_query],
+            ),
+            IncidentDecision(
+                status=IncidentStatus.COMPLETED,
+                message="The upload page is located and the data path was diagnosed.",
+                page=_page(),
+                diagnosis="The page mapping points to the inspected request handler.",
+                confidence=0.8,
+            ),
+        ]
+    )
+    database = FakeDatabase()
+    store = JsonIncidentStore(tmp_path / "data")
+    engine = IncidentEngine(runtime, store, database)
+
+    outcome = engine.start(workspace, "良率上传页面数据为空", "良率上传")
+
+    assert outcome.status == IncidentStatus.COMPLETED
+    assert database.queries == [menu_query]
+    assert len(runtime.turns) == 2
+    assert "Never\n   print SQL as an instruction to the user" in runtime.turns[0].system_prompt
+    observation = outcome.query_observations[0]
+    assert observation.sql_fingerprint is not None
+    assert observation.parameter_names == ["page_name"]
+    persisted = (tmp_path / "data" / "incidents" / f"{outcome.session_id}.json").read_text(
+        encoding="utf-8"
+    )
+    assert "良率上传%" not in persisted
+    assert "SELECT NAME, URL" not in persisted
+
+
+def test_failed_sql_is_returned_to_agent_for_automatic_correction(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    invalid_query = DataQuery(
+        name="bad_order_lookup",
+        purpose="Inspect order state.",
+        sql="SELECT missing FROM orders WHERE id = :id",
+        parameters={"id": 42},
+    )
+    corrected_query = DataQuery(
+        name="order_lookup",
+        purpose="Inspect order state.",
+        sql="SELECT id, status FROM orders WHERE id = :id",
+        parameters={"id": 42},
+    )
+    runtime = ScriptedStructuredRuntime(
+        [
+            IncidentDecision(
+                status=IncidentStatus.QUERY_REQUIRED,
+                message="Inspecting the affected order.",
+                page=_page(),
+                queries=[invalid_query],
+            ),
+            IncidentDecision(
+                status=IncidentStatus.QUERY_REQUIRED,
+                message="Correcting the query from the sanitized database error.",
+                page=_page(),
+                queries=[corrected_query],
+            ),
+            IncidentDecision(
+                status=IncidentStatus.COMPLETED,
+                message="Diagnosis complete.",
+                page=_page(),
+                diagnosis="The order remains stuck.",
+            ),
+        ]
+    )
+
+    class CorrectingDatabase(FakeDatabase):
+        def execute(self, query: DataQuery) -> QueryResult:
+            self.queries.append(query)
+            if len(self.queries) == 1:
+                raise ReadOnlyQueryError("Read-only query failed: invalid column missing")
+            return QueryResult(
+                query_name=query.name,
+                columns=["id", "status"],
+                rows=[{"id": 42, "status": "stuck"}],
+                returned_rows=1,
+            )
+
+    database = CorrectingDatabase()
+    engine = IncidentEngine(runtime, JsonIncidentStore(tmp_path / "data"), database)
+
+    outcome = engine.start(workspace, "Order 42 is stuck", "/orders/42")
+
+    assert outcome.status == IncidentStatus.COMPLETED
+    assert database.queries == [invalid_query, corrected_query]
+    assert len(runtime.turns) == 3
+    assert "Do not ask the user to run SQL" in runtime.turns[1].user_message
+    assert any(event.type == EventType.DATABASE_QUERY_FAILED for event in outcome.events)
 
 
 def test_query_request_without_database_becomes_durable_failure(tmp_path: Path) -> None:

@@ -4,12 +4,14 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import StrEnum
-from typing import Annotated
+from typing import Annotated, Any
 from uuid import uuid4
 
 from pydantic import BaseModel, Field, StringConstraints, model_validator
 
-from autocoding_agent.core.models import AgentUsage, ChatMessage, utc_now
+from autocoding_agent.core.models import AgentEvent, AgentUsage, ChatMessage, utc_now
+from autocoding_agent.core.runtime.models import RuntimeRunRecord
+from autocoding_agent.core.state_machine.models import CommandReceipt, TaskState
 from autocoding_agent.database_models import DataQuery, QueryObservation, QueryResult
 
 __all__ = [
@@ -68,8 +70,6 @@ class IncidentDecision(BaseModel):
         if self.status == IncidentStatus.NEEDS_INPUT and self.question is None:
             raise ValueError("question is required when status is needs_input")
         if self.status == IncidentStatus.QUERY_REQUIRED:
-            if self.page is None:
-                raise ValueError("page is required before querying incident data")
             if not self.queries:
                 raise ValueError("queries are required when status is query_required")
         elif self.queries:
@@ -91,6 +91,9 @@ class IncidentSession(BaseModel):
     database_reference: str | None = None
     source: str = "manual"
     external_reference: str | None = None
+    task_state: TaskState = TaskState.CREATED
+    version: int = Field(default=0, ge=0)
+    revision: int = Field(default=0, ge=0)
     runtime_session_id: str | None = None
     status: IncidentStatus | None = None
     last_decision: IncidentDecision | None = None
@@ -99,14 +102,40 @@ class IncidentSession(BaseModel):
     query_observations: list[QueryObservation] = Field(default_factory=list)
     query_rounds: int = 0
     capability_document: str | None = None
+    events: list[AgentEvent] = Field(default_factory=list)
+    runs: list[RuntimeRunRecord] = Field(default_factory=list)
+    command_receipts: list[CommandReceipt] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
+
+    @model_validator(mode="before")
+    @classmethod
+    def infer_lifecycle_for_legacy_sessions(cls, data: Any) -> Any:
+        """Load pre-runtime incident JSON without mutating the source file."""
+
+        if not isinstance(data, dict) or "task_state" in data:
+            return data
+        restored = {**data}
+        status = str(restored.get("status") or "")
+        restored["task_state"] = {
+            IncidentStatus.NEEDS_INPUT.value: TaskState.WAITING_INPUT,
+            IncidentStatus.QUERY_REQUIRED.value: TaskState.QUERYING_DATA,
+            IncidentStatus.COMPLETED.value: TaskState.COMPLETED,
+            IncidentStatus.FAILED.value: TaskState.FAILED,
+        }.get(status, TaskState.CREATED)
+        restored.setdefault("version", 0)
+        restored.setdefault("revision", 0)
+        restored.setdefault("events", [])
+        restored.setdefault("runs", [])
+        restored.setdefault("command_receipts", [])
+        return restored
 
 
 class IncidentOutcome(BaseModel):
     session_id: str
     workspace: str
     status: IncidentStatus
+    task_state: TaskState = TaskState.CREATED
     message: str
     question: str | None = None
     page: LocatedPage | None = None
@@ -118,3 +147,4 @@ class IncidentOutcome(BaseModel):
     query_observations: list[QueryObservation] = Field(default_factory=list)
     capability_document: str | None = None
     usage: AgentUsage = Field(default_factory=AgentUsage)
+    events: list[AgentEvent] = Field(default_factory=list)

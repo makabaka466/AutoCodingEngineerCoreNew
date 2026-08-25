@@ -1,6 +1,6 @@
 # AutoCoding Engineer 架构说明
 
-本文描述当前 `0.4.1` 代码已经实现的架构。数据字段、公共方法和命令行参数见
+本文描述当前 `0.5.0` 代码已经实现的架构。数据字段、公共方法和命令行参数见
 [接口与数据契约](INTERFACES.md)。
 
 ## 1. 项目目标
@@ -43,6 +43,7 @@ flowchart TD
     INCIDENT_ENGINE --> STRUCTURED_PORT["StructuredRuntime port"]
     INCIDENT_ENGINE --> DB_PORT["DatabaseReader port"]
     INCIDENT_ENGINE --> INCIDENT_STORE["IncidentSessionStore"]
+    INCIDENT_ENGINE --> STATE
     ENGINE --> SESSION_PORT["SessionStore port"]
     ENGINE --> MEMORY["CapabilityStore"]
     INCIDENT_ENGINE --> INCIDENT_MEMORY["IncidentCapabilityStore"]
@@ -50,15 +51,20 @@ flowchart TD
     STRUCTURED_PORT --> CLAUDE
     DB_PORT --> SQLSERVER["SQLServerDatabaseReader"]
     DB_PORT --> SQLITE["SQLiteDatabaseReader (CLI compatibility)"]
-    INCIDENT_STORE --> INCIDENT_JSON["JsonIncidentStore"]
+    INCIDENT_STORE --> INCIDENT_SQLITE["SQLiteIncidentStore + EventStore"]
     SESSION_PORT --> TASK_STORE["SQLiteTaskStore + EventStore"]
     ARTIFACTS --> ARTIFACT_STORE["TaskArtifactStore + Git observer"]
-    APP --> RECOVERY["RecoveryManager startup scan"]
+    APP --> RECOVERY["RecoveryManager"]
+    INCIDENT_APP --> INCIDENT_RECOVERY["IncidentRecoveryManager"]
+    RECOVERY --> SCANNER["OrphanedRunScanner"]
+    INCIDENT_RECOVERY --> SCANNER
     RECOVERY --> TASK_STORE
+    INCIDENT_RECOVERY --> INCIDENT_SQLITE
     CLAUDE --> CC["Claude Code CLI / configured model"]
     TASK_STORE --> DATA["~/.autocoding-agent/runtime/agent-runtime.db"]
     ARTIFACT_STORE --> ARTIFACT_DATA["~/.autocoding-agent/tasks/id/artifacts"]
-    INCIDENT_JSON --> INCIDENT_DATA["~/.autocoding-agent/incidents"]
+    INCIDENT_SQLITE --> DATA
+    INCIDENT_DATA["~/.autocoding-agent/incidents"] --> INCIDENT_SQLITE
     MEMORY --> DEV_MEMORY["workspaces/id/development"]
     INCIDENT_MEMORY --> INCIDENT_MEMORY_DATA["workspaces/id/incident"]
 ```
@@ -81,9 +87,11 @@ flowchart TD
 `AgentApplication`。接口层不直接依赖 Claude Code 的命令细节。
 
 `build_incident_application()` 是异常流程的组合根。它创建同一个 `ClaudeCodeRuntime`、
-独立的 `JsonIncidentStore`，桌面端通过 `SQLServerConnectionService` 注入
-`SQLServerDatabaseReader`；原 SQLite 路径继续用于 CLI 兼容。未来接入 MySQL/PostgreSQL
-只需实现 `DatabaseReader`；钉钉入口只依赖 `IncidentApplication`。
+`AgentStateMachine`、`SQLiteIncidentStore`、`IncidentRecoveryManager` 和能力存储，桌面端通过
+`SQLServerConnectionService` 注入 `SQLServerDatabaseReader`；原 SQLite 业务数据库路径继续用于
+CLI 兼容。开发与异常快照使用同一个 `agent-runtime.db` 的独立表，但共享生命周期事件模型、
+Runtime Run 和孤儿租约扫描。未来接入 MySQL/PostgreSQL 只需实现 `DatabaseReader`；钉钉入口只
+依赖 `IncidentApplication`。
 
 桌面端只创建一份 `SQLServerConnectionService`。它把同一个只读 reader/reference 注入开发与
 异常组合根；连接更换只作用于新任务，已有任务继续绑定启动时的数据源引用，避免半途中切库。
@@ -260,26 +268,37 @@ Runtime run 的 owner、PID、heartbeat 和终态同样进入 SQLite，供启动
 
 ## 5. 异常诊断流程
 
-`IncidentSession` 保存问题、页面线索、来源、外部消息引用、Claude 会话 ID、最后决定和查询
-审计摘要。它使用独立的 `~/.autocoding-agent/incidents/`，不会与开发任务会话混用。
+`IncidentSession` 保存问题、页面线索、来源、外部消息引用、Claude 会话 ID、最后决定、
+`TaskState`、version/revision、事件、Runtime Run、CommandReceipt 和查询审计摘要。默认快照位于
+`agent-runtime.db` 的异常专用表；旧 `~/.autocoding-agent/incidents/*.json` 只作为幂等导入源，
+不会与开发任务 aggregate 混用。
 
 ```mermaid
 stateDiagram-v2
-    [*] --> InspectPage: start(problem, page_hint)
-    InspectPage --> NeedsInput: 页面或问题不清楚
-    NeedsInput --> InspectPage: send(additional context)
-    InspectPage --> QueryRequired: 已定位页面且需要业务数据
-    QueryRequired --> AnalyzeData: 宿主执行只读查询并脱敏
-    AnalyzeData --> QueryRequired: 仍需一轮最小查询
-    AnalyzeData --> Completed: 给出诊断与建议
-    InspectPage --> Completed: 仅代码证据已足够
-    InspectPage --> Failed: runtime / contract / database error
-    AnalyzeData --> Failed: runtime / contract / database error
+    [*] --> Created
+    Created --> Inspecting: start(problem, page_hint)
+    Inspecting --> WaitingInput: 页面或问题不清楚
+    WaitingInput --> Inspecting: send(additional context)
+    Inspecting --> QueryingData: 需要页面映射或业务数据
+    QueryingData --> Inspecting: 宿主自动执行 / 返回结果或脱敏错误
+    Inspecting --> Completed: 给出诊断与建议
+    Inspecting --> Failed: runtime / contract / query attempts exhausted
+    Inspecting --> Paused: orphaned read-only Runtime
+    Paused --> Inspecting: continue read-only
+    Paused --> Replanning: investigate again
+    Replanning --> Inspecting: restart inspection
+    Paused --> Cancelled: cancel
 ```
 
 模型可用的代码工具固定为 `Read`、`Glob`、`Grep`。它负责从页面线索定位前端页面，并沿最小
-相关路径追踪请求、服务和数据访问代码；没有编辑、命令或数据库工具。需要数据时，模型通过
-结构化 `DataQuery` 提出最多五条参数化 SQL，由 `IncidentEngine` 交给 `DatabaseReader`。
+相关路径追踪请求、服务和数据访问代码；没有编辑、命令或数据库工具。需要页面映射或业务数据时，
+模型从已读代码与 schema 中提取/形成最多五条结构化、参数化 `DataQuery`，由 `IncidentEngine`
+直接交给 `DatabaseReader`，不能要求用户手工运行 SQL。页面名称需要数据库映射时允许在
+`LocatedPage` 尚未形成前查询 `Menu` 等映射表；返回的 URL 仍按不可信工作区相对线索复核。
+
+查询错误经过脱敏后自动返回同一模型会话修正，并计入查询轮次；达到上限才转为失败。成功查询
+只把限行、脱敏后的结果发回当前 Runtime。持久化审计保存查询名称、用途、SQL SHA-256 指纹、
+参数名、行数、截断和脱敏列，不保存 SQL 参数值或原始业务行。
 
 桌面默认 `SQLServerDatabaseReader` 使用 ODBC 和 `ApplicationIntent=ReadOnly`，只接受单条
 `SELECT/WITH`，拒绝分号、注释、写入、DDL、执行、批量和外部数据源等操作；命名参数由宿主
@@ -295,8 +314,8 @@ SQL Server 非密钥配置原子写入 `<data_dir>/database/sqlserver.json`，�
 活动异常会话绑定其创建时的安全数据库引用；用户更换连接后从下一项异常诊断开始使用，避免
 历史会话静默切换到另一套业务数据。
 
-查询结果只发送给当前 Claude 会话继续诊断。应用自己的 incident JSON 只保存查询名称、
-用途、返回行数、是否截断和脱敏列，不持久化原始业务行。Claude Code 自身的会话 transcript
+查询结果只发送给当前 Claude 会话继续诊断。应用自己的 incident snapshot 只保存查询审计摘要，
+不持久化原始业务行。Claude Code 自身的会话 transcript
 仍会接收脱敏后的结果，因此生产接入前还应结合企业的数据分级和模型服务策略复核允许字段。
 
 `source` 和 `external_reference` 是为钉钉等外部入口预留的关联字段。当前没有机器人、定时
@@ -423,16 +442,20 @@ knowledge/
 
 ## 8. 持久化和路径边界
 
-开发任务 ID 和异常会话文件名都必须是合法 UUID；这阻止调用方通过 session ID 构造任意路径。
-开发 Task snapshot、Event、Decision、Artifact metadata、Runtime Run 和 Command Receipt 使用
-SQLite WAL、foreign key、busy timeout 和单事务提交；
+开发任务 ID 和异常任务 ID 都必须是合法 UUID；这阻止调用方通过 session ID 构造任意路径。
+开发 Task snapshot、Event、Decision、Artifact metadata、Runtime Run 和 Command Receipt，以及
+异常 Task snapshot、Event、Runtime Run 和 Command Receipt，使用 SQLite WAL、foreign key、
+busy timeout 和单事务提交；
 `revision` 提供乐观并发检查，`version` 表达生命周期转换次数。Event ID 全局唯一，task 内
 sequence 单调递增，已追加事件若被修改会拒绝保存。旧 `sessions/*.json` 启动时幂等导入，导入
-完成后不再作为开发任务写入目标。异常会话和能力 Markdown/JSON 仍使用临时文件加 replace。
+完成后不再作为运行时任务写入目标。旧异常 JSON 同样幂等导入但不删除；能力 Markdown 继续使用
+临时文件加 replace。
 
-`SQLiteTaskStore.replay_task_state()` 按 sequence 回放 `state_transitioned` 并验证 from/to 链；
-旧 JSON 没有生命周期事件时会生成 actor=migration 的合成导入事件。RecoveryManager 在应用
-启动时检查非终态 snapshot、run owner/PID/heartbeat 与工作区观察结果，并采取保守转换。
+`SQLiteTaskStore.replay_task_state()` 与 `SQLiteIncidentStore.replay_task_state()` 按 sequence 回放
+`state_transitioned` 并验证 from/to 链；旧 JSON 没有生命周期事件时会生成 actor=migration 的
+合成导入事件。两套 Recovery Manager 共享 `OrphanedRunScanner`，启动时检查非终态 snapshot、
+run owner/PID/heartbeat。开发写阶段进入 `recovery_required`，异常只读阶段进入 `paused`，两者都
+不会自动重放旧 Runtime。
 
 Artifact 正文不写入目标仓库。`TaskArtifactStore` 使用 UUID 文件名、内容 SHA-256、大小限制、
 凭据脱敏和短临时文件原子替换；SQLite 只保存不可变元数据。Git observer 记录 status、commit、

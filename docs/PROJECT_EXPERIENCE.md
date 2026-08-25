@@ -1,6 +1,6 @@
 # AutoCodingEngineerCoreNew 项目开发与工程经验
 
-> 文档基线：2026-08-25，项目版本 `0.4.1`。本文以当前代码为准，并明确区分“已实现”、
+> 文档基线：2026-08-25，项目版本 `0.5.0`。本文以当前代码为准，并明确区分“已实现”、
 > “当前限制”和“后续规划”。本版本完成任务卡 `ACE-RUNTIME-001`：开发 Agent 已升级为由
 > 状态机、追加事件、运行记录、决策审计、任务产物和保守恢复共同驱动的可恢复 Runtime。
 
@@ -361,7 +361,8 @@ AgentApplication
 
 ```text
 ClaudeCodeRuntime
-JsonIncidentStore
+SQLiteIncidentStore + AgentStateMachine
+IncidentRecoveryManager + OrphanedRunScanner
 IncidentCapabilityStore
 可选 SQLServer/SQLite DatabaseReader
         ↓
@@ -370,7 +371,8 @@ IncidentEngine
 IncidentApplication
 ```
 
-两套流程共享 Runtime 和数据库端口，但拥有不同状态、Prompt、会话目录和能力目录。
+两套流程共享 Runtime、TaskState/Event/Run 与恢复扫描内核和数据库端口，但拥有不同结构化决定、
+Prompt、SQLite 表和能力目录。
 
 ---
 
@@ -604,23 +606,23 @@ Tkinter 后，默认使用 `pythonw.exe` 启动原生客户端并退出启动控
 
 ### 6.13 会话持久化
 
-开发任务使用 SQLite 事务存储，异常会话暂时继续使用原子 JSON：
+开发任务和异常任务都使用 SQLite 事务存储：
 
 ```text
 ~/.autocoding-agent/
 ├─ runtime/agent-runtime.db
 ├─ sessions/<uuid>.json      # 旧开发会话导入来源
-└─ incidents/<uuid>.json
+└─ incidents/<uuid>.json     # 旧异常会话导入来源
 ```
 
-开发 Task/Event 表和异常文件都只接受 UUID。SQLite 使用 WAL、foreign key、busy timeout 和
+开发和异常 Task/Event 表都只接受 UUID。SQLite 使用 WAL、foreign key、busy timeout 和
 `BEGIN IMMEDIATE`，在一个事务中追加事件并更新快照；内存 event sequence 或 revision 在事务
-失败时恢复。异常 JSON 继续使用同目录临时文件加 replace。
+失败时恢复。异常使用独立 `incident_*` 表；旧 JSON 幂等导入但不覆盖或删除。
 
-SQLiteTaskStore 已通过 snapshot revision 拒绝并发旧更新；桌面端仍通过忙碌状态规避本窗口内
-并发。每个 Runtime run 保存 owner ID、进程 PID 和 heartbeat。应用启动时扫描没有可靠终局的
-运行：只读 Inspect 可安全转为 paused；Implement/Verify 一律转入 recovery_required，不自动
-重放任何可能产生副作用的命令。
+SQLiteTaskStore 与 SQLiteIncidentStore 都通过 snapshot revision 拒绝并发旧更新；桌面端仍通过
+忙碌状态规避本窗口内并发。每个 Runtime run 保存 owner ID、进程 PID 和 heartbeat。两套恢复
+管理器共享 `OrphanedRunScanner`：开发只读 Inspect 和异常诊断转为 paused，开发
+Implement/Verify 转入 recovery_required，均不自动重放旧 Runtime。
 
 ### 6.14 Capability 与 Project Knowledge
 
@@ -1125,7 +1127,8 @@ powershell -ExecutionPolicy Bypass -File .\start.ps1 -Wait
 6. SQL 只读检查是保守规则，可能拒绝合法复杂查询，也不能替代只读数据库账号；
 7. 数据 schema 每个只读轮次都会读取，较大数据库需要缓存和按需裁剪；
 8. Capability 是“每完成任务一份文档”，尚未去重、合并和自动标记过期；
-9. 开发流程已有 Event/Run/Recovery，异常流程仍使用独立 JSON 状态机，尚未复用通用基础设施；
+9. 开发与异常已经共享 Event/Run/Recovery 基础设施，但两个 SQLite store 仍有部分事务代码重复，
+   后续可提取通用持久化基类；
 10. `CAPABILITIES.md` 是 Markdown 索引，不是语义检索；
 11. Project Knowledge 依赖人工维护，当前没有冲突检测和版本审批；
 12. Tkinter 的 Markdown、富文本和可访问性能力有限；
@@ -1330,6 +1333,7 @@ D:\python\python.exe -m ruff check src tests
 - `docs/INTERFACES.md`：API、枚举、数据模型和 CLI 契约；
 - `RELEASING.md`：发布和回退；
 - `docs/tasks/ACE-RUNTIME-001-agent-engine-runtime-upgrade.md`：本次 Runtime 升级任务记录；
+- `docs/tasks/ACE-INCIDENT-003-event-recovery-autonomous-sql.md`：异常恢复与自治 SQL 迭代记录；
 - `knowledge/`：分流程、分项目的用户维护知识。
 
 ### 关键代码
@@ -1341,9 +1345,11 @@ D:\python\python.exe -m ruff check src tests
 - `src/autocoding_agent/core/artifacts/`：任务产物契约和采集；
 - `src/autocoding_agent/core/recovery/`：孤儿运行扫描与保守恢复；
 - `src/autocoding_agent/adapters/sqlite_task_store.py`：原子 Task snapshot、追加事件、回放与旧 JSON 导入；
+- `src/autocoding_agent/adapters/sqlite_incident_store.py`：异常 snapshot/Event/Run/Command 事务存储；
 - `src/autocoding_agent/adapters/task_artifact_store.py`：脱敏、校验和原子 Artifact 落盘；
 - `src/autocoding_agent/adapters/workspace_snapshot.py`：Git 工作区基线与差异观察；
 - `src/autocoding_agent/incident/engine.py`：异常诊断状态机；
+- `src/autocoding_agent/incident/recovery.py`：异常孤儿 Runtime 的暂停与恢复策略；
 - `src/autocoding_agent/adapters/claude_code.py`：Claude Code Runtime；
 - `src/autocoding_agent/core/policies.py`：工具权限矩阵；
 - `src/autocoding_agent/adapters/sqlserver_database.py`：SQL Server 只读适配器；
@@ -1398,3 +1404,64 @@ Tkinter `Canvas` 内部已经存在 `_options()` 方法。自定义圆角按钮�
 新增字段前应检查基类命名，并通过真实控件构造测试而不是只测纯函数。
 
 完整设计提示词、令牌和来源见 `docs/UI_DESIGN_GUIDE.md`。
+
+---
+
+## 20. 异常流程迁移到通用 Event/Recovery 与自治 SQL
+
+### 20.1 背景问题
+
+异常流程原本已经能让模型返回 `DataQuery` 并由宿主执行，但生命周期只保存在
+`IncidentSession.status` 和原子 JSON 中：状态变化没有连续事件、Runtime 没有 run lease，进程中断
+后无法区分“未开始”和“已经执行过只读查询”。同时，旧 Prompt 没有明确禁止模型把 SQL 当作
+操作步骤交给用户，页面定位契约还要求查询前必须已有 `LocatedPage`，与 MES 使用 Menu 表把
+页面名称映射为 URL 的真实场景冲突。
+
+### 20.2 核心实现
+
+- `IncidentSession` 增加 `TaskState`、version/revision、`AgentEvent`、`RuntimeRunRecord` 和
+  `CommandReceipt`；所有状态转换经过共享 `AgentStateMachine`；
+- `SQLiteIncidentStore` 在共用 `agent-runtime.db` 中使用 `incident_*` 表，把 snapshot、新事件、
+  run 和 command receipt 放在一个事务中，并支持 sequence 回放和旧 JSON 幂等导入；
+- `OrphanedRunScanner` 从开发专用恢复逻辑中抽出，开发与异常 Recovery Manager 共用 owner/PID/
+  heartbeat 判定；异常 Runtime 永远只读，因此孤儿运行进入 `PAUSED`，但仍不会自动重放查询；
+- `IncidentDecision.query_required` 允许暂时没有 `LocatedPage`，模型可以先生成参数化 Menu 映射
+  查询，再把返回 URL 作为不可信相对线索去阅读代码；
+- Prompt 明确要求从相关代码和 schema 中提取已有查询语义、形成最小 SQL，并禁止要求用户运行
+  SQL 或粘贴结果；宿主自动调用 `DatabaseReader.execute()`；
+- 查询失败不会立刻把问题甩给用户：宿主把脱敏错误发回同一模型会话自动修正，达到查询尝试
+  上限后才形成可解释失败；
+- 查询审计只保存 SHA-256 SQL 指纹、参数名、用途、返回行数、截断和脱敏列，不保存参数值、
+  原始 SQL 决定或业务行。
+
+### 20.3 技术难点与解决方案
+
+**不同业务 aggregate 如何共享内核。** 开发使用 `AgentSession/AgentDecision`，异常使用
+`IncidentSession/IncidentDecision`，强行合并会让字段大量可空。解决方案是让状态机依赖最小
+`LifecycleSession` Protocol，让恢复扫描只依赖 task state 和 run lease；业务结果仍由各自 Engine
+处理。共享的是事实与安全机制，不是把不同业务契约压成一个模型。
+
+**查询可能在页面定位之前发生。** 原契约把“页面已定位”当成查询前置条件，但 Menu 映射本身就是
+定位证据。解决方案是允许 `query_required.page=None`，同时完成态仍强制包含页面和诊断，防止
+系统以半成品结束。
+
+**SQL 自动修正不能绕过安全边界。** 模型可以根据脱敏错误修改 SQL，但每次尝试仍重新经过
+SELECT/WITH 校验、参数绑定、限时、限行、脱敏和数据源引用检查；失败尝试计入统一轮次上限。
+模型自治扩大的是调查能力，不是数据库权限。
+
+**事件审计不能泄漏业务数据。** 保存完整 SQL 和参数会让订单号、人员信息等进入长期日志。
+因此事件只保存不可逆查询形状指纹与参数名，原始限行结果只进入当前模型会话。需要追查时可以
+确认“哪个查询形状何时执行、返回多少行”，但不能从审计库还原业务值。
+
+### 20.4 决策记录
+
+- ADR-023：异常流程共享 TaskState/Event/Run/Recovery 核心，保留独立业务决定和 SQLite 表；
+- ADR-024：数据库调查由模型提出结构化 SQL、宿主自动执行，不把查询步骤交给用户；
+- ADR-025：只读 Runtime 中断进入 paused 且需显式恢复，不因“理论无写入”而自动重放；
+- ADR-026：查询审计保存指纹和元数据，不长期保存 SQL 参数或业务行。
+
+### 20.5 验证
+
+确定性测试覆盖页面未定位前的 Menu 查询、宿主自动执行、SQL 失败自动修正、事件顺序与状态回放、
+SQLite 乐观并发拒绝、异常孤儿 run 启动暂停和显式恢复，以及桌面异常恢复卡。发布前完整非 live
+回归为 120 项通过，Ruff 与 diff 检查通过。

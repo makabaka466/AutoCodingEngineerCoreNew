@@ -179,6 +179,33 @@ class FakeIncidentApplication:
             message="继续诊断",
         )
 
+    def resume(
+        self,
+        session_id: str,
+        action: RecoveryAction = RecoveryAction.READ_ONLY_INSPECT,
+    ) -> IncidentOutcome:
+        self.calls.append(("resume", session_id, action.value))
+        session = self.sessions[session_id]
+        return IncidentOutcome(
+            session_id=session.id,
+            workspace=session.workspace,
+            status=IncidentStatus.NEEDS_INPUT,
+            task_state=TaskState.WAITING_INPUT,
+            message="已恢复异常诊断",
+            question="请补充记录编号",
+        )
+
+    def cancel(self, session_id: str) -> IncidentOutcome:
+        self.calls.append(("cancel", session_id))
+        session = self.sessions[session_id]
+        return IncidentOutcome(
+            session_id=session.id,
+            workspace=session.workspace,
+            status=IncidentStatus.FAILED,
+            task_state=TaskState.CANCELLED,
+            message="已取消异常诊断",
+        )
+
 
 @pytest.fixture(scope="session")
 def tk_root() -> Iterator[tk.Tk]:
@@ -335,6 +362,33 @@ def test_recovery_state_shows_explicit_safe_choices(root: tk.Toplevel) -> None:
     client._replan_recovery()
     operations[0]()
     assert application.calls == [("resume", session.id, "replan")]
+
+
+def test_incident_recovery_uses_same_explicit_recovery_controls(root: tk.Toplevel) -> None:
+    session = IncidentSession(
+        workspace=str(Path.cwd()),
+        problem="订单页面诊断中断",
+        status=IncidentStatus.FAILED,
+        task_state=TaskState.PAUSED,
+    )
+    application = FakeIncidentApplication([session])
+    client = DesktopClient(
+        root,
+        FakeApplication(),  # type: ignore[arg-type]
+        application,  # type: ignore[arg-type]
+    )
+    client._flow_session_ids[FlowKind.INCIDENT] = session.id
+    operations = _capture_operation(client)
+
+    client._select_flow(FlowKind.INCIDENT)
+
+    assert "恢复异常诊断" in client.approval_title.cget("text")
+    assert client.approve_button.cget("text") == "继续只读诊断"
+    assert client.reject_button.cget("text") == "取消诊断"
+    assert client.recovery_replan_button.cget("text") == "重新调查"
+    client._resume_recovery()
+    operations[0]()
+    assert application.calls == [("resume", session.id, "read_only_inspect")]
 
 
 def test_new_task_routes_first_message_to_application_start(
