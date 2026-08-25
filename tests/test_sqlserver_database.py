@@ -35,8 +35,9 @@ class FakeSecrets:
 
 
 class FakeCursor:
+    __slots__ = ("description", "executions")
+
     def __init__(self) -> None:
-        self.timeout = 0
         self.executions: list[tuple[str, tuple[object, ...]]] = []
         self.description = [("id",), ("email",), ("auth_token",)]
 
@@ -59,6 +60,7 @@ class FakeConnection:
     def __init__(self) -> None:
         self.cursor_value = FakeCursor()
         self.closed = False
+        self.timeout = 0
 
     def cursor(self) -> FakeCursor:
         return self.cursor_value
@@ -185,7 +187,7 @@ def test_sqlserver_reader_binds_parameters_bounds_rows_and_redacts() -> None:
             (1,),
         )
     ]
-    assert connection.cursor_value.timeout == 7
+    assert connection.timeout == 7
     assert result.returned_rows == 2
     assert result.truncated is True
     assert result.redacted_columns == ["auth_token"]

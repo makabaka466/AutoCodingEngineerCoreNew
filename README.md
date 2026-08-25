@@ -16,6 +16,8 @@
 - 程序只维护必须确定的边界：工作区、工具权限、用户审批、结构化结果、会话和持久化。
 - 每个完成任务自动生成一份可复用能力文档，供这个项目后续任务按需参考。
 - 开发任务和异常工单使用各自清晰的状态机，共享模型运行时，不引入平台耦合。
+- 开发 Task/Event/Decision/Run 由 SQLite 原子保存，可回放、可审计并支持命令幂等。
+- 写阶段中断不自动重试；系统生成恢复证据，由用户选择只读检查、重新规划或取消。
 
 ## 开发工作流程
 
@@ -226,10 +228,10 @@ Web 参数仍然兼容：`-Port 8502` 指定端口，`-NoBrowser` 不自动打�
 src/autocoding_agent/
 ├─ application.py          # 所有平台共用的稳定入口
 ├─ database_models.py      # 两套流程共用的只读查询与审计契约
-├─ core/                   # 状态、数据契约、权限档位和任务状态机
+├─ core/                   # 状态机、Handler、审计、Artifact、恢复和权限边界
 ├─ incident/               # 异常工单契约、页面定位/数据诊断状态机与应用门面
-├─ ports/                  # Runtime / SessionStore / 通用结构化 Runtime 抽象
-├─ adapters/               # Claude Code、JSON 会话、能力记忆、SQL Server/SQLite 只读数据源
+├─ ports/                  # Runtime / Event / Decision / Artifact / Session 抽象
+├─ adapters/               # Claude Code、SQLite 任务事件、Artifact、Git 观察、能力和只读数据源
 ├─ skills/                 # 显式注入模型的工作方法
 └─ interfaces/             # 原生桌面客户端、Typer CLI 与备用 Streamlit UI
 tests/                     # 不消耗模型额度的确定性测试；live 测试单独标记
@@ -237,10 +239,11 @@ docs/                      # 架构与接口说明
 ```
 
 详细内容见 [架构与结构文档](docs/ARCHITECTURE.md) 和
-[接口文档](docs/INTERFACES.md)。
+[接口文档](docs/INTERFACES.md)。项目从背景、业务理解、设计决策到真实踩坑与后续知识体系路线的
+完整沉淀见 [项目开发与工程经验](docs/PROJECT_EXPERIENCE.md)。
 
-`v0.2.x` 等补丁版本只在本地迭代；只有中间版本位递增，例如升级到 `v0.3.0` 时，才向
-GitHub 发布一次并创建不可变 tag。具体步骤见[版本发布与回退](RELEASING.md)。
+从 `v0.4.0` 开始，每次完成迭代都会同步版本与文档、运行完整检查、形成一个边界清晰的提交，
+并向 GitHub 推送一次。里程碑 tag 保持不可变。具体步骤见[版本发布与回退](RELEASING.md)。
 
 ## 验证
 
@@ -255,6 +258,6 @@ D:\python\python.exe -m pytest -m "not live"
 D:\python\python.exe -m pytest -m live
 ```
 
-当前有意不实现多 Agent、流式 token、数据库写入、异常自动修复和钉钉机器人。桌面客户端
+当前有意不实现多 Agent、流式 token 展示、数据库写入、异常自动修复和钉钉机器人。桌面客户端
 已经可以手动切换并使用两套流程；后续钉钉只需
 调用 `IncidentApplication`，数据库类型则通过 `DatabaseReader` 端口扩展，无需改写诊断内核。

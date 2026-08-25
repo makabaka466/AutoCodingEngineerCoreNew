@@ -72,8 +72,8 @@ class SQLServerDatabaseReader:
         """Open the configured database and perform a harmless metadata query."""
 
         with closing(self._connect()) as connection:
+            connection.timeout = self.query_timeout_seconds
             cursor = connection.cursor()
-            cursor.timeout = self.query_timeout_seconds
             cursor.execute("SELECT DB_NAME()")
             row = cursor.fetchone()
         selected_database = str(row[0]) if row else self.config.database
@@ -100,8 +100,8 @@ ORDER BY s.name, t.name, c.column_id
 """.strip()
         try:
             with closing(self._connect()) as connection:
+                connection.timeout = self.query_timeout_seconds
                 cursor = connection.cursor()
-                cursor.timeout = self.query_timeout_seconds
                 rows = cursor.execute(sql).fetchall()
         except pyodbc.Error as exc:
             raise ReadOnlyQueryError(self._safe_error("Schema inspection failed", exc)) from exc
@@ -129,8 +129,8 @@ ORDER BY s.name, t.name, c.column_id
         row_limit = min(query.max_rows, self.max_rows)
         try:
             with closing(self._connect()) as connection:
+                connection.timeout = self.query_timeout_seconds
                 cursor = connection.cursor()
-                cursor.timeout = self.query_timeout_seconds
                 cursor.execute(sql, *values)
                 raw_rows = cursor.fetchmany(row_limit + 1)
                 columns = _unique_column_names(

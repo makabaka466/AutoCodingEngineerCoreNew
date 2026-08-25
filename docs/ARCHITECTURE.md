@@ -1,6 +1,6 @@
 # AutoCoding Engineer 架构说明
 
-本文描述当前 `0.3.7` 代码已经实现的架构。数据字段、公共方法和命令行参数见
+本文描述当前 `0.4.0` 代码已经实现的架构。数据字段、公共方法和命令行参数见
 [接口与数据契约](INTERFACES.md)。
 
 ## 1. 项目目标
@@ -33,6 +33,10 @@ flowchart TD
     INCIDENT_APP --> INCIDENT_ENGINE["IncidentEngine"]
     ENGINE --> MODELS["Core models"]
     ENGINE --> POLICY["ExecutionPolicy"]
+    ENGINE --> STATE["AgentStateMachine"]
+    ENGINE --> HANDLERS["State Handlers"]
+    ENGINE --> AUDIT["DecisionRecorder"]
+    ENGINE --> ARTIFACTS["ArtifactRecorder"]
     ENGINE --> SKILLS["SkillRegistry"]
     ENGINE --> RUNTIME_PORT["AgentRuntime port"]
     ENGINE --> DB_PORT
@@ -47,9 +51,13 @@ flowchart TD
     DB_PORT --> SQLSERVER["SQLServerDatabaseReader"]
     DB_PORT --> SQLITE["SQLiteDatabaseReader (CLI compatibility)"]
     INCIDENT_STORE --> INCIDENT_JSON["JsonIncidentStore"]
-    SESSION_PORT --> JSON_STORE["JsonSessionStore"]
+    SESSION_PORT --> TASK_STORE["SQLiteTaskStore + EventStore"]
+    ARTIFACTS --> ARTIFACT_STORE["TaskArtifactStore + Git observer"]
+    APP --> RECOVERY["RecoveryManager startup scan"]
+    RECOVERY --> TASK_STORE
     CLAUDE --> CC["Claude Code CLI / configured model"]
-    JSON_STORE --> DATA["~/.autocoding-agent/sessions"]
+    TASK_STORE --> DATA["~/.autocoding-agent/runtime/agent-runtime.db"]
+    ARTIFACT_STORE --> ARTIFACT_DATA["~/.autocoding-agent/tasks/id/artifacts"]
     INCIDENT_JSON --> INCIDENT_DATA["~/.autocoding-agent/incidents"]
     MEMORY --> DEV_MEMORY["workspaces/id/development"]
     INCIDENT_MEMORY --> INCIDENT_MEMORY_DATA["workspaces/id/incident"]
@@ -61,12 +69,13 @@ flowchart TD
 | 系统配置 | `model_setup.py`、`sqlserver_service.py`、`workspace_knowledge.py` | 统一管理 Claude Code、模型服务、共用 SQL Server 与分流程 Markdown 知识 |
 | 应用门面 | `application.py` | 组装依赖并暴露稳定的任务 API |
 | 异常领域 | `incident/` | 页面定位、只读查询计划、数据诊断及独立会话状态机 |
-| 核心 | `core/` | 会话状态机、执行模式、数据模型、权限校验 |
-| 端口 | `ports/` | 定义模型运行时和会话存储所需的最小协议 |
-| 适配器 | `adapters/` | 调用 Claude Code、保存 JSON 会话/能力文档、SQL Server/SQLite 只读访问 |
+| 核心 | `core/` | 状态机、阶段 Handler、Decision、Artifact、Recovery、执行模式和权限校验 |
+| 端口 | `ports/` | 定义 Runtime、Session/Event/Decision/Artifact 存储所需的最小协议 |
+| 适配器 | `adapters/` | 调用 Claude Code、保存事务任务/事件/产物与能力文档、观察 Git、只读访问数据库 |
 | Skills | `skills/` | 向模型提供澄清、调查、修改、验证和能力归纳方法 |
 
-`build_application()` 是默认组合根。它创建 `ClaudeCodeRuntime`、`JsonSessionStore`、
+`build_application()` 是默认组合根。它创建 `ClaudeCodeRuntime`、`SQLiteTaskStore`、
+`TaskArtifactStore`、`GitWorkspaceObserver`、`AgentStateMachine`、`RecoveryManager`、
 `CapabilityStore`、`SkillRegistry`、`ExecutionPolicy` 和 `AgentEngine`，并可注入共用的
 `DatabaseReader`，然后返回
 `AgentApplication`。接口层不直接依赖 Claude Code 的命令细节。
@@ -128,48 +137,76 @@ Claude Code 以 `--bare` 启动，并使用空 setting sources、严格空 MCP �
 ## 4. 会话与任务流程
 
 一个 `AgentSession` 表示一个用户任务。它保存用户目标、双方消息、Claude Code 的可恢复
-会话 ID、最后决定、待审批请求、使用量和事件。会话由 JSON 文件持久化，因此 CLI 与 UI
-可以在不同进程中继续同一任务。
+会话 ID、最后决定、待审批请求、使用量、生命周期状态和事件。开发会话快照与事件由 SQLite
+事务存储，因此 CLI 与 UI 可以在不同进程中继续同一任务。
+
+开发流程明确区分三种概念：
+
+- `TaskState`：持久化任务生命周期，由 `AgentStateMachine` 独占修改；
+- `AgentStatus`：模型本轮结构化决定的类型，保留现有接口兼容；
+- `AgentMode`：本轮 Claude Code 的工具权限档位。
+
+`AgentEngine` 的 public action 会先构造带 command ID 和 expected version 的 `AgentCommand`。
+StateMachine 校验转换表、版本和非空原因，再更新 `task_state/version` 并追加
+`state_transitioned`。业务代码不直接设置 `task_state`。
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Inspect: start
-    Inspect --> NeedsInput: needs_input
-    NeedsInput --> Inspect: send
-    Inspect --> ApprovalRequired: approval_required
-    ApprovalRequired --> Implement: approve modify
-    ApprovalRequired --> Verify: approve verify
-    ApprovalRequired --> Inspect: reject 或 send revised instruction
-    Implement --> ApprovalRequired: 需要 verify 或新的权限
-    Verify --> ApprovalRequired: 需要 modify 或新的权限
-    Inspect --> Completed: completed
-    Implement --> Completed: completed
-    Verify --> Completed: completed
-    Inspect --> Failed: runtime / contract / policy error
-    Implement --> Failed: runtime / contract / policy error
-    Verify --> Failed: runtime / contract / policy error
-    Failed --> Inspect: send
+    [*] --> Created
+    Created --> Inspecting: start
+    Inspecting --> WaitingInput: needs_input
+    WaitingInput --> Inspecting: send
+    Inspecting --> QueryingData: query_required
+    QueryingData --> Inspecting: bounded results ready
+    Inspecting --> WaitingModifyApproval: request modify
+    Inspecting --> WaitingVerifyApproval: request verify
+    WaitingModifyApproval --> Implementing: approve
+    WaitingVerifyApproval --> Verifying: approve
+    WaitingModifyApproval --> Inspecting: reject / revised instruction
+    WaitingVerifyApproval --> Inspecting: reject / revised instruction
+    Implementing --> WaitingVerifyApproval: request verify
+    Implementing --> WaitingModifyApproval: revised proposal
+    Verifying --> Replanning: verification failed
+    Replanning --> Inspecting: bounded replan
+    Replanning --> Failed: replan limit reached
+    Verifying --> WaitingModifyApproval: more edits required
+    Inspecting --> Completed: completed
+    Implementing --> Completed: completed
+    Verifying --> Completed: completed
+    Inspecting --> Paused: orphaned read-only run / pause
+    Implementing --> RecoveryRequired: interrupted / uncertain side effect
+    Verifying --> RecoveryRequired: interrupted / uncertain side effect
+    RecoveryRequired --> Inspecting: read-only inspect / replan
+    Paused --> Inspecting: resume
+    Inspecting --> Failed: terminal runtime / contract / policy error
+    Failed --> Inspecting: compatibility retry by send
+    Created --> Cancelled: cancel
+    Inspecting --> Cancelled: cancel
+    Paused --> Cancelled: cancel
+    RecoveryRequired --> Cancelled: cancel
     Completed --> [*]
+    Cancelled --> [*]
 ```
 
 开发 `inspect` 还可进入内部 `query_required`：模型提交至多五条最小参数化 SELECT，主机经
 `DatabaseReader` 执行、只把受限结果送回同一 Claude 会话，再继续做语义判断。原始行不写入
 开发 session，只持久化查询名、用途、行数、截断和脱敏列审计。`implement/verify` 不允许查库。
 
-状态图表达正常使用路径；结构化契约本身允许模型返回受契约约束的状态。只有
-`completed` 在应用层被视为终态，之后 `send()` 会拒绝继续该会话。当前实现允许用户向
-`failed` 会话发送新消息重新进入只读调查。
+`replanning`、`paused`、`recovery_required` 和 `cancelled` 已接入公共 API、CLI 和桌面恢复卡。
+`completed` 与 `cancelled` 是终态；写或验证阶段出现不确定副作用时不得直接进入普通 failed，
+而是进入 recovery_required。为兼容旧使用方式，部分明确无副作用的 failed 仍允许通过 send
+重新进入只读调查。
 
 ### 4.1 新任务
 
 1. `start()` 严格解析工作区，确认它存在且为目录，拒绝空消息，并保存用户选择的知识项目。
-2. 创建会话并立即写入 JSON。
-3. 以 `inspect` 模式生成 `RuntimeTurn`。
+2. 创建 `created` 会话和 `task_created` 事件并在同一 SQLite 事务中保存快照与事件。
+3. `CreateTask` command 驱动 `created -> inspecting`，再以 `inspect` 模式生成 RuntimeTurn。
 4. 能力存储只把所选项目的 MD 同步到当前工作区能力视图；Skill Registry 在提示词中锁定选择。
 5. Claude Code 在目标工作区中运行并返回结构化决定。
-6. 核心校验决定，追加消息和事件，再次持久化会话。
+6. 核心校验决定，由 StateMachine 转入等待、查询、完成或失败状态，追加消息和事件后再次保存。
 
-### 4.2 澄清和恢复
+### 4.2 澄清、暂停和恢复
 
 `needs_input` 表示模型暂时不能进行有边界、有价值的调查。用户通过 `send()` 补充一次
 消息，核心使用 `inspect` 模式继续。Claude Code 适配器在首轮使用应用会话 UUID 作为
@@ -178,6 +215,10 @@ Claude 会话 ID，后续使用返回的 `runtime_session_id` 和 `--resume` 恢
 本地 `messages` 同时完整保存对话记录，供 UI 展示和其他 Runtime 实现使用。当前
 Claude Code 适配器依靠 `--resume` 延续模型上下文，没有把 `RuntimeTurn.history` 再次拼入
 命令提示词。
+
+`pause()` 只在安全持久化边界暂停；`cancel()` 不重放任何 Runtime。启动组合根会由
+RecoveryManager 扫描非终态任务和未终结 run：孤儿 Inspect 转为 paused，孤儿 Implement/Verify
+转为 recovery_required。用户通过 `resume(action)` 选择只读检查、重新规划或取消。
 
 ### 4.3 审批、修改和验证
 
@@ -203,15 +244,19 @@ Markdown 预览。预览形式由模型按任务语义决定，可以是界面�
 ### 4.4 失败处理
 
 Claude Code 启动失败、超时、非零退出、无效 JSON、缺少结构化结果、无可恢复 session ID、
-Pydantic 契约失败或核心策略违规，都会转换成持久化的 `failed` 决定和 `task_failed`
-事件。错误不会以未捕获异常形式丢失当前任务状态。
+Pydantic 契约失败或核心策略违规，都会形成持久化失败事实。只读阶段可以转为 failed；实施或
+验证阶段只要副作用状态不确定，就转为 recovery_required 并生成恢复报告。错误不会以未捕获
+异常形式丢失当前任务状态。
 
 首轮启动前会把传给 Claude Code 的预分配 UUID 先保存为 runtime session ID。即使模型进程
 在建立 transcript 后超时，后续也只会尝试精确 `--resume`，不会把可能已有副作用的轮次
 再次当成新会话重放。
 
-应用在调用 Runtime 前已经持久化用户消息和 `turn_started` 事件。当前没有单独的
-`running` 状态，也没有后台重试或崩溃恢复队列。
+应用在调用 Runtime 前已经持久化用户消息、`inspecting/implementing/verifying` 生命周期状态和
+`turn_started` 事件。SQLiteTaskStore 在一个 `BEGIN IMMEDIATE` 事务内为新事件分配单调
+sequence、追加不可变事件、增加 snapshot revision 并更新 Task snapshot；旧 revision 保存会被
+拒绝。命令结束时写入不可变 CommandReceipt；相同 command ID 重试直接返回当前持久化结果。
+Runtime run 的 owner、PID、heartbeat 和终态同样进入 SQLite，供启动恢复扫描使用。
 
 ## 5. 异常诊断流程
 
@@ -259,8 +304,9 @@ SQL Server 非密钥配置原子写入 `<data_dir>/database/sqlserver.json`，�
 
 ## 6. Claude Code Runtime
 
-`ClaudeCodeRuntime` 是 `AgentRuntime` 和 `StructuredRuntime` 的默认实现。开发流程通过
-`run()` 获取 `AgentDecision`；异常流程通过 `run_structured()` 获取 `IncidentDecision`。
+`ClaudeCodeRuntime` 是 `AgentRuntime` 和 `StructuredRuntime` 的默认实现。开发流程优先通过
+`run_observed()` 获取 `AgentDecision` 并实时保存活动；兼容 Runtime 可继续实现 `run()`。异常流程
+通过 `run_structured()` 获取 `IncidentDecision`。
 适配器不重写模型的 Agent 循环，而是把
 以下信息转换为一次 Claude Code CLI 调用：
 
@@ -273,9 +319,14 @@ SQL Server 非密钥配置原子写入 `<data_dir>/database/sqlserver.json`，�
 - bare 模式、空 setting sources、严格空 MCP 配置和禁用 Chrome 的隔离参数；
 - 新建或恢复 Claude Code 会话所需的 ID。
 
-适配器要求 Claude Code 返回 JSON envelope，且其中包含 `structured_output` 和非空
-`session_id`。它将 `structured_output` 校验为调用方要求的模型，并提取 token、费用、耗时和
-turn 数量。CLI stderr/stdout 中常见的认证信息会在形成用户可见错误前脱敏。
+开发适配器以 `Popen` 启动 `--output-format stream-json --include-hook-events`，从 system、assistant、
+ToolUse、ToolResult 和 result 行构造脱敏 RuntimeActivity。最终 result 必须包含
+`structured_output` 和非空 `session_id`，再校验为调用方要求的模型并提取 token、费用、耗时和
+turn 数量。活动、stderr/stdout 中的凭据和工作区外绝对路径会在持久化前脱敏。
+
+每轮建立 `RuntimeRunRecord`，保存 task/state/mode、owner、PID、heartbeat 和终态。适配器维护
+活动进程表并支持 `interrupt(run_id)`；这表示终止已登记父进程，不承诺回滚已发生的工具副作用。
+成功的 Bash ToolResult 只有匹配宿主认可的测试命令时才生成 host-verified `test_executed`。
 
 Windows 子进程同时设置 `CREATE_NO_WINDOW` 和隐藏 `STARTUPINFO`，因此 Claude Code 及其直接
 子进程不会在桌面问答时新建控制台窗口。每轮调用通过 `autocoding_agent` logger 记录开始、
@@ -324,7 +375,11 @@ flowchart LR
 
 ```text
 <data_dir>/
-├─ sessions/<session-id>.json
+├─ runtime/agent-runtime.db
+├─ tasks/<task-id>/
+│  ├─ manifest.json
+│  └─ artifacts/<artifact-uuid>.<json|patch|md>
+├─ sessions/<session-id>.json        # 旧开发会话，仅作为自动导入来源保留
 ├─ incidents/<session-id>.json
 └─ workspaces/<workspace-id>/
    ├─ development/
@@ -368,9 +423,20 @@ knowledge/
 
 ## 8. 持久化和路径边界
 
-会话文件名只能来自合法 UUID；这阻止调用方通过 session ID 构造任意路径。会话和能力
-文件均使用同目录临时文件加 replace 的方式写入，避免正常写入中留下半个 JSON 或
-Markdown。
+开发任务 ID 和异常会话文件名都必须是合法 UUID；这阻止调用方通过 session ID 构造任意路径。
+开发 Task snapshot、Event、Decision、Artifact metadata、Runtime Run 和 Command Receipt 使用
+SQLite WAL、foreign key、busy timeout 和单事务提交；
+`revision` 提供乐观并发检查，`version` 表达生命周期转换次数。Event ID 全局唯一，task 内
+sequence 单调递增，已追加事件若被修改会拒绝保存。旧 `sessions/*.json` 启动时幂等导入，导入
+完成后不再作为开发任务写入目标。异常会话和能力 Markdown/JSON 仍使用临时文件加 replace。
+
+`SQLiteTaskStore.replay_task_state()` 按 sequence 回放 `state_transitioned` 并验证 from/to 链；
+旧 JSON 没有生命周期事件时会生成 actor=migration 的合成导入事件。RecoveryManager 在应用
+启动时检查非终态 snapshot、run owner/PID/heartbeat 与工作区观察结果，并采取保守转换。
+
+Artifact 正文不写入目标仓库。`TaskArtifactStore` 使用 UUID 文件名、内容 SHA-256、大小限制、
+凭据脱敏和短临时文件原子替换；SQLite 只保存不可变元数据。Git observer 记录 status、commit、
+staged/unstaged diff 和未跟踪路径，但不会自动读取未跟踪文件正文。
 
 目标仓库只在 Claude Code 的当前工作目录中暴露。主机验证结果中的文件路径形式，但当前
 不会核实每条相对路径是否真实存在，也没有跨进程文件锁。默认数据目录为
@@ -385,8 +451,9 @@ Markdown。
 桌面客户端同时依赖开发 `AgentApplication` 和异常 `IncidentApplication`，通过显式流程
 选择器切换，并为每套流程维护独立的知识项目选项、当前 session 与历史列表；CLI 与 Web UI 继续使用各自
 对应的应用门面。桌面端把同步模型调用放在单一后台线程，所有 Tk 控件仍只由 UI 线程更新；
-执行期间禁止重复提交和流程/会话切换。当前 Runtime 没有
-取消端口，因此客户端不会提供虚假的停止按钮，任务运行时也会阻止直接关闭窗口。
+执行期间禁止重复提交和流程/会话切换。Runtime 具备内部 interrupt 端口；产品界面在安全边界
+提供 pause/cancel，并在 recovery_required 时显示只读检查、重新规划和取消选项，不把进程终止
+描述成副作用回滚。
 
 新的交付媒介可以复用同一门面，无需复制会话、审批或 Runtime 逻辑。模型运行时和会话存储
 分别通过 `AgentRuntime`、`SessionStore` Protocol 替换；当前能力存储由 `AgentEngine` 直接

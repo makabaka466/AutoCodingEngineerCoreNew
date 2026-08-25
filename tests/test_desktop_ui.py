@@ -19,6 +19,8 @@ from autocoding_agent.core.models import (
     MessageRole,
     ProposedChange,
 )
+from autocoding_agent.core.recovery.models import RecoveryAction
+from autocoding_agent.core.state_machine.models import TaskState
 from autocoding_agent.incident.models import (
     IncidentOutcome,
     IncidentSession,
@@ -104,6 +106,30 @@ class FakeApplication:
             message="已拒绝",
         )
 
+    def resume(
+        self,
+        session_id: str,
+        action: RecoveryAction = RecoveryAction.READ_ONLY_INSPECT,
+    ) -> AgentOutcome:
+        self.calls.append(("resume", session_id, action.value))
+        session = self.sessions[session_id]
+        return AgentOutcome(
+            session_id=session.id,
+            workspace=session.workspace,
+            status=AgentStatus.NEEDS_INPUT,
+            message="已恢复",
+        )
+
+    def cancel(self, session_id: str) -> AgentOutcome:
+        self.calls.append(("cancel", session_id))
+        session = self.sessions[session_id]
+        return AgentOutcome(
+            session_id=session.id,
+            workspace=session.workspace,
+            status=AgentStatus.FAILED,
+            message="已取消",
+        )
+
 
 class FakeIncidentApplication:
     def __init__(self, sessions: list[IncidentSession] | None = None) -> None:
@@ -124,9 +150,7 @@ class FakeIncidentApplication:
         *,
         project: str | None = None,
     ) -> IncidentOutcome:
-        self.calls.append(
-            ("start", str(workspace), problem, page_hint or "", project or "")
-        )
+        self.calls.append(("start", str(workspace), problem, page_hint or "", project or ""))
         session = IncidentSession(
             id=str(uuid4()),
             workspace=str(workspace),
@@ -293,6 +317,25 @@ def test_legacy_modify_approval_can_be_revised_but_not_approved(
     assert "缺少修改方案" in client.approval_title.cget("text")
 
 
+def test_recovery_state_shows_explicit_safe_choices(root: tk.Toplevel) -> None:
+    session = _session(AgentStatus.FAILED)
+    session.task_state = TaskState.RECOVERY_REQUIRED
+    application = FakeApplication([session])
+    client = DesktopClient(root, application)  # type: ignore[arg-type]
+    client.session_id = session.id
+    operations = _capture_operation(client)
+
+    client._render_session(session)
+
+    assert "恢复任务" in client.approval_title.cget("text")
+    assert client.approve_button.cget("text") == "只读检查"
+    assert client.reject_button.cget("text") == "取消任务"
+    assert client.recovery_replan_button.winfo_manager() == "grid"
+    client._replan_recovery()
+    operations[0]()
+    assert application.calls == [("resume", session.id, "replan")]
+
+
 def test_new_task_routes_first_message_to_application_start(
     root: tk.Toplevel, tmp_path: Path
 ) -> None:
@@ -305,9 +348,7 @@ def test_new_task_routes_first_message_to_application_start(
     client._send_message()
     outcome = operations[0]()
 
-    assert application.calls == [
-        ("start", str(tmp_path), "调查 src/app.py 的报错", "生物")
-    ]
+    assert application.calls == [("start", str(tmp_path), "调查 src/app.py 的报错", "生物")]
     assert outcome.status == AgentStatus.NEEDS_INPUT
 
 
@@ -574,9 +615,7 @@ def test_approval_buttons_route_exact_session_and_rejection_reason(
     ]
 
 
-def test_busy_window_refuses_to_close(
-    root: tk.Toplevel, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_busy_window_refuses_to_close(root: tk.Toplevel, monkeypatch: pytest.MonkeyPatch) -> None:
     warnings: list[str] = []
     client = DesktopClient(root, FakeApplication())  # type: ignore[arg-type]
     client._busy = True

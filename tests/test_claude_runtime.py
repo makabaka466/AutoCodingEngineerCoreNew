@@ -5,6 +5,9 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -12,6 +15,7 @@ import pytest
 from autocoding_agent.adapters.claude_code import ClaudeCodeError, ClaudeCodeRuntime
 from autocoding_agent.config import Settings
 from autocoding_agent.core.models import AgentMode, RuntimeTurn
+from autocoding_agent.core.runtime.models import RuntimeEventKind
 from autocoding_agent.incident.models import IncidentDecision, IncidentStatus
 
 
@@ -255,3 +259,106 @@ def test_runtime_error_redacts_provider_credentials(tmp_path: Path) -> None:
 
     assert secret not in str(error.value)
     assert "[REDACTED]" in str(error.value)
+
+
+def test_observed_runtime_parses_sanitized_tool_lifecycle(tmp_path: Path) -> None:
+    secret = "sk-1234567890abcdefghijkl"
+    stream = [
+        {"type": "system", "subtype": "init", "model": "deepseek-test"},
+        {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "tool-1",
+                        "name": "Bash",
+                        "input": {"command": f"api_key={secret} python -m pytest -q"},
+                    }
+                ]
+            },
+        },
+        {
+            "type": "user",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tool-1",
+                        "content": "102 passed",
+                        "is_error": False,
+                    }
+                ]
+            },
+        },
+        {
+            "type": "result",
+            "subtype": "success",
+            "session_id": "runtime-stream",
+            "structured_output": {"status": "completed", "message": "Done."},
+            "usage": {"input_tokens": 3, "output_tokens": 4},
+        },
+    ]
+    script = "import sys\n" + "\n".join(
+        f"print({json.dumps(json.dumps(item))}, flush=True)" for item in stream
+    )
+    captured: dict[str, object] = {}
+
+    def popen_factory(command: list[str], **kwargs: object) -> subprocess.Popen[str]:
+        captured["command"] = command
+        return subprocess.Popen([sys.executable, "-c", script], **kwargs)
+
+    runtime = ClaudeCodeRuntime(_settings(tmp_path), popen_factory=popen_factory)
+    activities = []
+
+    result = runtime.run_observed(_turn(tmp_path), "run-1", activities.append)
+
+    assert result.runtime_session_id == "runtime-stream"
+    assert result.usage.input_tokens == 3
+    assert [item.kind for item in activities] == [
+        RuntimeEventKind.SYSTEM_INIT,
+        RuntimeEventKind.TOOL_STARTED,
+        RuntimeEventKind.TOOL_FINISHED,
+    ]
+    assert secret not in json.dumps([item.model_dump(mode="json") for item in activities])
+    assert activities[-1].data["is_error"] is False
+    command = captured["command"]
+    assert isinstance(command, list)
+    assert _option_value(command, "--output-format") == "stream-json"
+    assert "--verbose" in command
+    assert "--include-hook-events" in command
+
+
+def test_observed_runtime_can_be_interrupted(tmp_path: Path) -> None:
+    started = threading.Event()
+
+    def popen_factory(command: list[str], **kwargs: object) -> subprocess.Popen[str]:
+        process = subprocess.Popen(
+            [sys.executable, "-c", "import time; print('{}', flush=True); time.sleep(30)"],
+            **kwargs,
+        )
+        started.set()
+        return process
+
+    runtime = ClaudeCodeRuntime(_settings(tmp_path), popen_factory=popen_factory)
+    errors: list[Exception] = []
+
+    def invoke() -> None:
+        try:
+            runtime.run_observed(_turn(tmp_path), "run-interrupt", lambda _event: None)
+        except Exception as exc:  # noqa: BLE001 - test captures worker failure
+            errors.append(exc)
+
+    worker = threading.Thread(target=invoke)
+    worker.start()
+    assert started.wait(timeout=2)
+    for _ in range(100):
+        if runtime.interrupt("run-interrupt"):
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail("The observed Runtime never registered its active process.")
+    worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert errors and "interrupted" in str(errors[0]).casefold()

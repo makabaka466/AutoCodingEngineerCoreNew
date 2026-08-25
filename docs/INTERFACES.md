@@ -1,6 +1,6 @@
 # AutoCoding Engineer 接口与数据契约
 
-本文记录当前 `0.3.7` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
+本文记录当前 `0.4.0` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
 Runtime、持久化和状态契约。
 设计动机和运行流程见[架构说明](ARCHITECTURE.md)。
 
@@ -30,7 +30,8 @@ def build_application(
 
 - 未传 `settings` 时使用进程缓存的 `get_settings()`。
 - 未传 `runtime` 时创建 `ClaudeCodeRuntime`。
-- 创建数据目录，并使用 JSON 会话存储和文件型能力存储。
+- 创建数据目录，并使用 SQLite Task/Event Store、文件型 Artifact/能力存储与 Git workspace observer。
+- 启动时运行 RecoveryManager，结果通过 `AgentApplication.recovery_scan` 暴露。
 - 配置本地滚动日志，并通过 `AgentApplication.log_path` 暴露日志文件路径。
 - `runtime` 参数可用于测试或替换模型执行适配器。
 - `database` 与无凭据 `database_reference` 可把同一只读数据源注入开发流程；模型仅能在
@@ -43,12 +44,19 @@ def build_application(
 | 方法 | 输入 | 行为和返回 |
 | --- | --- | --- |
 | `start(workspace, message, project=None)` | `str | Path`, `str`, `str | None` | 新建任务，保存所选知识项目并执行首个只读轮次，返回 `AgentOutcome` |
-| `send(session_id, message)` | `str`, `str` | 补充澄清或修订指令，以只读模式继续 |
-| `approve(session_id)` | `str` | 批准当前请求的精确 scope，并以对应模式继续 |
-| `reject(session_id, reason="")` | `str`, `str` | 拒绝当前请求，以只读模式继续并要求替代方案 |
+| `send(session_id, message, command_id=None)` | `str`, `str`, `str | None` | 补充澄清或修订指令，以只读模式继续；可用命令 ID 幂等重试 |
+| `approve(session_id, command_id=None)` | `str`, `str | None` | 批准当前请求的精确 scope，并以对应模式继续 |
+| `reject(session_id, reason="", command_id=None)` | `str`, `str`, `str | None` | 拒绝当前请求，以只读模式继续并要求替代方案 |
+| `resume(session_id, action="read_only_inspect")` | `str`, `RecoveryAction | str` | 从 paused/recovery_required 以显式安全动作恢复 |
+| `pause(session_id)` | `str` | 在持久化边界暂停非终态任务 |
+| `cancel(session_id)` | `str` | 取消任务且不重放 Runtime |
 | `outcome(session_id)` | `str` | 返回最近一次持久化结果 |
 | `get_session(session_id)` | `str` | 返回完整 `AgentSession`，包含消息和事件 |
 | `list_sessions()` | 无 | 按 `updated_at` 倒序返回所有会话 |
+| `events(session_id)` | `str` | 返回持久化事件时间线 |
+| `artifacts(session_id)` | `str` | 返回 Artifact 元数据，不直接输出敏感正文 |
+| `runs(session_id)` | `str` | 返回 Runtime run 生命周期记录 |
+| `explain_change(session_id, path)` | `str`, `str` | 聚合与相对路径相关的 Decision、Artifact 和 Event |
 
 主要前置条件：
 
@@ -63,7 +71,32 @@ def build_application(
 
 ## 2. 核心枚举
 
-### 2.1 `AgentStatus`
+### 2.1 `TaskState`
+
+`TaskState` 是开发任务的持久化生命周期，不等同于模型决定或工具权限：
+
+| 值 | 含义 |
+| --- | --- |
+| `created` | Task snapshot 已创建，尚未启动 Runtime |
+| `inspecting` | 正在进行只读理解、调查或方案设计 |
+| `waiting_input` | 等待用户补充一个关键信息 |
+| `querying_data` | 宿主正在执行模型提出的受限只读查询 |
+| `waiting_modify_approval` | 等待用户批准结构化修改方案 |
+| `implementing` | 已授权 Edit/Write 的实施轮次 |
+| `waiting_verify_approval` | 等待用户批准验证命令 |
+| `verifying` | 已授权白名单 Bash 的验证轮次 |
+| `replanning` | 验证失败后的有上限重新规划 |
+| `paused` | 用户暂停或孤儿只读运行的安全停靠状态 |
+| `recovery_required` | 中断后副作用不确定，需要恢复决策 |
+| `completed` | 已完成终态 |
+| `failed` | 明确失败；兼容路径可允许 send 后重新调查 |
+| `cancelled` | 用户取消终态 |
+
+只有 `AgentStateMachine.transition()` 可以修改 `AgentSession.task_state`。每次真实转换会增加
+`version` 并追加 `state_transitioned`；重复转换到相同状态是幂等 no-op。持久化 command receipt
+保证相同命令 ID 不会重复调用 Runtime。
+
+### 2.2 `AgentStatus`
 
 | 值 | 含义 |
 | --- | --- |
@@ -73,10 +106,10 @@ def build_application(
 | `completed` | 当前任务已如实到达终态 |
 | `failed` | Runtime、输出契约或策略检查失败 |
 
-只有 `completed` 会禁止后续 `send`，并触发能力文档保存。`failed` 当前可以通过 `send`
-重新进入只读轮次。
+`AgentStatus` 是模型本轮结构化决定/公开 Outcome 类型，不是任务生命周期。`completed` 会触发
+能力文档保存；是否允许继续由 `TaskState` 判断。`failed` 当前可以通过 `send` 重新进入只读轮次。
 
-### 2.2 `AgentMode`
+### 2.3 `AgentMode`
 
 | 值 | 用途 |
 | --- | --- |
@@ -84,13 +117,18 @@ def build_application(
 | `implement` | 用户批准后编辑或写入工作区文件 |
 | `verify` | 用户批准后执行白名单内的验证命令 |
 
-### 2.3 其他枚举
+### 2.4 其他枚举
 
 - `ApprovalScope`：`modify`、`verify`。
 - `MessageRole`：`user`、`assistant`、`system`；当前 Engine 追加的是 user/assistant。
-- `EventType`：`turn_started`、`runtime_finished`、`input_required`、
-  `approval_required`、`task_completed`、`task_failed`、`capability_saved`、
-  `capability_failed`、`database_queries_executed`。
+- `AgentCommandType`：`create_task`、`submit_user_input`、`grant_approval`、
+  `reject_approval`、`resume_task`、`pause_task`、`cancel_task`；
+- `FailureClass`：Runtime、Provider、Policy、Validation、副作用不确定和终态失败分类；
+- `EventType`：除任务、状态、输入、审批、完成、失败、能力和数据库事件外，还包括
+  `runtime_started/activity/completed/failed/interrupted`、`tool_started/finished`、
+  `code_modified`、`test_executed`、`verification_failed`、`recovery_required`、
+  `decision_recorded`、`artifact_recorded/failed`。
+- `RecoveryAction`：`read_only_inspect`、`replan`、`cancel`。
 
 ## 3. 结构化模型契约
 
@@ -161,6 +199,10 @@ CapabilityDraft
 AgentDecision
   status: AgentStatus
   message: str
+  reason: str | None = None
+  alternatives: list[str] = []
+  confidence: float | None = None (0–1)
+  risk_level: RiskLevel | None = None
   evidence: list[Evidence] = []
   next_actions: list[str] = []
   approval: ApprovalRequest | None = None
@@ -182,7 +224,8 @@ AgentDecision
 - 所有 `changed_files`、非空 evidence path 和 proposal path 必须是安全的相对路径。
 
 `message` 是用户可见的 Markdown 文本。`next_actions`、`evidence`、`changed_files` 和
-`test_summary` 是机器可读补充；桌面客户端会额外展示 evidence、changed files、测试摘要和
+`reason/alternatives/confidence/risk_level` 用于生成 DecisionRecord；`test_summary` 只是模型
+声明，默认不具备 host_verified 资格。桌面客户端会额外展示 evidence、changed files、测试摘要和
 能力文档路径。桌面与 Web UI 都会完整展示结构化修改方案和预览，CLI 输出其关键字段。
 
 ### 3.4 使用量与事件
@@ -200,23 +243,58 @@ AgentUsage
 ```text
 AgentEvent
   id: str (UUID 自动生成)
+  sequence: int | None（Event Store 分配）
+  schema_version: int = 1
   type: EventType
   message: str
+  reason: str | None
+  alternatives: list[str] = []
+  confidence: float | None
+  risk_level: RiskLevel | None
+  actor: str = "host"
+  correlation_id: str | None
+  causation_id: str | None
+  command_id: str | None
   data: dict[str, Any] = {}
   created_at: datetime (UTC 自动生成)
 ```
 
-事件按追加顺序保存在 session 中。一次成功 Runtime 轮次通常产生：
+事件同时保存在 Task snapshot 和独立 Event 表；SQLiteTaskStore 为每个 task 分配连续 sequence，
+Event ID 全局唯一，已追加事件不能被修改。一次新建并成功执行的 Runtime 轮次通常产生：
 
 ```text
+task_created
+state_transitioned (created -> inspecting)
 turn_started
-runtime_finished
+runtime_started
+runtime_activity / tool_started / tool_finished (0..n)
+runtime_completed | runtime_failed | runtime_interrupted
+decision_recorded
+artifact_recorded (0..n)
+state_transitioned (inspecting -> waiting/completed/failed/recovery_required)
 input_required | approval_required | task_completed | task_failed
 [capability_saved | capability_failed，仅 completed]
 ```
 
-Runtime 或策略异常的轮次会有 `turn_started` 和 `task_failed`，没有
-`runtime_finished`。
+Runtime 或策略异常会留下 run 终态；实施/验证副作用不确定时使用 `recovery_required`，不会把
+缺少最终 result 误写成普通 `task_failed` 后自动重试。
+
+`AgentCommand` 由 AgentEngine 的 start/send/approve/reject/resume/pause/cancel 入口创建：
+
+```text
+AgentCommand
+  id: str
+  task_id: str
+  type: AgentCommandType
+  expected_version: int
+  actor: str = "user"
+  payload: dict = {}
+  created_at: datetime
+```
+
+命令 ID 会进入相关事件。task snapshot 使用 revision compare-and-swap 拒绝跨进程旧快照；
+`send/approve/reject` 已开放 `command_id`，成功终结后写入不可变 CommandReceipt。同一 ID 重试
+返回当前持久化 Outcome，不再次执行 Runtime；若只有起始事件而没有 receipt，则拒绝不安全重放。
 
 ### 3.5 `AgentSession`
 
@@ -225,6 +303,10 @@ AgentSession
   id: str (UUID 自动生成)
   workspace: str
   goal: str
+  project: str | None = None
+  task_state: TaskState = created
+  version: int = 0
+  revision: int = 0
   runtime_session_id: str | None = None
   status: AgentStatus | None = None
   pending_approval: ApprovalRequest | None = None
@@ -234,22 +316,58 @@ AgentSession
   database_reference: str | None = None
   query_observations: list[QueryObservation] = []
   query_rounds: int = 0
+  replan_rounds: int = 0
   messages: list[ChatMessage] = []
   events: list[AgentEvent] = []
+  decision_records: list[DecisionRecord] = []
+  artifacts: list[ArtifactRecord] = []
+  runs: list[RuntimeRunRecord] = []
+  command_receipts: list[CommandReceipt] = []
   created_at: datetime
   updated_at: datetime
 ```
 
 `id` 是应用会话 ID；`runtime_session_id` 是 Claude Code 返回、用于下一轮 `--resume` 的 ID。
 两者不能假定始终相同。`workspace` 以严格解析后的绝对目录保存。
+`version` 只在生命周期转换时增加；`revision` 在每次 Task snapshot 保存时增加。旧 JSON 没有
+`task_state/version/revision` 时，会根据已有 status 和 pending approval 推导生命周期，以 0
+载入后导入 SQLite；旧文件不会被覆盖。
 
-### 3.6 `AgentOutcome`
+### 3.6 Decision、Artifact 与 Runtime Run
+
+```text
+DecisionRecord
+  id, task_id, event_id
+  decision_type, summary, reason
+  evidence: list[EvidenceRef]
+  alternatives, confidence, risk_level
+  actor, model, runtime_session_id, created_at
+
+ArtifactRecord
+  id, task_id, event_id, type
+  relative_path, sha256, size_bytes, schema_version
+  source, host_verified, sensitive
+  related_paths, metadata, created_at
+
+RuntimeRunRecord
+  id, task_id, state, mode
+  owner_id, owner_pid
+  status: started | completed | failed | interrupted
+  started_at, heartbeat_at, completed_at, terminal_reason
+  runtime_session_id, activity_ids
+```
+
+DecisionRecord 表达“为什么这样判断”；Artifact/Runtime/Event 表达宿主观察到的内容。三者都带来源
+ID，但只有 `host_verified=true` 的 Artifact 或明确宿主事件可以作为执行事实。
+
+### 3.7 `AgentOutcome`
 
 ```text
 AgentOutcome
   session_id: str
   workspace: str
   status: AgentStatus
+  task_state: TaskState
   message: str
   evidence: list[Evidence] = []
   next_actions: list[str] = []
@@ -275,6 +393,21 @@ class AgentRuntime(Protocol):
 ```
 
 自定义 Runtime 必须接收完整 `RuntimeTurn` 并返回经契约表达的 `RuntimeResult`。
+开发 Engine 会在适配器提供时优先调用：
+
+```python
+def run_observed(
+    turn: RuntimeTurn,
+    *,
+    run_id: str,
+    event_sink: Callable[[RuntimeActivity], None],
+) -> RuntimeResult: ...
+
+def interrupt(run_id: str) -> bool: ...
+```
+
+`event_sink` 在 Runtime 运行中增量持久化脱敏活动；`interrupt` 只控制当前进程生命周期，不表示
+已执行工具的副作用被撤销。仅实现 `run()` 的旧适配器仍可使用，但没有细粒度活动事件。
 
 ```text
 RuntimeTurn
@@ -326,7 +459,8 @@ claude -p
   --strict-mcp-config
   --mcp-config '{"mcpServers":{}}'
   --setting-sources ''
-  --output-format json
+  --output-format stream-json
+  --include-hook-events
   --model <configured-model>
   --permission-mode <permission-mode>
   --tools <comma-separated-tools>
@@ -339,7 +473,8 @@ claude -p
   <user message>
 ```
 
-子进程工作目录固定为 `RuntimeTurn.workspace`。适配器要求 stdout 是一个 JSON envelope：
+子进程工作目录固定为 `RuntimeTurn.workspace`。开发可观测路径要求 stdout 是逐行 stream-json，
+最终 `result` 行包含以下 JSON envelope；通用 `run_structured()` 兼容路径仍可直接读取最终 JSON：
 
 Windows 运行时还会传入隐藏 `STARTUPINFO` 和 `CREATE_NO_WINDOW`，避免每轮 Claude Code 调用
 弹出控制台。Runtime 日志只记录调用元数据、usage 和脱敏错误，不记录完整 prompt。
@@ -378,18 +513,31 @@ class SessionStore(Protocol):
     def list(self) -> list[AgentSession]: ...
 ```
 
-默认 `JsonSessionStore` 把每个会话保存为：
+默认 `SQLiteTaskStore` 把开发任务保存在：
 
 ```text
-<data_dir>/sessions/<uuid>.json
+<data_dir>/runtime/agent-runtime.db
 ```
 
 - `create` 在 UUID 已存在时抛出 `FileExistsError`；
 - `load` 在 UUID 格式非法时抛出 `ValueError`，不存在时抛出 `KeyError`；
-- `save` 采用临时文件替换；
-- `list` 读取全部 JSON 并按更新时间倒序排列。
+- `save` 使用 snapshot revision 做乐观并发检查，旧快照抛出 `ConcurrentSessionUpdate`；
+- snapshot 更新和新 Event、Decision、Artifact metadata、Run、CommandReceipt 在同一 SQLite 事务；
+- `list_events(task_id)` 按 task sequence 返回不可变事件；
+- `list_artifacts(task_id)`、`list_decisions(task_id)`、`list_runs(task_id)` 返回审计元数据；
+- `replay_task_state(task_id)` 根据状态事件重建生命周期，链断裂抛出 `EventStoreCorruption`；
+- `list` 按更新时间倒序返回 snapshot。
 
-JSON 内容是 `AgentSession.model_dump(mode="json")` 的完整结果。
+数据库表为 `tasks`、`events`、`decisions`、`artifacts`、`runs`、`commands`。Event/Decision/Artifact/
+CommandReceipt 插入后不可修改；Run 只允许从 started 转到一个终态，终态记录不可重写。
+
+Artifact 正文由 `TaskArtifactStore` 保存到 `<data_dir>/tasks/<task-id>/artifacts/`。文件名使用 UUID，
+manifest 保存类型、哈希、来源和关联路径；正文经过凭据脱敏、大小限制和原子替换。工作区 observer
+采集 Git status、commit 与 staged/unstaged diff，不读取未跟踪文件正文。
+
+旧 `<data_dir>/sessions/*.json` 会在 SQLiteTaskStore 初始化时幂等导入，并补充可回放的 migration
+事件。`JsonSessionStore` 仍保留用于兼容和测试，但不再是开发应用默认写入目标。异常流程仍使用
+独立 `JsonIncidentStore`。
 
 ## 6. 能力存储接口与文件格式
 
@@ -468,10 +616,17 @@ autocoding-agent --help
 | 命令 | 参数 | 作用 |
 | --- | --- | --- |
 | `start MESSAGE --workspace PATH` | `MESSAGE` 必填；`-w/--workspace` 必填 | 创建并运行新任务 |
-| `send MESSAGE --session-id UUID` | `MESSAGE` 必填；`-s/--session-id` 必填 | 继续现有任务 |
-| `approve --session-id UUID` | `-s/--session-id` 必填 | 批准待处理权限 |
-| `reject --session-id UUID [--reason TEXT]` | session 必填；`-r/--reason` 可选 | 拒绝权限并继续 |
+| `send MESSAGE --session-id UUID [--command-id ID]` | message/session 必填 | 幂等继续现有任务 |
+| `approve --session-id UUID [--command-id ID]` | session 必填 | 幂等批准待处理权限 |
+| `reject --session-id UUID [--reason TEXT] [--command-id ID]` | session 必填 | 拒绝权限并继续 |
 | `show --session-id UUID` | `-s/--session-id` 必填 | 显示最后结果 |
+| `resume --session-id UUID [--action ACTION]` | action 为 read_only_inspect/replan/cancel | 显式恢复暂停或不确定任务 |
+| `pause --session-id UUID` | session 必填 | 在持久化边界暂停 |
+| `cancel --session-id UUID` | session 必填 | 取消且不重放 Runtime |
+| `events --session-id UUID` | session 必填 | 输出事件时间线 JSON |
+| `artifacts --session-id UUID` | session 必填 | 输出 Artifact 元数据 JSON |
+| `runs --session-id UUID` | session 必填 | 输出 Runtime run JSON |
+| `explain PATH --session-id UUID` | path 为工作区相对路径 | 输出修改原因、产物和事件关联 |
 | `sessions` | 无 | 列出最近会话 |
 
 示例：
@@ -480,12 +635,15 @@ autocoding-agent --help
 autocoding-agent start "调查上传失败原因" --workspace D:\repo
 autocoding-agent send "入口是 src/upload.py" --session-id <uuid>
 autocoding-agent approve --session-id <uuid>
+autocoding-agent events --session-id <uuid>
+autocoding-agent explain src/upload.py --session-id <uuid>
+autocoding-agent resume --session-id <uuid> --action read_only_inspect
 autocoding-agent reject --session-id <uuid> --reason "先不要修改"
 autocoding-agent show --session-id <uuid>
 autocoding-agent sessions
 ```
 
-`start/send/approve/reject/show` 的标准输出格式为：
+`start/send/approve/reject/show/resume/pause/cancel` 的标准输出格式为：
 
 ```text
 session: <uuid>
@@ -499,7 +657,8 @@ status: <status>
 [capability: <absolute document path>]
 ```
 
-`sessions` 输出 JSON 数组，每项包含 `session_id`、`status`、`workspace`、`goal`、
+`events/artifacts/runs/explain/sessions` 输出 JSON；session 列表每项包含 `session_id`、`status`、
+`task_state`、`workspace`、`goal`、
 `updated_at`。接口操作抛错时 CLI 向 stderr 输出 `Error: ...` 并以退出码 1 结束。
 
 ## 8. 原生桌面客户端
@@ -524,12 +683,14 @@ autocoding-agent-client
 - 统一系统配置和本地滚动日志目录快捷入口；
 - 新任务、持久化聊天记录及同一 session 的多轮补充；
 - `approval_required` 的完整修改方案、当前/目标状态、影响、验证计划、预览，以及批准或调整；
+- `recovery_required` 的只读检查、重新规划和取消恢复卡，并显示当前 TaskState；
 - evidence、changed files、测试摘要和能力文档路径；
 - `needs_input`、`approval_required`、`completed`、`failed` 状态提示。
 
 应用方法是同步接口，因此客户端用一个后台工作线程执行每一轮，并通过 Tk 的事件队列回到
-主线程渲染。任务建立后会锁定所选项目，忙碌期间会禁用发送、会话切换和重复审批。当前 Runtime 没有取消端口；任务运行
-期间客户端会阻止关闭，而不是显示无法兑现的“停止”操作。Windows 下还会使用当前登录
+主线程渲染。任务建立后会锁定所选项目，忙碌期间会禁用发送、会话切换和重复审批。Runtime
+具备内部进程级 interrupt；界面只在安全持久化边界展示 pause/cancel/recovery 操作，不声称回滚
+已经发生的副作用。Windows 下还会使用当前登录
 会话内的命名互斥量保持单实例，避免两个桌面窗口并发写同一会话存储。
 
 系统配置是一个窗口、三个页签。模型页字段为 Claude Code 路径、API 地址、模型名称和 API
@@ -588,6 +749,8 @@ Web 模式。
 | `AUTO_CODING_DATABASE_MAX_ROWS` | `50` | 两套流程每条查询的主机返回行数上限，范围 1–1000 |
 | `AUTO_CODING_DATABASE_QUERY_TIMEOUT_SECONDS` | `5` | SQL Server/SQLite 单条查询超时，范围 1–60 秒 |
 | `AUTO_CODING_DATABASE_MAX_QUERY_ROUNDS` | `2` | 每个开发或异常会话最多自动查询轮次，范围 1–5 |
+| `AUTO_CODING_AGENT_MAX_REPLAN_ROUNDS` | `2` | 验证失败后的最大重规划轮数，范围 1–10 |
+| `AUTO_CODING_RUNTIME_LEASE_SECONDS` | `30` | 启动恢复扫描使用的本地运行租约秒数，范围 5–3600 |
 
 `ANTHROPIC_BASE_URL`、`ANTHROPIC_AUTH_TOKEN` 等模型服务环境变量不由 `Settings` 解析，
 但会由 Claude Code 子进程继承。桌面配置页把它们保存为 Windows 当前用户环境变量；API Key

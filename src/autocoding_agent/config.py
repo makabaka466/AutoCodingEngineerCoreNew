@@ -45,6 +45,8 @@ class Settings(BaseSettings):
     database_max_rows: int = Field(default=50, ge=1, le=1000)
     database_query_timeout_seconds: int = Field(default=5, ge=1, le=60)
     database_max_query_rounds: int = Field(default=2, ge=1, le=5)
+    agent_max_replan_rounds: int = Field(default=2, ge=1, le=10)
+    runtime_lease_seconds: int = Field(default=30, ge=5, le=3600)
 
     model_config = SettingsConfigDict(
         env_prefix="AUTO_CODING_",

@@ -22,6 +22,8 @@ from autocoding_agent.core.models import (
     ApprovalScope,
     MessageRole,
 )
+from autocoding_agent.core.recovery.models import RecoveryAction
+from autocoding_agent.core.state_machine.models import TaskState
 from autocoding_agent.incident.application import (
     IncidentApplication,
     build_incident_application,
@@ -78,6 +80,7 @@ class FlowKind(StrEnum):
     DEVELOPMENT = "development"
     INCIDENT = "incident"
 
+
 _INSTANCE_MUTEX_NAME = "Local\\AutoCodingEngineerDesktopClient"
 _instance_mutex: int | None = None
 
@@ -98,9 +101,7 @@ def incident_session_list_label(session: IncidentSession, max_length: int = 30) 
     title = " ".join(session.problem.split()) or "未命名异常"
     if len(title) > max_length:
         title = f"{title[: max_length - 1]}…"
-    status = (
-        INCIDENT_STATUS_PRESENTATION[session.status][0] if session.status else "未开始"
-    )
+    status = INCIDENT_STATUS_PRESENTATION[session.status][0] if session.status else "未开始"
     return f"{title}\n{status} · {session.updated_at.astimezone():%m-%d %H:%M}"
 
 
@@ -585,6 +586,13 @@ class DesktopClient:
             active_background=COLORS["accent_hover"],
         )
         self.approve_button.grid(row=0, column=2, padx=4)
+        self.recovery_replan_button = self._button(
+            approval_actions,
+            "重新规划",
+            self._replan_recovery,
+            background="#E8EEF9",
+            active_background="#D8E4F7",
+        )
 
         self.composer_frame = tk.Frame(
             main,
@@ -799,9 +807,7 @@ class DesktopClient:
         self._load_recent_sessions(select_current=bool(self.session_id))
         if self.session_id:
             try:
-                self._render_active_session(
-                    self._active_application().get_session(self.session_id)
-                )
+                self._render_active_session(self._active_application().get_session(self.session_id))
             except Exception as exc:
                 self.session_id = None
                 self.status_var.set(f"读取会话失败：{exc}")
@@ -946,7 +952,12 @@ class DesktopClient:
         elif session.status == AgentStatus.APPROVAL_REQUIRED:
             self.status_var.set("请检查授权范围，再选择批准或拒绝。")
         elif session.status == AgentStatus.FAILED:
-            self.status_var.set("任务执行失败，可以新建任务后重试。")
+            if session.task_state in {TaskState.PAUSED, TaskState.RECOVERY_REQUIRED}:
+                self.status_var.set("任务已安全暂停，请查看恢复报告并选择恢复方式。")
+            elif session.task_state == TaskState.REPLANNING:
+                self.status_var.set("验证未通过，请补充信息或继续只读分析以形成新方案。")
+            else:
+                self.status_var.set("任务执行失败，可以补充信息重试或新建任务。")
         self._sync_controls()
 
     def _render_incident_session(self, session: IncidentSession) -> None:
@@ -1078,9 +1089,7 @@ class DesktopClient:
         elif self.flow == FlowKind.INCIDENT and not self._incident_application_injected:
             self.incident_application = self._build_current_incident_application()
         self.sessions_list.selection_clear(0, "end")
-        self.task_title_var.set(
-            "新开发任务" if self.flow == FlowKind.DEVELOPMENT else "新异常诊断"
-        )
+        self.task_title_var.set("新开发任务" if self.flow == FlowKind.DEVELOPMENT else "新异常诊断")
         self._hide_approval()
         self._refresh_project_options()
         self._render_welcome()
@@ -1102,10 +1111,7 @@ class DesktopClient:
     def _open_system_settings(self, section: str = "model") -> None:
         if self._busy:
             return
-        if (
-            self._settings_dialog is not None
-            and self._settings_dialog.window.winfo_exists()
-        ):
+        if self._settings_dialog is not None and self._settings_dialog.window.winfo_exists():
             selected_tab = {
                 "database": self._settings_dialog.database_tab,
                 "knowledge": self._settings_dialog.knowledge_tab,
@@ -1268,8 +1274,7 @@ class DesktopClient:
                     raise RuntimeError("Incident application is not configured.")
                 current_session = current_application.get_session(session_id)
                 database_reference = (
-                    current_session.database_reference
-                    or self._active_incident_database_reference
+                    current_session.database_reference or self._active_incident_database_reference
                 )
 
                 def operation() -> AgentOutcome | IncidentOutcome:
@@ -1316,6 +1321,42 @@ class DesktopClient:
             "Claude Code 正在按只读范围继续",
         )
 
+    def _resume_recovery(self) -> None:
+        if self.flow != FlowKind.DEVELOPMENT or self._busy or not self.session_id:
+            return
+        session_id = self.session_id
+        self._run_in_background(
+            lambda: self.application.resume(
+                session_id,
+                RecoveryAction.READ_ONLY_INSPECT,
+            ),
+            "Claude Code 正在只读检查恢复现场",
+        )
+
+    def _replan_recovery(self) -> None:
+        if self.flow != FlowKind.DEVELOPMENT or self._busy or not self.session_id:
+            return
+        session_id = self.session_id
+        self._run_in_background(
+            lambda: self.application.resume(session_id, RecoveryAction.REPLAN),
+            "Claude Code 正在重新调查并制定方案",
+        )
+
+    def _cancel_recovery(self) -> None:
+        if self.flow != FlowKind.DEVELOPMENT or self._busy or not self.session_id:
+            return
+        if not messagebox.askyesno(
+            "取消任务",
+            "确认取消此任务？现有工作区内容不会被自动回滚。",
+            parent=self.root,
+        ):
+            return
+        session_id = self.session_id
+        self._run_in_background(
+            lambda: self.application.cancel(session_id),
+            "正在取消任务",
+        )
+
     def _run_in_background(
         self,
         operation: Callable[[], AgentOutcome | IncidentOutcome],
@@ -1338,13 +1379,9 @@ class DesktopClient:
                 self._set_busy(False)
                 if kind == "success":
                     outcome = payload
-                    if self.flow == FlowKind.DEVELOPMENT and not isinstance(
-                        outcome, AgentOutcome
-                    ):
+                    if self.flow == FlowKind.DEVELOPMENT and not isinstance(outcome, AgentOutcome):
                         raise TypeError("Development operation returned an invalid outcome.")
-                    if self.flow == FlowKind.INCIDENT and not isinstance(
-                        outcome, IncidentOutcome
-                    ):
+                    if self.flow == FlowKind.INCIDENT and not isinstance(outcome, IncidentOutcome):
                         raise TypeError("Incident operation returned an invalid outcome.")
                     self.session_id = outcome.session_id
                     self._flow_session_ids[self.flow] = outcome.session_id
@@ -1416,13 +1453,18 @@ class DesktopClient:
         self.new_task_button.configure(state="normal" if can_start_new else "disabled")
         self.workspace_entry.configure(state="normal" if can_choose_workspace else "disabled")
         self.browse_button.configure(state="normal" if can_choose_workspace else "disabled")
-        self.project_combo.configure(
-            state="readonly" if can_choose_workspace else "disabled"
-        )
+        self.project_combo.configure(state="readonly" if can_choose_workspace else "disabled")
+        recovery_state = False
+        if self.flow == FlowKind.DEVELOPMENT and self.session_id:
+            try:
+                recovery_state = self.application.get_session(self.session_id).task_state in {
+                    TaskState.PAUSED,
+                    TaskState.RECOVERY_REQUIRED,
+                }
+            except Exception:
+                recovery_state = False
         incident_input_state = (
-            "normal"
-            if can_choose_workspace and self.flow == FlowKind.INCIDENT
-            else "disabled"
+            "normal" if can_choose_workspace and self.flow == FlowKind.INCIDENT else "disabled"
         )
         self.page_hint_entry.configure(state=incident_input_state)
         self.prompt_input.configure(state="normal" if can_send else "disabled")
@@ -1431,6 +1473,12 @@ class DesktopClient:
             state="normal" if can_decide and self._approval_can_execute else "disabled"
         )
         self.reject_button.configure(state="normal" if can_decide else "disabled")
+        if recovery_state and not self._busy:
+            self.reject_button.configure(state="normal")
+            self.approve_button.configure(state="normal")
+            self.recovery_replan_button.configure(state="normal")
+        else:
+            self.recovery_replan_button.configure(state="disabled")
         self.sessions_list.configure(state="normal" if not self._busy else "disabled")
         self.model_config_button.configure(state="normal" if not self._busy else "disabled")
         self.development_flow_button.set_enabled(not self._busy)
@@ -1440,9 +1488,47 @@ class DesktopClient:
 
     def _show_approval(self, session: AgentSession) -> None:
         approval = session.pending_approval
+        if approval is None and session.task_state in {
+            TaskState.PAUSED,
+            TaskState.RECOVERY_REQUIRED,
+        }:
+            recovery = next(
+                (
+                    artifact
+                    for artifact in reversed(session.artifacts)
+                    if artifact.type.value == "recovery_report"
+                ),
+                None,
+            )
+            self._approval_can_execute = True
+            self.approval_title.configure(text="恢复任务 · 不会自动重放写操作")
+            self.approval_text.configure(state="normal")
+            self.approval_text.delete("1.0", "end")
+            self.approval_text.insert(
+                "1.0",
+                "检测到中断任务。请选择：只读检查当前现场、放弃旧方案后重新规划，"
+                "或取消任务。\n\n"
+                + (
+                    f"恢复报告：{recovery.relative_path}"
+                    if recovery is not None
+                    else "恢复报告未能生成，请先选择只读检查。"
+                ),
+            )
+            self.approval_text.configure(state="disabled")
+            self.reject_button.configure(text="取消任务", command=self._cancel_recovery)
+            self.approve_button.configure(text="只读检查", command=self._resume_recovery)
+            self.recovery_replan_button.configure(command=self._replan_recovery)
+            self.recovery_replan_button.grid(row=0, column=2, padx=4)
+            self.approve_button.grid_configure(column=3)
+            self.approval_frame.grid(row=2, column=0, sticky="ew", padx=34, pady=(8, 0))
+            return
         if approval is None:
             self._hide_approval()
             return
+        self.reject_button.configure(text="拒绝或调整", command=self._reject)
+        self.approve_button.configure(command=self._approve)
+        self.approve_button.grid_configure(column=2)
+        self.recovery_replan_button.grid_remove()
         is_modify = approval.scope == ApprovalScope.MODIFY
         self._approval_can_execute = not (is_modify and approval.proposal is None)
         self.approval_title.configure(
@@ -1472,6 +1558,8 @@ class DesktopClient:
 
     def _hide_approval(self) -> None:
         self._approval_can_execute = True
+        self.recovery_replan_button.grid_remove()
+        self.approve_button.grid_configure(column=2)
         self.approval_frame.grid_remove()
 
     def _on_return(self, event: tk.Event[tk.Text]) -> str | None:

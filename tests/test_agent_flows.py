@@ -26,6 +26,7 @@ from autocoding_agent.core.models import (
     RuntimeResult,
     RuntimeTurn,
 )
+from autocoding_agent.core.state_machine.models import TaskState
 from autocoding_agent.database_models import DataQuery, QueryResult
 
 
@@ -166,6 +167,20 @@ def test_multi_turn_clarification_preserves_full_history(tmp_path: Path) -> None
     assert event_types.count(EventType.INPUT_REQUIRED) == 2
     assert event_types.count(EventType.TASK_COMPLETED) == 1
     assert event_types.count(EventType.CAPABILITY_SAVED) == 1
+    assert final.task_state == TaskState.COMPLETED
+    state_transitions = [
+        (event.data["from"], event.data["to"])
+        for event in final.events
+        if event.type == EventType.STATE_TRANSITIONED
+    ]
+    assert state_transitions == [
+        ("created", "inspecting"),
+        ("inspecting", "waiting_input"),
+        ("waiting_input", "inspecting"),
+        ("inspecting", "waiting_input"),
+        ("waiting_input", "inspecting"),
+        ("inspecting", "completed"),
+    ]
     assert app.get_session(first.session_id).project == "生物"
     assert "selected the knowledge project '生物'" in runtime.turns[0].system_prompt
 
@@ -200,6 +215,7 @@ def test_development_flow_can_use_shared_read_only_database(tmp_path: Path) -> N
     outcome = app.start(workspace, "Investigate order 42 in src/orders.py")
 
     assert outcome.status == AgentStatus.COMPLETED
+    assert outcome.task_state == TaskState.COMPLETED
     assert database.queries == [query]
     assert outcome.query_observations[0].returned_rows == 1
     assert len(runtime.turns) == 2
@@ -207,8 +223,11 @@ def test_development_flow_can_use_shared_read_only_database(tmp_path: Path) -> N
     assert '"status": "stuck"' in runtime.turns[1].user_message
     session = app.get_session(outcome.session_id)
     assert session.database_reference == reference
-    session_file = state / "sessions" / f"{outcome.session_id}.json"
-    assert '"status": "stuck"' not in session_file.read_text(encoding="utf-8")
+    assert '"status":"stuck"' not in session.model_dump_json()
+    assert (state / "runtime" / "agent-runtime.db").is_file()
+    assert [
+        event.data["to"] for event in outcome.events if event.type == EventType.STATE_TRANSITIONED
+    ] == ["inspecting", "querying_data", "inspecting", "completed"]
     assert outcome.capability_document is not None
     assert Path(outcome.capability_document).parent.parent.name == "development"
 
@@ -236,7 +255,13 @@ def test_approval_resumes_in_exact_authorized_mode(
     completed = app.approve(pending.session_id)
 
     assert pending.status == AgentStatus.APPROVAL_REQUIRED
+    assert pending.task_state == (
+        TaskState.WAITING_MODIFY_APPROVAL
+        if scope == ApprovalScope.MODIFY
+        else TaskState.WAITING_VERIFY_APPROVAL
+    )
     assert completed.status == AgentStatus.COMPLETED
+    assert completed.task_state == TaskState.COMPLETED
     assert [turn.mode for turn in runtime.turns] == [AgentMode.INSPECT, expected_mode]
     assert required_tool in runtime.turns[1].tools
     assert runtime.turns[0].capability_dir is not None
@@ -410,6 +435,23 @@ def test_session_can_resume_after_application_restart(tmp_path: Path) -> None:
         "Provide the failing endpoint.",
     ]
     assert restarted_app.get_session(first.session_id).status == AgentStatus.COMPLETED
+    assert restarted_app.get_session(first.session_id).task_state == TaskState.COMPLETED
+
+
+def test_duplicate_approval_command_id_does_not_repeat_runtime(tmp_path: Path) -> None:
+    workspace = tmp_path / "repo-idempotent"
+    workspace.mkdir()
+    runtime = ScriptedRuntime(_approval(ApprovalScope.MODIFY), _completed(changed=True))
+    app = _app(tmp_path / "state-idempotent", runtime)
+    pending = app.start(workspace, "Fix the upload consistency bug.")
+
+    first = app.approve(pending.session_id, command_id="approve-command-1")
+    duplicate = app.approve(pending.session_id, command_id="approve-command-1")
+    session = app.get_session(pending.session_id)
+
+    assert first.status == duplicate.status == AgentStatus.COMPLETED
+    assert len(runtime.turns) == 2
+    assert [item.command_id for item in session.command_receipts].count("approve-command-1") == 1
 
 
 def test_first_turn_failure_preserves_preallocated_runtime_session(tmp_path: Path) -> None:

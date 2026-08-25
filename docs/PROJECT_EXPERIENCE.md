@@ -1,0 +1,1370 @@
+# AutoCodingEngineerCoreNew 项目开发与工程经验
+
+> 文档基线：2026-08-25，项目版本 `0.4.0`。本文以当前代码为准，并明确区分“已实现”、
+> “当前限制”和“后续规划”。本版本完成任务卡 `ACE-RUNTIME-001`：开发 Agent 已升级为由
+> 状态机、追加事件、运行记录、决策审计、任务产物和保守恢复共同驱动的可恢复 Runtime。
+
+## 1. 文档目的
+
+本文不是简单的 README，也不是逐个接口的参考手册。它用于沉淀 AutoCodingEngineerCoreNew
+从需求形成、架构重构到当前实现过程中的完整工程经验，重点回答：
+
+- 为什么要做这个项目，它解决什么问题；
+- 产品真正的业务对象是什么，而不是什么；
+- 为什么采用当前架构和安全边界；
+- 两套 Agent 流程如何运转；
+- Claude Code、模型、数据库、会话、能力文档和 UI 如何组合；
+- 开发过程中遇到过哪些真实问题，如何定位和解决；
+- 哪些方案经过权衡后被采用，哪些方案被暂缓或放弃；
+- 当前系统还有哪些限制，下一阶段应如何建设工程经验知识体系。
+
+本文面向后续维护者、架构设计者和继续开发本项目的 Agent。具体字段和 API 应同时参考
+`docs/INTERFACES.md`，当前架构细节应同时参考 `docs/ARCHITECTURE.md`。
+
+---
+
+## 2. 项目背景与演进
+
+### 2.1 初始问题
+
+项目最初希望提供一个能够帮助用户完成代码开发的工具。早期思路容易落入“平台化”方向：
+自己建设需求分析、任务拆分、文件扫描、规则判断、执行调度和页面交互。实践后发现，过多的
+宿主规则会产生三个问题：
+
+1. 宿主用文件名、关键词或固定步骤替代模型理解，限制了 Claude Code 的代码调查能力；
+2. 为了获得上下文而扫描整个项目，消耗大量时间与 Token，且经常读取无关代码；
+3. 平台层逐渐变成主要复杂度，而真正有价值的 Agent 工程能力反而被规则包围。
+
+因此项目进行了方向调整：平台只作为交互媒介，真正产品是一个平台无关的 Agent 内核。
+模型负责理解和语义决策，Python 宿主只负责不能交给模型自行决定的硬边界。
+
+### 2.2 核心定位变化
+
+项目经历了以下认知变化：
+
+```text
+早期：开发平台 + 大量固定流程 + 全项目分析
+  ↓
+中期：把用户问题交给 Claude Code，但仍由宿主判断部分需求规则
+  ↓
+当前：模型负责需求理解、文件选择、调查、诊断和方案；宿主负责权限、状态、数据和持久化
+```
+
+当前产品定位是：
+
+> 一个以 Claude Code 为执行运行时、以模型语义能力为核心、由宿主提供确定性安全边界的
+> 平台无关工程 Agent 内核。
+
+桌面客户端、CLI、备用 Web UI，以及未来的钉钉机器人，都只是这个内核的输入输出适配器。
+
+### 2.3 当前业务场景
+
+系统当前服务两类业务：
+
+1. **软件开发**：理解需求、调查代码、提出修改方案、等待授权、实施修改、执行验证并沉淀能力；
+2. **异常处理**：根据问题和页面线索定位代码，按需查询 SQL Server 业务数据，输出诊断证据和
+   建议，但不修改代码、不写数据库、不自动处理生产异常。
+
+指纹 MES 是当前已配置的一个知识项目，也是两套流程的重要验证场景，但它不是
+AutoCodingEngineerCoreNew 的硬编码业务。MES 的目录结构、页面定位 SQL 和开发约束保存在
+项目知识 Markdown 中，由用户在对话页选择“项目”后按需注入。
+
+### 2.4 当前阶段
+
+当前版本已经具备：
+
+- 原生桌面客户端及双击启动；
+- 开发与异常诊断两套独立流程；
+- Claude Code 与 Anthropic 兼容模型接入；
+- 模型配置、Claude Code 检测和 API Key 配置页面；
+- 两套流程共用的 SQL Server 只读连接；
+- 项目知识二级分支和 Markdown 编辑；
+- 多轮会话、精确恢复、修改与验证审批；
+- 独立 TaskState、命令 envelope、集中转换规则和带原因的状态转换事件；
+- SQLite 原子 Task/Event Store、命令幂等、Runtime 活动时间线与运行租约；
+- 真实工作区基线/差异 Artifact、Decision Record 和修改原因查询；
+- 暂停、取消、启动扫描、保守恢复与有上限的验证失败重规划；
+- 结构化模型输出和宿主二次校验；
+- 开发、异常各自独立的 Capability 文档；
+- 本地脱敏日志、确定性测试和版本回退规则。
+
+尚未实现语义 RAG、跨工作区工程经验共享、自动异常修复、钉钉接入、流式 Token 展示和
+多 Agent 编排。开发 Runtime 已支持进程级 interrupt，但还没有 Windows Job Object 级进程树治理。
+
+---
+
+## 3. 业务理解
+
+### 3.1 用户真正需要的不是“自动写代码”
+
+用户在真实工程环境中需要的是一条可信的闭环：
+
+```text
+说清问题
+  → 找到正确位置
+  → 阅读必要代码和数据
+  → 解释当前状态
+  → 给出可审查方案
+  → 获得授权
+  → 实施最小完整修改
+  → 验证结果
+  → 保存可复用经验
+```
+
+代码生成只是中间步骤。定位是否准确、方案是否可理解、权限是否受控、结果是否经过验证，
+决定了 Agent 能否进入真实项目。
+
+### 3.2 需求澄清原则
+
+需求是否清楚属于语义判断，不适合由宿主通过“是否包含文件名”“是否包含路径”等规则判定。
+当前做法是：
+
+- 模型判断现有信息是否足够；
+- 不足时每轮只询问一个最关键、信息价值最高的问题；
+- 用户给出文件名、路径、页面或业务线索后，模型读取对应目标并追踪必要关联代码；
+- 找不到目标、结果不唯一或仍缺关键上下文时继续澄清；
+- 不通过全仓扫描弥补缺失意图。
+
+这使 Agent 保留理解灵活性，同时控制 Token 和调查范围。
+
+### 3.3 开发流程业务规则
+
+开发流程的业务状态如下：
+
+```text
+用户需求
+  ↓
+Inspect：模型只读调查
+  ├─ 信息不足 → needs_input → 用户回答 → 恢复同一会话
+  ├─ 需要业务数据 → query_required → 宿主执行只读 SQL → 恢复同一会话
+  ├─ 只需结论 → completed
+  └─ 需要修改 → approval_required(modify + 结构化方案)
+                         ↓ 用户批准
+                    Implement：允许 Edit/Write
+                         ├─ 不需命令 → completed
+                         └─ 需要验证 → approval_required(verify)
+                                               ↓ 用户批准
+                                          Verify：仅允许受控命令
+                                               ↓
+                                           completed
+```
+
+修改前必须呈现：
+
+- 当前是什么；
+- 要改成什么；
+- 涉及哪些文件或区域；
+- 预期结果；
+- 影响和验证方法；
+- 合适时提供界面线框、伪代码、接口示例或行为前后对比。
+
+普通对话回复在存在审批时会被视为“调整要求”，并清除旧审批，防止用户修改需求后仍执行旧方案。
+
+### 3.4 异常诊断业务规则
+
+异常流程的目标不是立即修复，而是形成可靠诊断：
+
+```text
+问题描述 + 页面线索
+  ↓
+定位页面、路由、窗体或模块
+  ↓
+追踪最小代码链路
+  ↓
+按需提出最小只读 SQL
+  ↓
+宿主校验、执行、限行、脱敏
+  ↓
+模型结合代码和数据给出诊断、证据、置信度和建议
+```
+
+当前异常流程明确禁止：
+
+- 修改目标仓库；
+- 执行 Shell 命令；
+- 写数据库；
+- 调用真实外部修复接口；
+- 在证据不足时声称已找到唯一根因；
+- 把“适合自动化”解释为“现在已经可以自动执行”。
+
+这种边界为后续钉钉接入保留了安全前提：钉钉可以创建、继续和展示异常任务，但不会因为入口
+自动化而绕过诊断边界。
+
+### 3.5 项目知识的业务含义
+
+界面中的“开发”和“异常处理”是一级流程；每个流程下面可以有多个二级项目。一个项目对应
+一份同名 Markdown：
+
+```text
+knowledge/
+├─ development/<项目>/<项目>.md
+└─ incident/<项目>/<项目>.md
+```
+
+项目知识保存稳定、跨页面的当前项目事实，例如技术栈、目录结构、常用调用链、页面定位方式和
+开发约束。单次任务状态、临时异常数据和某个页面的短期结论不应持续追加到项目知识中。
+
+当前“生物”项目中，页面名称可以通过参数化只读 SQL 查询 `Menu` 表，使用返回的 `URL` 作为
+相对代码位置线索。该规则属于用户选择的项目知识，不是宿主代码中的通用硬规则。
+
+### 3.6 五类知识的边界
+
+| 类型 | 作用 | 当前存储 |
+| --- | --- | --- |
+| Skills | Agent 应该怎样工作 | `src/autocoding_agent/skills/` |
+| Project Knowledge | 当前项目是什么、有哪些稳定约束 | `knowledge/<flow>/<project>/` |
+| Session Memory | 当前任务进度、消息、审批和查询审计 | `~/.autocoding-agent/sessions`、`incidents` |
+| Capability | 某工作区已完成任务产生的可复用能力 | `~/.autocoding-agent/workspaces/...` |
+| Engineering Experience | 跨项目设计经验、问题解决经验和失败教训 | 尚未实现，下一阶段建设 |
+
+---
+
+## 4. 总体设计思路
+
+### 4.1 模型负责语义，宿主负责边界
+
+这是项目最重要的设计原则。
+
+交给模型的内容：
+
+- 理解用户意图；
+- 判断是否需要追问；
+- 选择需要读取的文件；
+- 判断代码关系；
+- 定位页面和调用链；
+- 提出数据库查询计划；
+- 诊断根因；
+- 制定修改与验证方案；
+- 判断任务何时可以如实完成；
+- 总结能力草稿。
+
+由宿主控制的内容：
+
+- 工作区是否存在；
+- 当前模式能看到哪些工具；
+- 是否已经获得修改或验证授权；
+- SQL 是否只读、参数是否绑定、结果是否限行和脱敏；
+- 模型输出是否符合结构化契约；
+- 路径是否越界；
+- 会话、日志、配置和能力文档如何持久化；
+- 密钥保存位置；
+- 失败是否可追踪。
+
+宿主不判断“哪个文件语义上相关”，但必须判断“这个路径是否越过安全边界”。两类判断不能混淆。
+
+### 4.2 不重写 Claude Code Agent Loop
+
+项目选择复用 Claude Code 的代码搜索、文件读取、编辑和命令执行能力，而不是自行重写工具调用
+循环。Python Runtime 负责构造安全参数、传入系统提示词和 JSON Schema，再解析最终结构化结果。
+
+这样做的收益：
+
+- 保留 Claude Code 成熟的代码调查能力；
+- 避免维护自定义工具协议和复杂 Agent Loop；
+- 可以使用 Claude Code 的精确 session resume；
+- 模型可以自然选择 Read、Glob、Grep、Edit、Write、Bash。
+
+代价是仍需维护 CLI 协议兼容。当前 Runtime 通过 `stream-json` 观察 Claude Code 生命周期和工具
+活动，并提供进程级 interrupt；它不展示流式 Token，也不把模型自报当作宿主事实。
+
+### 4.3 应用内核与交付平台分离
+
+`AgentApplication` 和 `IncidentApplication` 是稳定应用门面。桌面 UI、CLI 和 Streamlit 只调用
+门面，不直接组装 Claude 命令或实现业务状态机。
+
+因此未来增加钉钉入口时，应调用 `IncidentApplication`，而不是复制异常诊断 Prompt 和数据库
+逻辑。这是“平台只是媒介”的代码体现。
+
+### 4.4 结构化决定代替文本猜测
+
+模型最终输出通过 Pydantic 生成 JSON Schema。宿主只接受符合 `AgentDecision` 或
+`IncidentDecision` 的 `structured_output`，不再从自由文本中截取首尾花括号。
+
+结构化契约使状态机能够确定地判断：
+
+- 是否需要用户输入；
+- 是否需要数据库查询；
+- 是否需要修改或验证审批；
+- 哪些文件被报告为已修改；
+- 是否完成；
+- 能力草稿包含什么。
+
+模型负责内容质量，Schema 负责数据形状，宿主策略负责安全一致性。
+
+### 4.5 历史知识只能作为证据线索
+
+Project Knowledge 和 Capability 都被提示为“不可信且可能过期的参考材料”。它们不能覆盖：
+
+1. 当前用户要求；
+2. 当前仓库代码；
+3. 当前数据库 schema 和授权查询结果；
+4. 宿主权限策略。
+
+这是未来接入 Engineering Experience/RAG 时必须继续保留的原则。
+
+---
+
+## 5. 系统架构
+
+### 5.1 总体结构
+
+```text
+桌面客户端 / CLI / Streamlit / 未来钉钉
+                    ↓
+       Application Facade 应用门面
+          ├─ AgentApplication
+          └─ IncidentApplication
+                    ↓
+              Domain Engine
+          ├─ AgentEngine
+          └─ IncidentEngine
+                    ↓
+       Ports：Runtime / Store / Database
+                    ↓
+Adapters：Claude Code / SQLite / Artifact / Capability / SQL Server
+                    ↓
+Claude Code + 模型 / 本地文件 / Windows Credential Manager / SQL Server
+```
+
+### 5.2 分层职责
+
+| 层 | 主要目录 | 职责 |
+| --- | --- | --- |
+| Interfaces | `interfaces/` | 桌面、CLI、Web 的输入输出转换 |
+| Application | `application.py`、`incident/application.py` | 依赖组装和稳定业务入口 |
+| Domain/Core | `core/`、`incident/` | 状态机、契约、审批和业务流程 |
+| Ports | `ports/`、`incident/ports.py` | Runtime、会话和数据库最小协议 |
+| Adapters | `adapters/` | Claude Code、JSON、能力、SQL Server、SQLite |
+| Skills | `skills/` | 显式注入模型的工作方法 |
+| Knowledge | `knowledge/` | 用户维护的分流程项目知识 |
+
+### 5.3 组合根
+
+`build_application()` 组装开发流程：
+
+```text
+ClaudeCodeRuntime
+SQLiteTaskStore
+TaskArtifactStore + GitWorkspaceObserver
+CapabilityStore(development)
+SkillRegistry
+ExecutionPolicy
+AgentStateMachine + RecoveryManager
+可选 DatabaseReader
+        ↓
+AgentEngine
+        ↓
+AgentApplication
+```
+
+`build_incident_application()` 组装异常流程：
+
+```text
+ClaudeCodeRuntime
+JsonIncidentStore
+IncidentCapabilityStore
+可选 SQLServer/SQLite DatabaseReader
+        ↓
+IncidentEngine
+        ↓
+IncidentApplication
+```
+
+两套流程共享 Runtime 和数据库端口，但拥有不同状态、Prompt、会话目录和能力目录。
+
+---
+
+## 6. 核心技术实现
+
+### 6.1 Pydantic 数据契约
+
+项目使用 Pydantic 2 定义稳定契约，主要包括：
+
+- `AgentSession`：开发任务的完整持久化状态；
+- `AgentDecision`：开发模型每轮唯一合法输出；
+- `ChangeProposal`：修改前的结构化方案；
+- `IncidentSession`：异常任务状态；
+- `IncidentDecision`：页面、查询、诊断和建议；
+- `DataQuery`：两套流程共用的最小只读查询计划；
+- `QueryResult`：本轮返回模型的脱敏结果；
+- `QueryObservation`：可以长期保存但不含原始业务行的审计摘要。
+
+模型校验器保证状态与载荷一致。例如：
+
+- `approval_required` 必须携带审批对象；
+- 非审批状态不能夹带审批；
+- `query_required` 必须包含查询；
+- 异常诊断完成时必须包含已定位页面和诊断结论；
+- 新的 modify 审批必须在 Engine 层额外验证完整方案。
+
+### 6.2 任务生命周期 StateMachine
+
+状态机升级后，开发流程不再把一个 `status` 同时用作模型结果、权限和任务生命周期。系统明确
+分成三层：
+
+| 层 | 职责 |
+| --- | --- |
+| `TaskState` | 当前任务处于 inspecting、waiting、implementing、verifying 或终态 |
+| `AgentStatus` | 模型本轮返回 needs_input、query_required、approval_required、completed、failed |
+| `AgentMode` | Claude Code 本轮获得 INSPECT、IMPLEMENT 或 VERIFY 工具权限 |
+
+`core/state_machine/` 定义：
+
+- `TaskState`：14 个当前及预留生命周期状态；
+- `AgentCommand`/`AgentCommandType`：命令 ID、task ID、expected version、actor 和 payload；
+- `TransitionRule`：每个来源状态允许进入的目标集合；
+- `FailureClass`：为后续恢复策略预留的失败类别；
+- `AgentStateMachine`：校验转换、拒绝旧版本、增加 task version 并生成转换事件。
+
+AgentEngine 的 start、send、approve、reject 都先构造命令。业务代码不直接写
+`session.task_state`；真正转换统一经过 StateMachine，并记录 from、to、reason、actor、version 和
+command ID。转换到相同状态是幂等 no-op，非法转换和 stale expected version 会被明确拒绝。
+
+为了兼容已经保存的 session，缺少 TaskState 的旧 JSON 会根据 `AgentStatus` 和 pending approval
+推导状态，version 从 0 开始。当前 `AgentStatus` 字段仍由 Engine 保存，因为它表示最后模型决定，
+不是生命周期状态。
+
+Phase 2 已将开发任务切换到 SQLiteTaskStore：Task snapshot 和新 Event 在同一事务提交，事件按
+task 获得连续 sequence，snapshot 使用 revision 拒绝并发旧保存，已追加事件不能修改，并支持
+按状态事件回放生命周期。旧 JsonSessionStore 文件会在启动时幂等导入，并为缺少生命周期事件
+的历史任务生成 migration 事件。`replanning`、`paused`、`recovery_required`、`cancelled` 均已
+进入公共操作；重复 command ID 由持久化 receipt 返回已有结果，不会再次调用 Runtime。
+
+### 6.3 Claude Code Runtime
+
+开发流程的可观测 Runtime 使用 `subprocess.Popen()` 调用真实 `claude.exe`，逐行读取
+`stream-json`；异常流程和兼容调用仍可使用最终 JSON 路径。主要参数包括：
+
+```text
+-p
+--bare
+--no-chrome
+--strict-mcp-config
+--mcp-config {"mcpServers":{}}
+--setting-sources ""
+--output-format stream-json
+--include-hook-events
+--model <configured model>
+--permission-mode dontAsk
+--tools <mode-specific tools>
+--allowedTools <host-approved tools>
+--append-system-prompt <skills + boundaries>
+--json-schema <Pydantic schema>
+--session-id <new id> 或 --resume <exact runtime id>
+```
+
+关键设计：
+
+- `--bare`、空 setting sources 和严格空 MCP 隔离目标仓库及用户全局设置，防止其扩展权限；
+- `--no-chrome` 避免加载浏览器集成；
+- Runtime 逐行解析 system、assistant、ToolUse、ToolResult 和 result envelope；
+- `structured_output` 再经过一次 Pydantic 校验；
+- 必须获得可恢复的 Claude session ID，否则本轮视为失败；
+- Runtime 记录 Token、成本、耗时和 turn 数；
+- 每个 run 持久化 owner、PID、heartbeat、终态原因和脱敏活动；
+- `interrupt(run_id)` 只终止已登记的本地进程，留下 interrupted 或 recovery_required 事实；
+- Provider 错误和 stderr 在显示及日志前脱敏。
+
+### 6.4 精确会话恢复
+
+应用 session ID 与 Claude session ID 分开建模，但首轮会使用应用 UUID 预分配 Claude session。
+首次启动前先把该 ID 写入应用会话，随后才调用模型。
+
+这样即使首轮超时或模型进程异常，也不会因为应用不知道旧 ID 而静默创建新会话、重复执行一轮
+可能已经发生副作用的任务。后续轮次始终使用精确 `--resume <runtime_session_id>`，不使用按目录
+推断的 continue，防止同一工作区多个任务串线。
+
+### 6.5 权限档位
+
+| 模式 | 可见工具 | 自动允许范围 |
+| --- | --- | --- |
+| Inspect | Read、Glob、Grep | 全部只读工具 |
+| Implement | Read、Glob、Grep、Edit、Write | 已批准任务中的文件读写 |
+| Verify | Read、Glob、Grep、Bash | 仅预定义测试、构建、静态检查和 Git 只读命令 |
+
+Verify 白名单包括 pytest、ruff、npm test/lint/typecheck、dotnet build/test、go test、cargo test、
+git status 和 git diff。当前没有把任意 Bash 暴露给模型。
+
+Capability 目录位于目标工作区之外。它只在 Inspect 模式通过 `--add-dir` 挂载；Implement 和
+Verify 不再挂载，防止已经获得仓库写权限的模型修改长期能力记忆。
+
+### 6.6 修改方案与审批
+
+修改审批要求 `ChangeProposal` 至少包含一项变更，每项说明：
+
+- `path` 或影响区域；
+- 当前状态；
+- 修改后的状态；
+- 总体目标和预期结果；
+- 可选影响、验证计划和 Markdown 预览。
+
+用户批准后，Engine 会把已审查方案重新写入继续指令，要求模型只执行该范围。历史会话中缺少
+proposal 的旧审批仍可以加载，但不能直接批准执行，必须让模型重新调查和生成方案。
+
+### 6.7 宿主二次校验
+
+Schema 合法不代表行为合法。Engine 还会检查：
+
+- Inspect 模式不能报告 `changed_files`；
+- Implement/Verify 期间不能请求数据库查询；
+- modify 审批不能缺少方案；
+- 证据路径、方案路径和变更路径不能是绝对路径；
+- Windows drive/root、Unix root 和 `..` 路径均被拒绝。
+
+这些检查用于守住边界。Implement 前后还会由宿主采集 Git status 和 staged/unstaged diff，分别
+形成 baseline 与 current Artifact；只有真实哈希发生变化才记录 `code_modified`。模型自报的
+`changed_files`、`test_summary` 和宿主观察事实分开保存，不能互相冒充。非 Git 工作区会明确
+记录“无法生成真实 patch”，不会伪造差异。
+
+### 6.8 SQL Server 只读访问
+
+两套流程共用 `DatabaseReader` 端口和一份 SQL Server 配置。模型不直接获得数据库连接，而是
+返回 `DataQuery`，由宿主执行。
+
+当前防线包括：
+
+1. 只接受以 `SELECT` 或 `WITH` 开头的语句；
+2. 拒绝分号、多语句、SQL 注释和空字节；
+3. 去除字符串和引号标识符后，再拦截 INSERT、UPDATE、DELETE、MERGE、EXEC、DDL、
+   BACKUP、DBCC、WAITFOR、KILL 等关键词；
+4. 命名参数由宿主转换为 `?` 参数并单独绑定，不拼接用户输入；
+5. 连接串使用 `ApplicationIntent=ReadOnly`；
+6. 单条结果受行数限制，超长值截断，二进制只返回长度；
+7. password、token、secret、credential、cookie、session 等敏感列整列脱敏；
+8. 默认最多两轮查询、每条最多 50 行、查询超时 5 秒；
+9. 原始业务行只发给当前模型轮次，不写入应用会话和能力文档；
+10. 会话绑定启动时的安全数据库引用，配置变更只影响新任务。
+
+`ApplicationIntent=ReadOnly` 和 SQL 文本校验不能替代数据库权限。生产环境仍应使用只有 SELECT
+权限的专用账号，形成数据库侧最终边界。
+
+### 6.9 SQL Server 配置与秘密管理
+
+非秘密配置写入：
+
+```text
+~/.autocoding-agent/database/sqlserver.json
+```
+
+SQL Server 密码通过 `keyring` 保存到 Windows Credential Manager，不进入 JSON。保存新配置时
+先记录旧密码；若配置文件原子替换失败，会尽力恢复旧凭据，避免出现“密码已换但配置未换”的
+半成功状态。
+
+配置字段拒绝分号、花括号、空字节和换行，避免把单个 UI 字段注入为额外连接串属性。驱动列表
+从 `pyodbc.drivers()` 动态读取，并优先显示版本较新的 Microsoft ODBC Driver。
+
+### 6.10 模型与 Claude Code 配置
+
+客户端启动时通过真实可执行文件的 `--version` 检查 Claude Code。Windows 下不依赖可能受
+PowerShell 执行策略影响的 `claude.ps1`，优先使用真实 `.exe`/`.com`。
+
+配置页面维护：
+
+- Claude Code 可执行文件；
+- Anthropic 兼容 API 地址；
+- 模型名称；
+- API Key。
+
+非密钥信息和 API Key 当前保存到 Windows 当前用户环境变量，API Key 不回填到输入框，也不
+写入项目 `.env`、会话或日志。保存后清除 Settings 缓存，使新任务使用最新配置。
+
+### 6.11 桌面客户端
+
+桌面端选择标准库 Tkinter/ttk，而不是把 Streamlit 嵌入 WebView。主要原因：
+
+- 当前 Python 已包含 Tk 8.6，不增加大型 GUI 依赖；
+- 无需启动本地 HTTP 服务；
+- 不依赖 WebView2；
+- 避免服务进程和窗口双重生命周期；
+- 更容易通过 `pythonw.exe` 实现双击无控制台启动。
+
+Claude Runtime 对应用门面仍表现为同步调用。为避免界面冻结，桌面端使用单一后台线程执行
+start/send/approve/reject/resume，通过结果队列和 `root.after()` 回到 Tk 主线程更新控件。忙碌时
+禁用会触发新轮次的按钮，防止同一 session 并发 resume。
+
+UI 提供：
+
+- 开发/异常处理胶囊式流程选择，当前项以颜色标识；
+- 工作区输入与选择；
+- “项目”知识分支选择及相对 MD 路径；
+- 页面线索输入；
+- 会话列表；
+- 方案预览和批准/拒绝；
+- RecoveryRequired 的只读检查、重新规划和取消恢复卡；
+- 模型、SQL Server、MD 知识统一配置；
+- 本地日志入口。
+
+### 6.12 Windows 子进程与隐藏窗口
+
+Claude Code 检测和每轮问答都使用 `STARTF_USESHOWWINDOW + SW_HIDE + CREATE_NO_WINDOW`，避免
+每次调用弹出控制台。根目录 `start.cmd` 调用 `start.ps1`，脚本检查 Python 3.12、依赖和
+Tkinter 后，默认使用 `pythonw.exe` 启动原生客户端并退出启动控制台。
+
+备用 Web UI 通过 `start.cmd -Web` 显式启动，不再作为默认入口。
+
+### 6.13 会话持久化
+
+开发任务使用 SQLite 事务存储，异常会话暂时继续使用原子 JSON：
+
+```text
+~/.autocoding-agent/
+├─ runtime/agent-runtime.db
+├─ sessions/<uuid>.json      # 旧开发会话导入来源
+└─ incidents/<uuid>.json
+```
+
+开发 Task/Event 表和异常文件都只接受 UUID。SQLite 使用 WAL、foreign key、busy timeout 和
+`BEGIN IMMEDIATE`，在一个事务中追加事件并更新快照；内存 event sequence 或 revision 在事务
+失败时恢复。异常 JSON 继续使用同目录临时文件加 replace。
+
+SQLiteTaskStore 已通过 snapshot revision 拒绝并发旧更新；桌面端仍通过忙碌状态规避本窗口内
+并发。每个 Runtime run 保存 owner ID、进程 PID 和 heartbeat。应用启动时扫描没有可靠终局的
+运行：只读 Inspect 可安全转为 paused；Implement/Verify 一律转入 recovery_required，不自动
+重放任何可能产生副作用的命令。
+
+### 6.14 Capability 与 Project Knowledge
+
+已完成的开发任务生成开发 Capability，已完成的异常任务生成异常 Capability。两者按工作区和
+流程隔离：
+
+```text
+~/.autocoding-agent/workspaces/<workspace-id>/
+├─ development/
+│  ├─ CAPABILITIES.md
+│  ├─ pinned/
+│  ├─ tasks/
+│  └─ capabilities/
+└─ incident/
+   ├─ CAPABILITIES.md
+   ├─ pinned/
+   ├─ tasks/
+   └─ capabilities/
+```
+
+`workspace-id` 由规范化工作区绝对路径计算 SHA-256 前 16 位。能力文件写入前会脱敏工作区路径、
+用户主目录和常见密钥形式。任务 JSON 用于幂等判断和重建 `CAPABILITIES.md` 索引。
+
+项目知识源文件仍位于本项目 `knowledge/`。新任务只同步用户选中的项目 MD 到对应能力目录的
+`pinned/` 只读视图，避免一次加载所有项目知识。
+
+能力保存属于次要流程：如果任务已经成功但能力落盘失败，任务仍保持 completed，只追加
+`capability_failed` 事件。
+
+### 6.15 本地可观测性
+
+日志默认保存到：
+
+```text
+~/.autocoding-agent/logs/autocoding-agent.log
+```
+
+使用 UTF-8 轮转日志，单文件 2 MB，保留 5 份。日志记录 session ID、模式、模型、工作区、
+启动/完成、耗时、Token、超时和脱敏后的 Runtime 错误，不记录完整用户问题、系统 Prompt、
+API Key、数据库密码和原始查询结果。
+
+本地日志的定位是“失败后追溯”，不是业务数据归档。
+
+### 6.16 Decision、Artifact 与安全恢复
+
+`core/handlers/` 将 Inspect、Implement、Verify 和 Recovery 阶段拆成独立 Handler；Handler 只返回
+结果，不直接修改生命周期。StateMachine 仍是唯一 TaskState 写入口。
+
+每个模型决定会形成 `DecisionRecord`，保存 reason、alternatives、confidence、risk、证据引用、
+模型和来源 event ID。`explain_change(task_id, path)` 将相关决定与 Artifact 聚合起来回答“为什么
+建议或修改这个文件”，但不会把模型理由伪装为执行事实。
+
+任务 Artifact 位于 `<data_dir>/tasks/<task-id>/artifacts/`，正文使用 UUID 文件名并由 manifest 记录：
+
+- analysis/context/proposal；
+- baseline status 与 baseline patch；
+- changes patch；
+- test result；
+- recovery report；
+- final report。
+
+每条记录保存 SHA-256、大小、schema version、来源、关联路径和 `host_verified`。写入使用短临时
+文件名再原子替换，规避 Windows 长路径；内容经过凭据脱敏并受大小限制。模型 test summary 默认
+不是 host verified；只有从真实 Bash ToolResult 观察到的测试命令才产生宿主 `test_executed`。
+
+RecoveryManager 遵循“不能证明安全就不自动重试”：启动扫描只协调死进程或孤儿 run，写阶段
+统一进入 recovery_required。用户只能选择只读检查、重新规划或取消；验证失败进入 replanning，
+新修改仍需重新审批，超过配置的重规划次数后转为 failed。
+
+---
+
+## 7. 实现过程中遇到的问题与解决方案
+
+### 7.1 过度框架化限制模型能力
+
+**问题**：早期倾向于用宿主代码判断需求是否包含路径、是否应该扫描项目、下一步走哪个固定
+节点。规则越来越多，模型只剩下填空角色。
+
+**解决**：重构为小状态机。需求清晰度、相关文件、诊断和方案交给模型；宿主只保留权限、
+Schema、状态和路径边界。
+
+**经验**：Agent 系统中的确定性代码应该保护边界，而不是替代模型语义能力。
+
+### 7.2 全项目分析消耗时间和 Token
+
+**问题**：为了“理解项目”默认读取大量文件，旧式单体项目尤其容易产生无关上下文和幻觉。
+
+**解决**：要求模型从用户提供的文件、路径、页面或业务线索开始，只追踪最小必要调用链；信息
+不足时询问一个关键问题。项目知识用于提供地图，不替代当前代码验证。
+
+**经验**：好的代码 Agent 不是读得最多，而是知道什么证据足以支持当前结论。
+
+### 7.3 App 内 Skill 无法随目标仓库 cwd 自动发现
+
+**问题**：Claude Code 的 cwd 必须是用户目标仓库。如果把 Skill 只放在应用自己的 `.claude`
+目录，运行时通常不会发现。
+
+**解决**：使用 `SkillRegistry` 从 Python 包中显式加载 `SKILL.md`，把工作方法追加到系统 Prompt，
+不依赖目标仓库或用户全局配置。
+
+**经验**：应用拥有的 Agent 能力必须显式注入，不能依赖当前目录偶然发现。
+
+### 7.4 Windows 找不到裸 `claude`
+
+**问题**：命令行中 `claude` 可能实际是 `.cmd` 或 `.ps1`。`subprocess.run([...], shell=False)` 在
+Windows 下不能保证解析它，PowerShell 还可能阻止 `claude.ps1`。
+
+**解决**：自动搜索并验证真实 `claude.exe`，配置页允许手动选择；每次保存都运行隐藏的
+`--version` 检查。默认配置也优先已知真实可执行路径。
+
+**经验**：服务进程调用 CLI 时必须保存可直接执行的文件，而不是保存交互式 Shell 中的别名。
+
+### 7.5 自定义模型名告警但接口实际可用
+
+**问题**：DeepSeek Anthropic 兼容端点使用 `deepseek-v4-pro`，Claude Code 不认识该模型名并
+提示上下文窗口告警，但实际请求可以成功。
+
+**解决**：把端点和模型作为用户配置，不在宿主中枚举“合法模型”；以真实健康检查和结构化
+输出结果判断可用性。
+
+**经验**：兼容端点场景中，客户端内置模型列表不一定是服务能力真相；但上下文窗口和费用
+估算仍可能不准确，需要在生产化前明确配置。
+
+### 7.6 自由文本 JSON 解析不可靠
+
+**问题**：从模型文本中寻找第一个和最后一个花括号容易受 Markdown、解释文本和嵌套内容影响。
+
+**解决**：Claude Code 使用 `--json-schema` 返回 `structured_output`，再由 Pydantic 二次校验；
+缺少结构化结果直接失败，不再猜测。
+
+**经验**：凡是要驱动状态机的模型输出，都应使用明确 Schema，而不是依赖提示词保证文本格式。
+
+### 7.7 目标仓库设置可能扩大权限
+
+**问题**：目标仓库或用户的 Claude settings、hooks、MCP、Skills 可能引入额外工具或自动授权，
+破坏宿主权限矩阵。
+
+**解决**：使用 `--bare`、空 setting sources、严格空 MCP config 和 `--no-chrome`，只暴露当前
+模式声明的内置工具。项目 CLAUDE.md 若被读取，也只是低优先级不可信项目上下文。
+
+**经验**：提示词中的“请勿修改”不是权限边界，工具可见性和外部配置隔离才是。
+
+### 7.8 Capability 目录可能被修改模式写入
+
+**问题**：能力目录位于工作区之外。如果在 Implement 模式仍通过 `--add-dir` 挂载，获得
+Edit/Write 权限的模型可能修改长期记忆，形成持久化污染。
+
+**解决**：只在 Inspect 模式挂载 Capability 目录；Implement 和 Verify 不提供该外部目录。
+
+**经验**：长期知识既是数据资产，也是潜在 Prompt Injection 载体；可读与可写权限必须分开。
+
+### 7.9 超时后可能重放有副作用的首轮
+
+**问题**：如果只在模型成功返回后保存 Claude session ID，首轮超时前可能已经修改文件。下一次
+继续时应用不知道旧 session，可能把任务作为新会话重放。
+
+**解决**：首轮启动前持久化预分配的 runtime UUID，后续始终精确 resume。
+
+**经验**：Agent 的幂等性不能只看最终返回；必须考虑工具已经执行但结果尚未送达的中间状态。
+
+### 7.10 修改审批缺少可审查方案
+
+**问题**：仅展示“申请修改这些文件”无法让用户判断修改目标，批准行为没有明确语义。
+
+**解决**：引入 `ChangeProposal`，要求描述 before/after、预期结果、影响、验证和可用预览。旧会话
+缺方案时禁止直接实施。
+
+**经验**：审批不是一个按钮，而是用户对明确方案和范围的授权。
+
+### 7.11 桌面界面在问答时冻结
+
+**问题**：Runtime 使用同步 subprocess；如果在 Tk 主线程直接调用，模型等待期间窗口无响应。
+
+**解决**：模型调用放到单一后台线程，结果通过队列和 `root.after()` 返回主线程，忙碌期间禁用
+重复提交。
+
+**当前状态**：开发 Runtime 已改为持有 `Popen` 句柄并支持按 run ID interrupt；桌面端仍只在持久化
+边界提供暂停/取消，避免把“终止当前父进程”误导成“所有子进程和副作用都已撤销”。Windows
+Job Object 级进程树清理仍是后续增强。
+
+### 7.12 每次问答弹出 Claude 控制台
+
+**问题**：Windows 子进程默认可能创建控制台窗口，严重影响桌面体验。
+
+**解决**：统一封装 `hidden_window_options()`，Claude 检测和 Runtime 调用都使用隐藏窗口标志；
+桌面客户端通过 `pythonw.exe` 启动。
+
+### 7.13 问答超时无法追溯
+
+**问题**：模型调用可能超时。没有生命周期事件时只能看到 UI 错误，无法判断工具是否已经执行、
+模型是否返回，以及是否可以安全重试。
+
+**解决**：除本地轮转日志外，Runtime 还逐行产生脱敏活动事件，并持久化 run start、heartbeat、
+complete/fail/interrupt。超时后若处于写或验证阶段，任务进入 recovery_required，而不是自动重试。
+
+### 7.14 项目知识 Markdown 逐渐臃肿
+
+**问题**：如果每次开发或异常完成都追加到同一项目 Markdown，文档会混入页面特例、临时状态和
+重复结论，降低检索精度并增加 Token。
+
+**解决**：项目 Markdown 只保留稳定的跨页面知识；每次任务的具体经验写入独立 Capability。
+开发和异常分开，项目也按二级分支分开。
+
+**经验**：基础知识、任务记录和长期工程经验必须分层，不能把所有记忆放进一个文件。
+
+### 7.15 Capability 文件名和内容脱敏
+
+**问题**：如果用模型生成标题构造文件名，标题中的密钥可能进入文件名和索引；Bearer Token 若
+先经过通用 Authorization 正则，也可能只脱敏前缀、留下凭据尾部。
+
+**解决**：Capability 文件使用 session UUID，不使用标题作为路径；Bearer 模式先于通用键值
+正则执行，文档内容统一替换工作区、用户目录和常见密钥。
+
+**经验**：脱敏要覆盖内容、文件名、索引、异常和日志；正则执行顺序本身也是安全逻辑。
+
+### 7.16 SQL Server 旧驱动 TLS 握手失败
+
+**问题**：使用系统旧的 `SQL Server` ODBC 驱动连接现代或受策略限制的 SQL Server 时出现
+`SSL 安全错误`、`SECDoClientHandshake` 和无效连接串属性。
+
+**解决**：检测并选择 `ODBC Driver 17 for SQL Server`，保留 Encrypt 与
+TrustServerCertificate 配置。UI 只展示实际安装的 SQL Server 驱动并优先现代版本。
+
+**经验**：端口可达不等于数据库协议可用；应区分 TCP、TLS/驱动、认证、数据库权限四个层次。
+
+### 7.17 `pyodbc.Cursor.timeout` 属性不存在
+
+**问题**：真实 `pyodbc 5.3.0` 的 Cursor 没有 `timeout`，代码给 Cursor 动态赋值时报：
+
+```text
+'pyodbc.Cursor' object has no attribute 'timeout' and no __dict__ for setting new attributes
+```
+
+原测试 FakeCursor 允许动态属性，导致缺陷未被发现。
+
+**解决**：在创建 Cursor 前设置 `connection.timeout`；同时使用 `__slots__` 收紧 FakeCursor，测试
+断言连接对象的查询超时。`pyodbc.connect(..., timeout=...)` 仍用于登录连接超时，两者职责不同。
+
+**经验**：测试替身不能比真实依赖更宽松；涉及第三方扩展类型时，应模拟其关键限制。
+
+### 7.18 Snapshot 与 Event 半提交
+
+**问题**：如果先改 session 再写事件，或先写事件再保存 snapshot，进程崩溃会产生无法解释的
+生命周期；并发入口还可能用旧状态覆盖新状态。
+
+**解决**：SQLiteTaskStore 使用 `BEGIN IMMEDIATE` 在同一事务内分配连续 sequence、追加不可变
+Event、写入 Decision/Artifact/Run/Command Receipt 并以 revision compare-and-swap 更新 snapshot。
+故障注入测试验证事务回滚后内存 revision 和 sequence 也能恢复。
+
+**经验**：Event Store 的价值不在于“多写一份日志”，而在于事件和当前状态必须共享一致性边界。
+
+### 7.19 崩溃恢复与重复副作用
+
+**问题**：进程在 Edit/Write 后、最终结果前崩溃时，只看 task_state 无法知道副作用是否发生；直接
+resume 或重跑可能重复修改。
+
+**解决**：实施前记录 baseline，运行期间保存 run owner/PID/heartbeat，启动时扫描孤儿运行并
+比较当前工作区。只读任务可暂停后检查，写/验证任务强制 recovery_required，由用户选择只读
+调查、重新规划或取消，绝不自动重放。
+
+**经验**：恢复首先是风险判断，其次才是续跑；“不知道是否执行过”必须建模为独立状态。
+
+### 7.20 Artifact 文件在 Windows 超长路径失败
+
+**问题**：把语义标题和长后缀直接拼进任务产物文件名，会在深层数据目录触发 Windows 路径长度
+限制，导致任务主体成功但审计落盘失败。
+
+**解决**：正文统一使用 UUID 文件名，语义类型、来源和关联路径存入 manifest；临时文件也使用
+短随机名后原子替换。
+
+**经验**：文件名应是稳定标识，不应承担展示语义；跨平台路径上限必须进入 Artifact 设计。
+
+---
+
+## 8. 技术难点与通用解决方案
+
+### 8.1 自主性与安全性的平衡
+
+最困难的问题不是让模型调用工具，而是既不通过规则削弱模型，又不让模型自行扩大副作用。
+当前采用“三层控制”：
+
+```text
+模型语义判断
+  ↓
+结构化数据契约
+  ↓
+宿主权限与路径/SQL边界
+```
+
+三层分别解决“做什么”“如何表达”和“能不能执行”，不能互相替代。
+
+### 8.2 跨进程连续会话
+
+Claude Code 每轮是独立 CLI 子进程，但用户期待连续对话。解决方式是同时保存应用 session 和
+Claude session：应用 JSON 保存业务状态，Claude transcript 保存模型上下文，通过精确 ID
+恢复。应用历史不是模型会话的替代品，而是产品状态和审计依据。
+
+### 8.3 业务数据进入模型的安全通道
+
+直接给模型数据库工具会扩大权限，也难以保证数据不落盘。当前采用“模型规划、宿主执行、结果
+短暂回传、只存审计摘要”的闭环，兼顾语义选择和数据边界。
+
+### 8.4 历史知识复用与上下文污染
+
+完全不读历史会重复调查；把所有历史塞入 Prompt 又会造成 Token 浪费和陈旧知识干扰。当前先用
+索引 + 按需打开相关 Capability，下一阶段升级为带来源、状态和适用边界的混合检索。
+
+### 8.5 老项目的证据链
+
+在 WinForms、EF6 和多项目单体解决方案中，页面、服务、仓储和数据库经常分散。项目知识提供
+典型调用链和定位方式，但模型必须回到当前工作区核实 Designer、事件、接口、实现、容器注册、
+DbContext 和数据库数据，不能只凭历史经验推断。
+
+---
+
+## 9. 技术选型与决策记录
+
+| ID | 决策 | 采用方案 | 未采用/暂缓方案 | 主要原因与代价 |
+| --- | --- | --- | --- | --- |
+| ADR-001 | 产品边界 | 平台无关 Agent 内核 | 继续建设重型工作流平台 | 减少平台复杂度，保留模型能力；需要清晰端口 |
+| ADR-002 | 语义判断 | 交给模型 | 文件名/关键词硬编码规则 | 适应不同项目；结果必须结构化校验 |
+| ADR-003 | Agent Runtime | Claude Code CLI stream-json | 自研完整 Tool Loop | 快速复用成熟能力并获得活动事件；需维护 CLI 协议兼容 |
+| ADR-004 | 模型输出 | JSON Schema + Pydantic | 解析自由文本 JSON | 状态机可靠；Schema 设计需要谨慎演进 |
+| ADR-005 | 会话恢复 | 精确 session ID / resume | continue 或重放历史 | 防止同目录串线和重复副作用 |
+| ADR-006 | 权限控制 | Inspect/Implement/Verify 分档 | 单一高权限模式 | 用户审批清晰；多一轮交互 |
+| ADR-007 | 修改审批 | 结构化 before/after 方案 | 仅显示操作列表 | 授权可理解；模型输出契约更复杂 |
+| ADR-008 | 异常流程 | 只读诊断 | 首版自动修复/写库 | 先建立可信证据链；暂时不能闭环处置 |
+| ADR-009 | 数据库调用 | 模型提查询、宿主执行 | 直接给模型 DB 工具 | 可统一校验、限行和脱敏；需要查询状态循环 |
+| ADR-010 | 桌面技术 | Tkinter/ttk | PySide、CustomTkinter、WebView | 零大型依赖、无本地服务；视觉和富文本能力有限 |
+| ADR-011 | 配置秘密 | 用户环境变量 + Credential Manager | `.env` 明文 | 不污染仓库；跨平台一致性较弱 |
+| ADR-012 | 初版会话存储 | 原子 JSON 文件 | 首版直接引入数据库 | 早期易检查、易迁移；现由 SQLite 兼容导入 |
+| ADR-013 | Capability | 工作区 + 流程隔离 | 自动覆盖 CLAUDE.md | 不污染目标仓库；跨工作区尚不能共享 |
+| ADR-014 | 项目知识 | 每流程、每项目一份 MD | 一个全局大文档 | 控制上下文和维护边界；需用户选择项目 |
+| ADR-015 | 日志 | 本地轮转脱敏日志 | 无日志或记录完整 Prompt | 可追溯且控制泄密；诊断信息有意受限 |
+| ADR-016 | 发布策略 | 每次完成迭代验证、提交并推送一次 | 多轮本地积累后批次推送 | 每个迭代都有远端回退点；要求推送前同步版本和文档 |
+| ADR-017 | 工程经验 | 候选审核后进入统一知识库 | 完成即直接写正式经验 | 降低重复、错误泛化和知识污染；增加治理步骤 |
+| ADR-018 | 任务生命周期 | TaskState、AgentStatus、AgentMode 三层分离 | 继续复用单一 status 字段 | 状态语义清晰并支持恢复；需要旧会话迁移层 |
+| ADR-019 | 状态转换 | Command + StateMachine + expected version | Engine 分散直接赋值 | 可审计、可校验，并由原子 Event Store 保证持久化一致性 |
+| ADR-020 | Task/Event 存储 | SQLite snapshot + append-only event 同事务 | JSON snapshot + 独立 JSONL | 保证一致性和并发拒绝；增加迁移与 schema 管理 |
+| ADR-021 | 执行事实 | 宿主 diff/ToolResult 与模型自报分离 | 直接信任 changed_files/test_summary | 避免虚假审计；需额外采集 Artifact |
+| ADR-022 | 任务恢复 | 写阶段转 RecoveryRequired，禁止自动重放 | 启动后无条件 resume | 避免重复副作用；需要用户恢复决策 |
+| ADR-023 | Runtime 观察 | CLI stream-json + Popen interrupt | 立即迁移 Agent SDK | 与现有 DeepSeek/Claude Code 配置兼容；进程树治理有限 |
+| ADR-024 | Artifact 命名 | UUID 正文 + manifest 元数据 | 语义长文件名 | 避免 Windows 长路径并便于不可变校验 |
+| ADR-025 | 重规划 | 验证失败有上限地 replanning 并重新审批 | 无限制自动 repair | 防止失控循环；增加一次人工授权往返 |
+
+---
+
+## 10. 测试策略
+
+### 10.1 确定性测试优先
+
+默认测试不调用模型、不消耗 API Token。通过 Fake Runtime、Fake Connection、临时目录和结构化
+结果覆盖状态机与边界。目前测试涵盖：
+
+- 需求澄清和同会话继续；
+- 修改/验证审批、拒绝和旧审批兼容；
+- 方案字段和预览展示；
+- Inspect/Implement/Verify 工具矩阵；
+- Claude 命令构造、session resume 和错误分类；
+- 开发和异常数据库查询循环；
+- SQL 参数绑定、只读拦截、限行和敏感列脱敏；
+- SQL Server 配置和密码回滚；
+- Project Knowledge 路径、分支、同步和隔离；
+- Capability 生成、幂等、索引和秘密脱敏；
+- 桌面 UI 路由、忙碌状态、流程选择和审批卡；
+- 日志轮转和 Runtime 错误脱敏；
+- 状态转换、命令幂等、Event replay、并发 revision 和事务回滚；
+- Handler、Decision、Artifact、clean/dirty/non-Git 工作区策略；
+- Runtime stream 活动、interrupt、真实 ToolResult 与模型自报分离；
+- 孤儿运行扫描、RecoveryRequired、暂停/取消和重规划上限。
+
+### 10.2 Live 测试隔离
+
+真实 Claude Code/模型调用标记为 `live`，默认完整检查使用：
+
+```powershell
+D:\python\python.exe -m pytest -m "not live" -q
+D:\python\python.exe -m ruff check src tests
+```
+
+需要验证真实模型兼容性时单独运行 live 测试，避免日常回归测试产生费用和不确定性。
+
+### 10.3 测试经验
+
+- 测试输出契约，不测试某个模型一定会说什么；
+- Fake 必须保留真实依赖的关键限制；
+- 安全缺陷应增加负向测试，而不只验证 happy path；
+- UI 尽量把格式化和路由提取成纯函数测试；
+- 模型 Prompt 变化需要同时验证 Runtime Schema 和状态机兼容；
+- 生命周期转换必须覆盖合法、非法、幂等、旧版本和旧 session 推导；
+- 实际集成问题仍需要分层测试网络、驱动、认证和权限，单元测试不能替代真实环境。
+
+---
+
+## 11. 配置、运行与发布
+
+### 11.1 运行要求
+
+- Python 3.12+；
+- Claude Code；
+- 可用的 Anthropic 兼容端点、模型和 API Key；
+- 需要 SQL Server 时安装 ODBC Driver 17 或 18。
+
+根目录双击：
+
+```text
+start.cmd
+```
+
+脚本优先使用 `D:\python\python.exe`，否则从 PATH 寻找 Python；检查版本、依赖和 Tkinter 后默认
+启动客户端。调试时可使用：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\start.ps1 -Wait
+```
+
+### 11.2 关键环境配置
+
+| 变量 | 含义 |
+| --- | --- |
+| `AUTO_CODING_CLAUDE_COMMAND` | 真实 Claude Code 可执行文件 |
+| `AUTO_CODING_CLAUDE_MODEL` | 模型名 |
+| `ANTHROPIC_BASE_URL` | Anthropic 兼容 API 地址 |
+| `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY` | API 凭据 |
+| `AUTO_CODING_CLAUDE_TIMEOUT_SECONDS` | 单轮外层超时 |
+| `AUTO_CODING_DATA_DIR` | 本地会话、能力和日志根目录 |
+| `AUTO_CODING_DATABASE_MAX_ROWS` | 数据库单次返回上限 |
+| `AUTO_CODING_DATABASE_QUERY_TIMEOUT_SECONDS` | SQL 查询超时 |
+| `AUTO_CODING_DATABASE_MAX_QUERY_ROUNDS` | 单任务查询轮数上限 |
+| `AUTO_CODING_AGENT_MAX_REPLAN_ROUNDS` | 验证失败后允许的最大重规划轮数 |
+| `AUTO_CODING_RUNTIME_LEASE_SECONDS` | 启动扫描判断运行租约的时间窗口 |
+
+### 11.3 发布与回退
+
+从 `0.4.0` 开始，每次完成迭代都同步版本号、README、架构、接口和工程经验文档，运行完整测试与
+静态检查，创建一个边界清晰的提交并向 GitHub 推送一次。功能不兼容或架构升级递增 minor，兼容
+修复递增 patch；需要形成公开里程碑时再创建不可变 tag。
+
+回退优先从历史提交或 tag 新建安全分支，不使用 `git reset --hard`、强制推送和覆盖 tag。发布
+前必须检查工作区，禁止提交 `.env`、本地日志、缓存、凭据和目标项目生成文件。
+
+---
+
+## 12. 安全模型与风险边界
+
+### 12.1 主要受保护资产
+
+- 用户目标仓库；
+- 数据库业务数据；
+- API Key 和数据库密码；
+- Capability 和未来工程经验知识；
+- Claude session 与应用会话完整性；
+- 本地日志和用户隐私。
+
+### 12.2 主要威胁
+
+- 模型越过用户批准范围修改文件；
+- 目标仓库 CLAUDE 设置、MCP 或历史知识扩大权限；
+- 数据库查询包含写操作或大规模数据读取；
+- 数据库行、代码注释或能力文档中的 Prompt Injection；
+- 密钥通过错误、日志、文件名或 Markdown 索引泄漏；
+- 超时后重复执行有副作用任务；
+- 多进程并发覆盖会话；
+- 模型报告的变更与真实 Git diff 不一致；
+- 陈旧经验被当作当前事实。
+
+### 12.3 已有防护
+
+- 工具按模式收缩；
+- 修改和验证前用户审批；
+- Claude 设置/MCP 隔离；
+- 结构化输出和路径校验；
+- 只读 SQL 校验、参数绑定、限行、超时和脱敏；
+- 密钥分离存储和日志脱敏；
+- 预分配 session ID；
+- 原子文件写入；
+- SQLite 原子 Task/Event 提交、revision 并发拒绝和命令 receipt；
+- Runtime owner/PID/heartbeat、启动孤儿扫描和进程级 interrupt；
+- Implement 前后 Git status/diff Artifact 与模型自报分离；
+- 写阶段中断进入 RecoveryRequired，禁止自动重放；
+- 历史知识不可信声明；
+- 能力目录只在只读模式挂载。
+
+### 12.4 尚待补强
+
+- Windows Job Object/完整进程树清理；
+- 分布式运行所有权和跨机器租约；
+- SDK 级逐工具审批和更稳定的协议适配；
+- SQL Parser 级只读验证，而不只依赖保守正则；
+- 数据库账号最小权限自动检查；
+- Engineering Knowledge 的审核、撤销、版本和证据机制。
+
+---
+
+## 13. 当前限制与技术债
+
+1. 应用门面仍按轮次同步返回，没有向 UI 展示流式 Token；
+2. Runtime 可终止登记的 Claude 父进程，但不能完全证明其所有后代进程都已清理；
+3. 运行租约使用本地 owner/PID/heartbeat，不是跨机器分布式锁；
+4. Git 工作区可采集真实 diff，非 Git 工作区只能记录状态，无法生成等价 patch；
+5. Verify 只从已识别的真实 Bash ToolResult 形成宿主测试事实，复杂命令可能需扩展识别；
+6. SQL 只读检查是保守规则，可能拒绝合法复杂查询，也不能替代只读数据库账号；
+7. 数据 schema 每个只读轮次都会读取，较大数据库需要缓存和按需裁剪；
+8. Capability 是“每完成任务一份文档”，尚未去重、合并和自动标记过期；
+9. 开发流程已有 Event/Run/Recovery，异常流程仍使用独立 JSON 状态机，尚未复用通用基础设施；
+10. `CAPABILITIES.md` 是 Markdown 索引，不是语义检索；
+11. Project Knowledge 依赖人工维护，当前没有冲突检测和版本审批；
+12. Tkinter 的 Markdown、富文本和可访问性能力有限；
+13. 异常流程只输出建议，尚未形成人工确认后的受控处置状态机；
+14. 尚无钉钉鉴权、幂等、回调签名、任务关联和通知重试；
+15. 模型兼容端点的上下文窗口、费用和未知模型提示仍需独立管理。
+
+这些限制应进入后续版本规划，不能通过 Prompt 声称已经解决。
+
+---
+
+## 14. 下一阶段：Engineering Experience Knowledge
+
+### 14.1 目标
+
+从“每个工作区复用自己的 Capability”升级为“跨项目复用经过治理的工程经验”。经验内容包括：
+
+- 通用技术方案；
+- 架构决策及原因；
+- 故障排查方法；
+- 失败案例和反模式；
+- 最佳实践及适用边界。
+
+Failure Knowledge 建议作为 Engineering Knowledge 的 `failure`/`anti_pattern` 类型，而不是再
+建设一套完全独立的存储和检索系统。
+
+### 14.2 推荐知识模型
+
+每条知识应至少包含：
+
+```text
+id / type / title / summary
+problem_signals / context
+decision / rationale / method
+validation / failure_modes / constraints
+evidence_refs / tags / confidence
+status / created_at / last_verified_at / supersedes
+```
+
+必须回答：何时适用、为什么这样做、证据是什么、何时不要使用。
+
+### 14.3 沉淀闭环
+
+```text
+任务完成
+  ↓
+Capability / Incident / Failure Log
+  ↓
+统一转换为 Knowledge Candidate
+  ↓
+脱敏、质量校验、相似度检测
+  ├─ 重复：合并或增加证据
+  ├─ 冲突：保留不同上下文和边界
+  └─ 新知识：进入候选区
+  ↓
+人工确认或达到证据门槛
+  ↓
+Engineering Knowledge(verified)
+  ↓
+后续任务检索与引用
+```
+
+第一阶段不应让任务完成后直接写入正式知识库。Capability 是来源，Knowledge Candidate 是缓冲，
+verified Engineering Knowledge 才是可长期复用的正式经验。
+
+### 14.4 检索方案
+
+建议先使用 SQLite 保存结构化知识，并使用 FTS5 建立关键词索引；知识规模扩大后增加 Embedding
+向量检索，最终采用混合召回和重排：
+
+```text
+FTS 精确词检索 ─┐
+                  ├─ 合并 → 元数据过滤 → 重排 → Top 3~5
+向量语义检索 ────┘
+```
+
+工程问题包含错误码、类名、方法名和框架名，纯向量检索并不可靠。索引是可重建派生数据，结构化
+知识及版本记录才是真相来源。
+
+### 14.5 工作流接入位置
+
+需求明确并确认基本技术上下文后再检索工程经验，不应在用户每输入一句话时加载大量知识。
+
+```text
+理解任务
+  → 确认页面/模块/技术栈/错误类型
+  → 生成知识查询
+  → 检索少量相关经验
+  → 模型结合当前代码和数据制定方案
+```
+
+检索结果必须携带知识 ID、状态、来源和最后验证时间，并继续作为不可信参考。最终方案最好说明
+使用了哪些经验，便于评估知识是否真正产生价值。
+
+### 14.6 建议版本路线
+
+- `v0.4`：统一 Engineering Knowledge 模型、SQLite Store、人工管理页面；
+- `v0.5`：Capability/异常/失败日志转 Knowledge Candidate，审核、脱敏和去重；
+- `v0.6`：FTS5 + Embedding 混合检索和重排；
+- `v0.7`：接入开发和异常推理流程，记录引用和使用效果；
+- `v0.8`：自动候选、冲突检测、陈旧标记和基于证据的晋级。
+
+### 14.7 成功指标
+
+知识条数不是主要指标，应关注：
+
+- 检索 Top-K 相关率；
+- Agent 对知识来源的引用准确率；
+- 使用经验后任务成功率和方案接受率；
+- 重复调查和重复失败是否减少；
+- 平均输入 Token 是否下降；
+- 错误或过期知识被采用的比例；
+- 候选重复率、合并率、停用率；
+- 同一经验在不同项目成功复用的次数。
+
+---
+
+## 15. 关键工程经验总结
+
+1. **模型做语义判断，代码做确定性边界。** 不要用简单规则替代需求理解，也不要用 Prompt
+   替代权限控制。
+2. **先有证据，再有方案。** 文件、路径、当前代码、schema 和授权数据是结论基础。
+3. **审批必须对应清晰方案。** 用户批准的是明确 before/after 和范围，不是抽象的“允许修改”。
+4. **模型输出必须结构化。** Prompt 约定不能代替 Schema 和宿主校验。
+5. **会话恢复要考虑半完成副作用。** 超时不代表工具从未执行，session ID 必须在启动前持久化。
+6. **历史知识是参考，不是事实。** Project Knowledge、Capability 和未来 RAG 都要以当前证据复核。
+7. **不同生命周期的知识必须分层。** 项目事实、任务状态、能力和跨项目经验不能混在一个 MD。
+8. **数据库安全需要多层防线。** 文本校验、参数绑定、限行、脱敏、只读意图和只读账号缺一不可。
+9. **秘密可能从任何载体泄漏。** 不只检查正文，还要检查文件名、索引、日志、异常和正则顺序。
+10. **测试替身必须忠于真实依赖。** 过于宽松的 Fake 会把集成缺陷隐藏到用户环境。
+11. **UI 不应伪造 Runtime 能力。** 进程终止不等于副作用回滚，恢复界面必须呈现真实风险。
+12. **平台入口与业务内核解耦。** 新入口只调用应用门面，不复制 Prompt、状态机和安全逻辑。
+13. **知识积累需要治理。** 自动生成只能进入候选区，正式经验要有证据、边界、版本和退出机制。
+14. **版本可回退比版本数量更重要。** 每次迭代只形成一个经验证的远端提交，边界清晰才便于回退。
+15. **模型理由与宿主事实必须分开。** changed_files 和 test_summary 是声明，diff 和 ToolResult 才是证据。
+16. **恢复不能等同于重试。** 写操作结果不确定时先进入 RecoveryRequired，再由证据和用户决定。
+
+---
+
+## 16. 后续维护指南
+
+### 16.1 修改状态机时
+
+- 先修改 Pydantic 契约；
+- 再修改集中 StateMachine 的转换规则和对应 Handler；
+- 同步 Runtime Schema、UI 显示和 CLI 输出；
+- 增加合法和非法状态的确定性测试；
+- 说明旧会话如何兼容或明确拒绝。
+
+### 16.2 增加新工具权限时
+
+- 先说明它属于 Inspect、Implement 还是 Verify；
+- 判断工具是否有间接副作用；
+- 不把 `allowed_tools` 当作唯一可见性边界；
+- 检查目标仓库设置、MCP 和外部目录是否可能扩权；
+- 添加越权负向测试。
+
+### 16.3 增加数据库能力时
+
+- 优先扩展 `DatabaseReader`，不要让模型直接持有凭据；
+- 明确只读/写入边界；
+- 查询必须参数化、限时、限行、脱敏；
+- 原始业务数据默认不持久化；
+- 生产环境使用最小权限账号；
+- 记录查询审计而不是完整结果。
+
+### 16.4 增加知识能力时
+
+- 先定义知识生命周期和来源；
+- 区分项目事实、任务记录、候选经验和正式经验；
+- 所有知识带来源、状态和适用边界；
+- 索引必须可重建；
+- 注入模型时限制 Top-K 和 Token；
+- 冲突和陈旧知识应停用或降权，不静默覆盖历史。
+
+### 16.5 发布前检查
+
+```powershell
+git status --short
+D:\python\python.exe -m pytest -m "not live" -q
+D:\python\python.exe -m ruff check src tests
+```
+
+同时确认：
+
+- 未提交 `.env`、凭据、日志、缓存和数据库结果；
+- 版本号、README、架构和接口文档与代码一致；
+- 当前迭代的任务卡和本工程经验文档已同步；
+- 新功能有失败路径和边界测试；
+- 已发布 tag 没有被修改；
+- 回退路径明确；
+- 当前迭代只创建一个边界清晰的提交，并在检查后向 GitHub 推送一次。
+
+---
+
+## 17. 相关文档与关键代码
+
+### 文档
+
+- `README.md`：使用方式和产品概览；
+- `docs/ARCHITECTURE.md`：当前系统架构；
+- `docs/INTERFACES.md`：API、枚举、数据模型和 CLI 契约；
+- `RELEASING.md`：发布和回退；
+- `docs/tasks/ACE-RUNTIME-001-agent-engine-runtime-upgrade.md`：本次 Runtime 升级任务记录；
+- `knowledge/`：分流程、分项目的用户维护知识。
+
+### 关键代码
+
+- `src/autocoding_agent/core/engine.py`：开发状态机；
+- `src/autocoding_agent/core/state_machine/`：任务生命周期、命令、失败分类和转换规则；
+- `src/autocoding_agent/core/handlers/`：Inspect、Implement、Verify、Recovery 阶段处理器；
+- `src/autocoding_agent/core/audit/`：Decision Record 与修改原因聚合；
+- `src/autocoding_agent/core/artifacts/`：任务产物契约和采集；
+- `src/autocoding_agent/core/recovery/`：孤儿运行扫描与保守恢复；
+- `src/autocoding_agent/adapters/sqlite_task_store.py`：原子 Task snapshot、追加事件、回放与旧 JSON 导入；
+- `src/autocoding_agent/adapters/task_artifact_store.py`：脱敏、校验和原子 Artifact 落盘；
+- `src/autocoding_agent/adapters/workspace_snapshot.py`：Git 工作区基线与差异观察；
+- `src/autocoding_agent/incident/engine.py`：异常诊断状态机；
+- `src/autocoding_agent/adapters/claude_code.py`：Claude Code Runtime；
+- `src/autocoding_agent/core/policies.py`：工具权限矩阵；
+- `src/autocoding_agent/adapters/sqlserver_database.py`：SQL Server 只读适配器；
+- `src/autocoding_agent/adapters/database_safety.py`：SQL 安全校验与脱敏；
+- `src/autocoding_agent/adapters/capability_store.py`：开发能力记忆；
+- `src/autocoding_agent/incident/capability_store.py`：异常能力记忆；
+- `src/autocoding_agent/workspace_knowledge.py`：项目 Markdown 分支管理；
+- `src/autocoding_agent/interfaces/desktop_ui.py`：原生桌面客户端；
+- `src/autocoding_agent/interfaces/system_settings_ui.py`：统一配置页面；
+- `src/autocoding_agent/model_setup.py`：Claude Code 和模型配置；
+- `src/autocoding_agent/sqlserver_config.py`：SQL Server 配置和凭据；
+- `src/autocoding_agent/observability.py`：本地轮转日志。
+
+---
+
+## 18. 结语
+
+AutoCodingEngineerCoreNew 当前最重要的成果不是某个 UI，也不是某条 Prompt，而是建立了一个
+清晰的责任分界：让模型充分理解和处理工程问题，同时由宿主守住权限、状态、数据和持久化。
+
+下一阶段应在这个边界上建设 Engineering Experience Knowledge，使 Capability、异常记录和失败
+日志先转成可审核的知识候选，再通过统一模型、混合检索和证据闭环影响后续任务。最终目标不是
+简单增加历史文档数量，而是让 Agent 在更多项目实践后，能够更快找到相关经验、更少重复踩坑，
+并且始终说明经验来自哪里、为何适用、何时失效。

@@ -9,6 +9,10 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field, StringConstraints, model_validator
 
+from autocoding_agent.core.artifacts.models import ArtifactRecord
+from autocoding_agent.core.audit.models import DecisionRecord, RiskLevel
+from autocoding_agent.core.runtime.models import RuntimeRunRecord
+from autocoding_agent.core.state_machine.models import CommandReceipt, TaskState
 from autocoding_agent.database_models import DataQuery, QueryObservation
 
 NonEmptyText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
@@ -44,8 +48,24 @@ class MessageRole(StrEnum):
 
 
 class EventType(StrEnum):
+    TASK_CREATED = "task_created"
+    STATE_TRANSITIONED = "state_transitioned"
     TURN_STARTED = "turn_started"
     RUNTIME_FINISHED = "runtime_finished"
+    RUNTIME_STARTED = "runtime_started"
+    RUNTIME_ACTIVITY = "runtime_activity"
+    TOOL_STARTED = "tool_started"
+    TOOL_FINISHED = "tool_finished"
+    CODE_MODIFIED = "code_modified"
+    TEST_EXECUTED = "test_executed"
+    VERIFICATION_FAILED = "verification_failed"
+    RUNTIME_COMPLETED = "runtime_completed"
+    RUNTIME_FAILED = "runtime_failed"
+    RUNTIME_INTERRUPTED = "runtime_interrupted"
+    RECOVERY_REQUIRED = "recovery_required"
+    DECISION_RECORDED = "decision_recorded"
+    ARTIFACT_RECORDED = "artifact_recorded"
+    ARTIFACT_FAILED = "artifact_failed"
     INPUT_REQUIRED = "input_required"
     APPROVAL_REQUIRED = "approval_required"
     TASK_COMPLETED = "task_completed"
@@ -125,6 +145,10 @@ class AgentDecision(BaseModel):
 
     status: AgentStatus
     message: str
+    reason: str | None = None
+    alternatives: list[str] = Field(default_factory=list)
+    confidence: float | None = Field(default=None, ge=0, le=1)
+    risk_level: RiskLevel | None = None
     evidence: list[Evidence] = Field(default_factory=list)
     next_actions: list[str] = Field(default_factory=list)
     approval: ApprovalRequest | None = None
@@ -157,8 +181,18 @@ class AgentUsage(BaseModel):
 
 class AgentEvent(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid4()))
+    sequence: int | None = Field(default=None, ge=1)
+    schema_version: int = Field(default=1, ge=1)
     type: EventType
     message: str
+    reason: str | None = None
+    alternatives: list[str] = Field(default_factory=list)
+    confidence: float | None = Field(default=None, ge=0, le=1)
+    risk_level: RiskLevel | None = None
+    actor: str = "host"
+    correlation_id: str | None = None
+    causation_id: str | None = None
+    command_id: str | None = None
     data: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=utc_now)
 
@@ -170,6 +204,9 @@ class AgentSession(BaseModel):
     workspace: str
     goal: str
     project: str | None = None
+    task_state: TaskState = TaskState.CREATED
+    version: int = Field(default=0, ge=0)
+    revision: int = Field(default=0, ge=0)
     runtime_session_id: str | None = None
     status: AgentStatus | None = None
     pending_approval: ApprovalRequest | None = None
@@ -179,10 +216,51 @@ class AgentSession(BaseModel):
     database_reference: str | None = None
     query_observations: list[QueryObservation] = Field(default_factory=list)
     query_rounds: int = 0
+    replan_rounds: int = 0
     messages: list[ChatMessage] = Field(default_factory=list)
     events: list[AgentEvent] = Field(default_factory=list)
+    decision_records: list[DecisionRecord] = Field(default_factory=list)
+    artifacts: list[ArtifactRecord] = Field(default_factory=list)
+    runs: list[RuntimeRunRecord] = Field(default_factory=list)
+    command_receipts: list[CommandReceipt] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
+
+    @model_validator(mode="before")
+    @classmethod
+    def infer_task_state_for_legacy_sessions(cls, data: Any) -> Any:
+        """Load pre-state-machine JSON without rewriting the original session file."""
+
+        if not isinstance(data, dict) or "task_state" in data:
+            return data
+        restored = {**data}
+        status = str(restored.get("status") or "")
+        approval = restored.get("pending_approval")
+        if status == AgentStatus.NEEDS_INPUT.value:
+            task_state = TaskState.WAITING_INPUT
+        elif status == AgentStatus.QUERY_REQUIRED.value:
+            task_state = TaskState.QUERYING_DATA
+        elif status == AgentStatus.APPROVAL_REQUIRED.value:
+            scope = (
+                approval.scope.value
+                if isinstance(approval, ApprovalRequest)
+                else str((approval or {}).get("scope") or "")
+            )
+            task_state = (
+                TaskState.WAITING_VERIFY_APPROVAL
+                if scope == ApprovalScope.VERIFY.value
+                else TaskState.WAITING_MODIFY_APPROVAL
+            )
+        elif status == AgentStatus.COMPLETED.value:
+            task_state = TaskState.COMPLETED
+        elif status == AgentStatus.FAILED.value:
+            task_state = TaskState.FAILED
+        else:
+            task_state = TaskState.CREATED
+        restored["task_state"] = task_state
+        restored.setdefault("version", 0)
+        restored.setdefault("revision", 0)
+        return restored
 
 
 class RuntimeTurn(BaseModel):
@@ -209,6 +287,7 @@ class AgentOutcome(BaseModel):
     session_id: str
     workspace: str
     status: AgentStatus
+    task_state: TaskState = TaskState.CREATED
     message: str
     evidence: list[Evidence] = Field(default_factory=list)
     next_actions: list[str] = Field(default_factory=list)
