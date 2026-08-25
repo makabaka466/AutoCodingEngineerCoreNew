@@ -72,6 +72,27 @@ def test_same_state_transition_is_idempotent(tmp_path: Path) -> None:
     assert len(session.events) == event_count
 
 
+def test_completed_cycle_can_reopen_for_user_input_but_stays_recovery_terminal(
+    tmp_path: Path,
+) -> None:
+    session = _session(tmp_path)
+    machine = AgentStateMachine()
+    machine.transition(session, TaskState.INSPECTING, reason="Begin the first cycle.")
+    machine.transition(session, TaskState.COMPLETED, reason="Complete the first cycle.")
+
+    assert machine.is_terminal(session.task_state) is True
+    assert machine.can_transition(TaskState.COMPLETED, TaskState.INSPECTING) is True
+
+    machine.transition(
+        session,
+        TaskState.INSPECTING,
+        reason="The user submitted a follow-up for a new cycle.",
+    )
+
+    assert session.task_state == TaskState.INSPECTING
+    assert machine.is_terminal(session.task_state) is False
+
+
 def test_illegal_transition_is_rejected_without_mutation(tmp_path: Path) -> None:
     session = _session(tmp_path)
     machine = AgentStateMachine()

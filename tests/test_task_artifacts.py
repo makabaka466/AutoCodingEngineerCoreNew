@@ -246,6 +246,7 @@ def test_application_archives_model_reason_and_host_observed_diff(tmp_path: Path
     changes = next(item for item in session.artifacts if item.type == ArtifactType.CHANGES_PATCH)
     test_result = next(item for item in session.artifacts if item.type == ArtifactType.TEST_RESULT)
     assert baseline.metadata["dirty"] is False
+    assert all(item.metadata["cycle_number"] == 1 for item in session.artifacts)
     assert changes.host_verified is True
     assert changes.metadata["baseline_was_dirty"] is False
     assert test_result.host_verified is False

@@ -177,6 +177,75 @@ def test_incident_flow_locates_page_queries_data_and_diagnoses(tmp_path: Path) -
     assert any(event.type == EventType.DATABASE_QUERIES_EXECUTED for event in outcome.events)
 
 
+def test_completed_incident_reopens_and_writes_a_new_cycle_document(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace-follow-up"
+    workspace.mkdir()
+    state = tmp_path / "data-follow-up"
+    runtime = ScriptedStructuredRuntime(
+        [
+            IncidentDecision(
+                status=IncidentStatus.COMPLETED,
+                message="First diagnosis complete.",
+                page=_page(),
+                diagnosis="The first symptom is explained.",
+            ),
+            IncidentDecision(
+                status=IncidentStatus.COMPLETED,
+                message="Follow-up diagnosis complete.",
+                page=_page(),
+                diagnosis="The additional symptom has the same request boundary.",
+            ),
+        ]
+    )
+    store = JsonIncidentStore(state)
+    engine = IncidentEngine(
+        runtime,
+        store,
+        None,
+        capabilities=IncidentCapabilityStore(state),
+        model="test-model",
+    )
+
+    first = engine.start(workspace, "Order page is stale", "/orders/42")
+    saved = store.load(first.session_id)
+    saved.query_rounds = 2
+    store.save(saved)
+    second = engine.send(
+        first.session_id,
+        "Continue: does the refresh action use the same endpoint?",
+        command_id="incident-follow-up-2",
+    )
+    duplicate = engine.send(
+        first.session_id,
+        "Continue: does the refresh action use the same endpoint?",
+        command_id="incident-follow-up-2",
+    )
+    session = store.load(first.session_id)
+    first_document = Path(first.capability_document or "")
+    second_document = Path(second.capability_document or "")
+
+    assert second.status == duplicate.status == IncidentStatus.COMPLETED
+    assert second.cycle_number == duplicate.cycle_number == 2
+    assert session.cycle_number == 2
+    assert session.query_rounds == 0
+    assert session.cycle_objective == (
+        "Continue: does the refresh action use the same endpoint?"
+    )
+    assert len(runtime.turns) == 2
+    assert first_document.is_file()
+    assert second_document.is_file()
+    assert first_document != second_document
+    assert second_document.name.endswith("-cycle-002.md")
+    assert "cycle_number: 1" in first_document.read_text(encoding="utf-8")
+    assert "cycle_number: 2" in second_document.read_text(encoding="utf-8")
+    event_types = [event.type for event in session.events]
+    assert event_types.count(EventType.TASK_REOPENED) == 1
+    assert event_types.count(EventType.TASK_COMPLETED) == 2
+    assert event_types.count(EventType.CAPABILITY_SAVED) == 2
+
+
 def test_agent_resolves_page_with_host_executed_sql_before_page_is_known(
     tmp_path: Path,
 ) -> None:

@@ -121,6 +121,7 @@ class AgentEngine:
             goal=message.strip(),
             project=project.strip() if project and project.strip() else None,
             database_reference=self.database_reference,
+            cycle_objective=message.strip(),
         )
         session.events.append(
             AgentEvent(
@@ -152,12 +153,10 @@ class AgentEngine:
         session = self.sessions.load(session_id)
         if duplicate := self._duplicate_command_outcome(session, command_id):
             return duplicate
-        if self.state_machine.is_terminal(session.task_state):
-            raise ValueError(
-                "This task is complete or cancelled. Start a new session for a new task."
-            )
         if not message.strip():
             raise ValueError("Message cannot be empty.")
+        if session.task_state == TaskState.CANCELLED:
+            raise ValueError("This task was cancelled and cannot be reopened.")
         # A normal reply while approval is pending is treated as a revised instruction.
         session.pending_approval = None
         command = AgentCommand(
@@ -166,7 +165,38 @@ class AgentEngine:
             type=AgentCommandType.SUBMIT_USER_INPUT,
             expected_version=session.version,
         )
+        if session.task_state == TaskState.COMPLETED:
+            self._reopen_completed_cycle(session, message.strip(), command)
         return self._run_command(session, message.strip(), AgentMode.INSPECT, command)
+
+    @staticmethod
+    def _reopen_completed_cycle(
+        session: AgentSession,
+        message: str,
+        command: AgentCommand,
+    ) -> None:
+        previous_cycle = session.cycle_number
+        session.cycle_number += 1
+        session.cycle_objective = message
+        session.cycle_query_observation_start = len(session.query_observations)
+        session.query_rounds = 0
+        session.replan_rounds = 0
+        session.status = None
+        session.last_decision = None
+        session.pending_approval = None
+        session.capability_document = None
+        session.events.append(
+            AgentEvent(
+                type=EventType.TASK_REOPENED,
+                message="Reopened the completed conversation for a new work cycle.",
+                actor=command.actor,
+                command_id=command.id,
+                data={
+                    "from_cycle": previous_cycle,
+                    "to_cycle": session.cycle_number,
+                },
+            )
+        )
 
     def approve(self, session_id: str, command_id: str | None = None) -> AgentOutcome:
         session = self.sessions.load(session_id)
@@ -903,6 +933,7 @@ class AgentEngine:
                 message=f"Executed {len(results)} bounded read-only database queries.",
                 data={
                     "query_round": session.query_rounds,
+                    "cycle_number": session.cycle_number,
                     "queries": [
                         {
                             "name": query.name,
@@ -923,7 +954,11 @@ class AgentEngine:
                 AgentEvent(
                     type=EventType.CAPABILITY_SAVED,
                     message="Saved reusable development capability knowledge.",
-                    data={"path": receipt.document_path, "created": receipt.created},
+                    data={
+                        "path": receipt.document_path,
+                        "created": receipt.created,
+                        "cycle_number": session.cycle_number,
+                    },
                 )
             )
         except Exception as exc:
@@ -1156,7 +1191,14 @@ class AgentEngine:
                 AgentStatus.FAILED: EventType.TASK_FAILED,
             }[decision.status]
         session.events.append(
-            AgentEvent(type=event_type, message=decision.message, data={"status": decision.status})
+            AgentEvent(
+                type=event_type,
+                message=decision.message,
+                data={
+                    "status": decision.status,
+                    "cycle_number": session.cycle_number,
+                },
+            )
         )
 
     @staticmethod
@@ -1169,6 +1211,7 @@ class AgentEngine:
             workspace=session.workspace,
             status=session.status,
             task_state=session.task_state,
+            cycle_number=session.cycle_number,
             message=decision.message,
             evidence=decision.evidence,
             next_actions=decision.next_actions,
@@ -1176,7 +1219,9 @@ class AgentEngine:
             changed_files=decision.changed_files,
             test_summary=decision.test_summary,
             capability_document=session.capability_document,
-            query_observations=session.query_observations,
+            query_observations=session.query_observations[
+                session.cycle_query_observation_start :
+            ],
             usage=session.last_usage,
             events=session.events,
         )

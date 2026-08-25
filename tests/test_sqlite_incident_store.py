@@ -57,6 +57,18 @@ def test_sqlite_incident_store_persists_replayable_event_timeline(tmp_path: Path
     assert store.replay_task_state(outcome.session_id) == TaskState.COMPLETED
     assert store.list_runs(outcome.session_id)[0].status.value == "completed"
 
+    follow_up = engine.send(outcome.session_id, "Check the refresh action too.")
+    transitions = [
+        (event.data["from"], event.data["to"])
+        for event in store.list_events(outcome.session_id)
+        if event.type == EventType.STATE_TRANSITIONED
+    ]
+
+    assert follow_up.cycle_number == 2
+    assert store.replay_task_state(outcome.session_id) == TaskState.COMPLETED
+    assert transitions[-2:] == [("completed", "inspecting"), ("inspecting", "completed")]
+    assert len(store.list_runs(outcome.session_id)) == 2
+
 
 def test_sqlite_incident_store_rejects_stale_snapshot_save(tmp_path: Path) -> None:
     store = SQLiteIncidentStore(tmp_path / "data", migrate_legacy_json=False)

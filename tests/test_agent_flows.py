@@ -10,6 +10,7 @@ from pydantic import ValidationError
 
 from autocoding_agent.adapters.capability_store import CapabilityStore
 from autocoding_agent.adapters.json_session_store import JsonSessionStore
+from autocoding_agent.adapters.sqlite_task_store import SQLiteTaskStore
 from autocoding_agent.application import AgentApplication, build_application
 from autocoding_agent.config import Settings
 from autocoding_agent.core.models import (
@@ -445,6 +446,66 @@ def test_session_can_resume_after_application_restart(tmp_path: Path) -> None:
     ]
     assert restarted_app.get_session(first.session_id).status == AgentStatus.COMPLETED
     assert restarted_app.get_session(first.session_id).task_state == TaskState.COMPLETED
+
+
+def test_completed_development_session_reopens_as_independent_cycle(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "repo-follow-up"
+    workspace.mkdir()
+    state = tmp_path / "state-follow-up"
+    runtime = ScriptedRuntime(
+        _completed("First cycle complete."),
+        _completed("Follow-up cycle complete."),
+        runtime_session_id="claude-follow-up-session",
+    )
+    app = _app(state, runtime)
+
+    first = app.start(workspace, "Inspect the upload behavior.")
+    first_document = Path(first.capability_document or "")
+    persisted = SQLiteTaskStore(state)
+    before_follow_up = persisted.load(first.session_id)
+    before_follow_up.query_rounds = 2
+    before_follow_up.replan_rounds = 2
+    persisted.save(before_follow_up)
+
+    second = app.send(
+        first.session_id,
+        "Continue: explain the retry behavior.",
+        command_id="follow-up-cycle-2",
+    )
+    duplicate = app.send(
+        first.session_id,
+        "Continue: explain the retry behavior.",
+        command_id="follow-up-cycle-2",
+    )
+    session = app.get_session(first.session_id)
+    second_document = Path(second.capability_document or "")
+
+    assert first.status == second.status == duplicate.status == AgentStatus.COMPLETED
+    assert second.cycle_number == duplicate.cycle_number == 2
+    assert session.cycle_number == 2
+    assert session.cycle_objective == "Continue: explain the retry behavior."
+    assert session.query_rounds == 0
+    assert session.replan_rounds == 0
+    assert len(runtime.turns) == 2
+    assert runtime.turns[1].runtime_session_id == "claude-follow-up-session"
+    assert first_document.is_file()
+    assert second_document.is_file()
+    assert first_document != second_document
+    assert second_document.name.endswith("-cycle-002.md")
+    assert "cycle_number: 1" in first_document.read_text(encoding="utf-8")
+    assert "cycle_number: 2" in second_document.read_text(encoding="utf-8")
+    assert persisted.replay_task_state(first.session_id) == TaskState.COMPLETED
+    event_types = [event.type for event in session.events]
+    assert event_types.count(EventType.TASK_REOPENED) == 1
+    assert event_types.count(EventType.TASK_COMPLETED) == 2
+    assert event_types.count(EventType.CAPABILITY_SAVED) == 2
+    assert [
+        (event.data["from"], event.data["to"])
+        for event in session.events
+        if event.type == EventType.STATE_TRANSITIONED
+    ][-2:] == [("completed", "inspecting"), ("inspecting", "completed")]
 
 
 def test_duplicate_approval_command_id_does_not_repeat_runtime(tmp_path: Path) -> None:

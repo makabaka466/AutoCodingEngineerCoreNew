@@ -225,12 +225,13 @@ class ArtifactRecorder:
         content = f"""# Task Final Report
 
 - Task ID: `{session.id}`
+- Work cycle: `{session.cycle_number}`
 - Decision ID: `{decision_record.id}`
 - Project: `{session.project or "未选择"}`
 
 ## Goal
 
-{session.goal}
+{session.cycle_objective or session.goal}
 
 ## Outcome
 
@@ -321,7 +322,10 @@ class ArtifactRecorder:
             message=f"Recorded {artifact_type.value} artifact.",
             actor="host",
             command_id=command_id,
-            data={"artifact_type": artifact_type.value},
+            data={
+                "artifact_type": artifact_type.value,
+                "cycle_number": session.cycle_number,
+            },
         )
         record = self.store.write_text(
             task_id=session.id,
@@ -331,7 +335,7 @@ class ArtifactRecorder:
             source=source,
             host_verified=host_verified,
             related_paths=related_paths,
-            metadata=metadata,
+            metadata={**metadata, "cycle_number": session.cycle_number},
         )
         event.data.update(
             {

@@ -1,6 +1,6 @@
 # AutoCoding Engineer 架构说明
 
-本文描述当前 `0.5.2` 代码已经实现的架构。数据字段、公共方法和命令行参数见
+本文描述当前 `0.5.3` 代码已经实现的架构。数据字段、公共方法和命令行参数见
 [接口与数据契约](INTERFACES.md)。
 
 ## 1. 项目目标
@@ -144,9 +144,10 @@ Claude Code 以 `--bare` 启动，并使用空 setting sources、严格空 MCP �
 
 ## 4. 会话与任务流程
 
-一个 `AgentSession` 表示一个用户任务。它保存用户目标、双方消息、Claude Code 的可恢复
-会话 ID、最后决定、待审批请求、使用量、生命周期状态和事件。开发会话快照与事件由 SQLite
-事务存储，因此 CLI 与 UI 可以在不同进程中继续同一任务。
+一个 `AgentSession` 表示一段可以持续追问的软件工程会话；会话内由 `cycle_number` 区分多个
+已完成工作轮次。它保存用户目标、本轮目标、双方消息、Claude Code 的可恢复会话 ID、最后决定、
+待审批请求、使用量、生命周期状态和事件。开发会话快照与事件由 SQLite 事务存储，因此 CLI 与
+UI 可以在不同进程中继续同一任务。
 
 开发流程明确区分三种概念：
 
@@ -181,6 +182,7 @@ stateDiagram-v2
     Inspecting --> Completed: completed
     Implementing --> Completed: completed
     Verifying --> Completed: completed
+    Completed --> Inspecting: new user follow-up
     Inspecting --> Paused: orphaned read-only run / pause
     Implementing --> RecoveryRequired: interrupted / uncertain side effect
     Verifying --> RecoveryRequired: interrupted / uncertain side effect
@@ -192,7 +194,6 @@ stateDiagram-v2
     Inspecting --> Cancelled: cancel
     Paused --> Cancelled: cancel
     RecoveryRequired --> Cancelled: cancel
-    Completed --> [*]
     Cancelled --> [*]
 ```
 
@@ -201,9 +202,10 @@ stateDiagram-v2
 开发 session，只持久化查询名、用途、行数、截断和脱敏列审计。`implement/verify` 不允许查库。
 
 `replanning`、`paused`、`recovery_required` 和 `cancelled` 已接入公共 API、CLI 和桌面恢复卡。
-`completed` 与 `cancelled` 是终态；写或验证阶段出现不确定副作用时不得直接进入普通 failed，
-而是进入 recovery_required。为兼容旧使用方式，部分明确无副作用的 failed 仍允许通过 send
-重新进入只读调查。
+`completed` 是当前工作轮次的静止完成态，Recovery 扫描会忽略它，但新的用户消息可以显式驱动
+`completed -> inspecting`；`cancelled` 才是永久封闭状态。写或验证阶段出现不确定副作用时不得
+直接进入普通 failed，而是进入 recovery_required。为兼容旧使用方式，部分明确无副作用的 failed
+仍允许通过 send 重新进入只读调查。
 
 ### 4.1 新任务
 
@@ -246,10 +248,22 @@ Markdown 预览。预览形式由模型按任务语义决定，可以是界面�
 `inspect` 模式要求模型给出不使用该权限的真实替代结果。用户在审批等待中直接调用
 `send()`，会清除旧审批，并把新消息视为修订后的指令。
 
+### 4.4 完成后继续对话
+
+到达 `completed` 时当前轮次的 Event、Decision、Artifact 和 Capability 已经封口。之后收到新的
+`SUBMIT_USER_INPUT`，Engine 增加 `cycle_number`、记录 `task_reopened`，清空当前决定、审批和
+能力文档指针，并重置本轮 `query_rounds/replan_rounds`；历史消息、Runtime Session、事件、决定、
+查询审计和 Artifact 均保留。状态机随后执行 `completed -> inspecting`，模型可以利用相关历史，
+但 Prompt 要求重新核对当前代码和授权数据。
+
+相同 command ID 在重新打开前先经过 CommandReceipt 幂等检查，因此网络或外部入口重试只返回
+原完成结果，不会意外开启额外工作轮次。`cancelled`、`paused` 和 `recovery_required` 仍不能通过
+普通输入绕过其安全边界。
+
 修改和验证是分开的权限：`implement` 不能执行命令；`verify` 不能编辑文件。验证发现还
 需修改时，模型需要再次申请 `modify`。
 
-### 4.4 失败处理
+### 4.5 失败处理
 
 Claude Code 启动失败、超时、非零退出、无效 JSON、缺少结构化结果、无可恢复 session ID、
 Pydantic 契约失败或核心策略违规，都会形成持久化失败事实。只读阶段可以转为 failed；实施或
@@ -387,7 +401,8 @@ flowchart LR
     INDEX --> NEXT["后续任务选择性参考"]
 ```
 
-只有 `completed` 会触发 `CapabilityStore.record()`。模型应在最终决定中提供
+只有 `completed` 会触发 `CapabilityStore.record()`。澄清、查询、审批和验证只是同一工作轮次的
+中间状态，不单独生成 MD。模型应在最终决定中提供
 `CapabilityDraft`；若没有，存储器会根据目标、最终消息、下一步和测试摘要创建保底草稿。
 
 当前落盘结构是：
@@ -404,13 +419,13 @@ flowchart LR
    ├─ development/
    │  ├─ CAPABILITIES.md
    │  ├─ pinned/<二级路径>/<二级路径名>.md
-   │  ├─ tasks/<session-id>.json
-   │  └─ capabilities/<session-id>.md
+   │  ├─ tasks/<session-id>[-cycle-NNN].json
+   │  └─ capabilities/<session-id>[-cycle-NNN].md
    └─ incident/
       ├─ CAPABILITIES.md
       ├─ pinned/<二级路径>/<二级路径名>.md
-      ├─ tasks/<session-id>.json
-      └─ capabilities/<session-id>.md
+      ├─ tasks/<session-id>[-cycle-NNN].json
+      └─ capabilities/<session-id>[-cycle-NNN].md
 ```
 
 用户直接维护的源文件不在 `<data_dir>`，而在本项目：
@@ -426,7 +441,9 @@ knowledge/
 结果、变更文件、测试摘要、模型和能力文档相对路径。写入前会替换工作区绝对路径、用户
 主目录以及常见 token/password/secret 形式。Markdown 和 JSON 都通过临时文件替换写入。
 
-同一 session 再次记录时，以现有 task JSON 为幂等依据，返回原文档且 `created=false`。
+同一 session 的第 1 轮沿用 `<session-id>.md` 保持兼容，第 2 轮起使用
+`<session-id>-cycle-002.md`。每轮以自己的 task JSON 为幂等依据：重复记录同一轮返回原文档且
+`created=false`，新轮次写入新的不可覆盖文档并独立加入索引。
 能力保存失败只追加 `capability_failed` 事件，不会把已经完成的软件任务改为失败。
 
 只读轮次通过 Claude Code 的 `--add-dir` 获得当前流程自己的工作区能力目录，并被提示先查看
@@ -436,7 +453,7 @@ knowledge/
 
 ### 当前能力记忆边界
 
-当前实现是“每个完成会话一份能力文档”，尚未实现语义去重、跨任务合并、修订历史、证据
+当前实现是“每个完成工作轮次一份能力文档”，尚未实现语义去重、跨任务合并、修订历史、证据
 指纹、自动陈旧标记或跨工作区共享。`CAPABILITIES.md` 只是根据 task JSON 重建的 Markdown
 索引。第一项任务完成前也会存在一个明确写着暂无能力条目的空索引。
 

@@ -619,6 +619,7 @@ class DesktopClient:
         self._busy_label = ""
         self._busy_tick = 0
         self._current_status: AgentStatus | IncidentStatus | None = None
+        self._current_task_state: TaskState | None = None
         self._approval_can_execute = True
         self._flow_projects: dict[FlowKind, str] = {
             FlowKind.DEVELOPMENT: "",
@@ -1606,13 +1607,16 @@ class DesktopClient:
         else:
             self.incident_context_frame.grid()
         self.prompt_placeholder.configure(
-            text=(
-                "描述任务目标、约束条件，以及相关文件或页面线索…"
-                if is_development
-                else "描述异常现象、影响范围，以及可复现条件…"
-            )
+            text=self._default_prompt_placeholder_text()
         )
         self._refresh_project_options()
+
+    def _default_prompt_placeholder_text(self) -> str:
+        return (
+            "描述任务目标、约束条件，以及相关文件或页面线索…"
+            if self.flow == FlowKind.DEVELOPMENT
+            else "描述异常现象、影响范围，以及可复现条件…"
+        )
 
     def _knowledge_domain(self) -> KnowledgeDomain:
         return (
@@ -1663,6 +1667,9 @@ class DesktopClient:
         self._render_incident_session(session)
 
     def _render_welcome(self) -> None:
+        self._current_task_state = None
+        self.send_button.configure(text="发送任务")
+        self.prompt_placeholder.configure(text=self._default_prompt_placeholder_text())
         if self.flow == FlowKind.INCIDENT:
             self.task_title_var.set("新异常诊断")
             message = (
@@ -1688,6 +1695,7 @@ class DesktopClient:
         self._set_status(None)
 
     def _render_session(self, session: AgentSession) -> None:
+        self._current_task_state = session.task_state
         entries: list[tuple[str, str]] = []
         for item in session.messages:
             role = {
@@ -1711,12 +1719,15 @@ class DesktopClient:
                 details.extend(f"• {item}" for item in decision.changed_files)
             if decision.test_summary:
                 details.append(f"验证\n{decision.test_summary}")
-            if session.query_observations:
+            cycle_observations = session.query_observations[
+                session.cycle_query_observation_start :
+            ]
+            if cycle_observations:
                 details.append("数据查询")
                 details.extend(
                     f"• {item.query_name}: {item.returned_rows} 行"
                     + ("，已截断" if item.truncated else "")
-                    for item in session.query_observations
+                    for item in cycle_observations
                 )
             if session.capability_document:
                 details.append(f"能力文档\n{session.capability_document}")
@@ -1732,13 +1743,22 @@ class DesktopClient:
         self.task_title_var.set(title[:64] + ("…" if len(title) > 64 else ""))
         self._set_status(session.status)
         self._show_approval(session)
+        self.send_button.configure(text="发送任务")
+        self.prompt_placeholder.configure(text=self._default_prompt_placeholder_text())
         if session.status == AgentStatus.COMPLETED:
-            self.status_var.set("任务已完成。点击左侧“新建任务”开始下一项工作。")
+            self.status_var.set(
+                f"第 {session.cycle_number} 轮任务已完成。可以继续追问、补充要求，或新建任务。"
+            )
+            self.send_button.configure(text="继续对话")
+            self.prompt_placeholder.configure(text="继续追问，或者补充新的修改要求…")
         elif session.status == AgentStatus.NEEDS_INPUT:
+            self.send_button.configure(text="发送任务")
             self.status_var.set("请在下方补充模型询问的信息。")
         elif session.status == AgentStatus.APPROVAL_REQUIRED:
+            self.send_button.configure(text="发送任务")
             self.status_var.set("请检查授权范围，再选择批准或拒绝。")
         elif session.status == AgentStatus.FAILED:
+            self.send_button.configure(text="发送任务")
             if session.task_state in {TaskState.PAUSED, TaskState.RECOVERY_REQUIRED}:
                 self.status_var.set("任务已安全暂停，请查看恢复报告并选择恢复方式。")
             elif session.task_state == TaskState.REPLANNING:
@@ -1748,6 +1768,7 @@ class DesktopClient:
         self._sync_controls()
 
     def _render_incident_session(self, session: IncidentSession) -> None:
+        self._current_task_state = session.task_state
         entries: list[tuple[str, str]] = []
         for item in session.messages:
             role = {
@@ -1774,12 +1795,15 @@ class DesktopClient:
             if decision.findings:
                 details.append("发现")
                 details.extend(f"• {item.summary}" for item in decision.findings)
-            if session.query_observations:
+            cycle_observations = session.query_observations[
+                session.cycle_query_observation_start :
+            ]
+            if cycle_observations:
                 details.append("数据查询")
                 details.extend(
                     f"• {item.query_name}: {item.returned_rows} 行"
                     + ("，已截断" if item.truncated else "")
-                    for item in session.query_observations
+                    for item in cycle_observations
                 )
             if decision.recommended_actions:
                 details.append("建议动作")
@@ -1806,13 +1830,23 @@ class DesktopClient:
         else:
             self._hide_approval()
         self._set_status(session.status)
+        self.send_button.configure(text="发送任务")
+        self.prompt_placeholder.configure(text=self._default_prompt_placeholder_text())
         if session.status == IncidentStatus.COMPLETED:
-            self.status_var.set("异常诊断已完成。可以切换流程或新建另一项诊断。")
+            self.status_var.set(
+                f"第 {session.cycle_number} 轮异常诊断已完成。"
+                "可以继续追问、补充现象，或新建诊断。"
+            )
+            self.send_button.configure(text="继续对话")
+            self.prompt_placeholder.configure(text="继续追问，或者补充新的异常线索…")
         elif session.status == IncidentStatus.NEEDS_INPUT:
+            self.send_button.configure(text="发送任务")
             self.status_var.set("请在下方补充模型询问的异常信息。")
         elif session.status == IncidentStatus.QUERY_REQUIRED:
+            self.send_button.configure(text="发送任务")
             self.status_var.set("正在根据页面和只读数据继续诊断。")
         elif session.status == IncidentStatus.FAILED:
+            self.send_button.configure(text="发送任务")
             if session.task_state in {TaskState.PAUSED, TaskState.RECOVERY_REQUIRED}:
                 self.status_var.set("异常诊断已暂停，请选择继续只读调查、重新调查或取消。")
             else:
@@ -2258,9 +2292,10 @@ class DesktopClient:
 
         can_start_new = not self._busy
         can_choose_workspace = not self._busy and self.session_id is None
-        can_send = not self._busy and self._current_status not in {
-            AgentStatus.COMPLETED,
-            IncidentStatus.COMPLETED,
+        can_send = not self._busy and self._current_task_state not in {
+            TaskState.CANCELLED,
+            TaskState.PAUSED,
+            TaskState.RECOVERY_REQUIRED,
         }
         can_decide = (
             self.flow == FlowKind.DEVELOPMENT

@@ -49,9 +49,10 @@ class CapabilityStore:
     ) -> CapabilityReceipt:
         directory = self.prepare(session.workspace, session.project)
         draft = decision.capability or self._fallback_draft(session, decision)
-        # A UUID-only filename cannot leak a secret that the model placed in a title.
-        document = directory / "capabilities" / f"{session.id}.md"
-        task_record = directory / "tasks" / f"{session.id}.json"
+        # The UUID-derived cycle key cannot leak a secret that the model placed in a title.
+        record_key = capability_cycle_key(session.id, session.cycle_number)
+        document = directory / "capabilities" / f"{record_key}.md"
+        task_record = directory / "tasks" / f"{record_key}.json"
         index_file = directory / "CAPABILITIES.md"
 
         if task_record.exists():
@@ -73,9 +74,11 @@ class CapabilityStore:
             "schema_version": 1,
             "task_id": session.id,
             "session_id": session.id,
+            "cycle_number": session.cycle_number,
             "workspace_id": directory.parent.name,
             "project": session.project,
             "goal": safe(session.goal),
+            "cycle_objective": safe(session.cycle_objective or session.goal),
             "outcome": safe(decision.message),
             "changed_files": [safe(path) for path in decision.changed_files],
             "test_summary": safe(decision.test_summary or ""),
@@ -145,6 +148,7 @@ class CapabilityStore:
         return f"""---
 schema_version: 1
 session_id: {json.dumps(session.id)}
+cycle_number: {session.cycle_number}
 model: {json.dumps(model)}
 completed_at: {json.dumps(session.updated_at.isoformat())}
 ---
@@ -175,7 +179,9 @@ completed_at: {json.dumps(session.updated_at.isoformat())}
 
 ## 来源任务
 
-- 目标：{safe(session.goal)}
+- 会话原始目标：{safe(session.goal)}
+- 本轮目标：{safe(session.cycle_objective or session.goal)}
+- 工作轮次：{session.cycle_number}
 - 结果：{safe(decision.message)}
 - 变更文件：{", ".join(safe(path) for path in decision.changed_files) or "无"}
 """
@@ -183,12 +189,25 @@ completed_at: {json.dumps(session.updated_at.isoformat())}
     def _rebuild_index(self, directory: Path, project: str | None = None) -> None:
         pinned = pinned_markdown_entries(directory, project)
         entries: list[str] = []
-        for record_file in sorted((directory / "tasks").glob("*.json")):
-            record = json.loads(record_file.read_text(encoding="utf-8"))
+        records = [
+            json.loads(record_file.read_text(encoding="utf-8"))
+            for record_file in (directory / "tasks").glob("*.json")
+        ]
+        records.sort(
+            key=lambda item: (
+                str(item.get("completed_at", "")),
+                str(item.get("session_id", "")),
+                int(item.get("cycle_number", 1)),
+            )
+        )
+        for record in records:
             document = directory / record["document"]
             title = _markdown_title(document.read_text(encoding="utf-8"))
             summary = str(record.get("outcome", "")).replace("\n", " ").strip()
-            entries.append(f"- [{title}]({record['document']}) — {summary[:240]}")
+            cycle = int(record.get("cycle_number", 1))
+            entries.append(
+                f"- [第 {cycle} 轮 · {title}]({record['document']}) — {summary[:240]}"
+            )
         content = (
             """# Development Capabilities
 
@@ -214,6 +233,14 @@ only entries relevant to the current task and verify them against current reposi
         temporary = path.with_suffix(path.suffix + ".tmp")
         temporary.write_text(content, encoding="utf-8")
         temporary.replace(path)
+
+
+def capability_cycle_key(session_id: str, cycle_number: int) -> str:
+    """Keep legacy first-cycle names while assigning every later completion a new file."""
+
+    if cycle_number < 1:
+        raise ValueError("cycle_number must be at least 1")
+    return session_id if cycle_number == 1 else f"{session_id}-cycle-{cycle_number:03d}"
 
 
 def _markdown_title(content: str) -> str:

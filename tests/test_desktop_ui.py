@@ -422,18 +422,59 @@ def test_existing_task_routes_message_to_same_session(root: tk.Toplevel) -> None
     assert application.calls == [("send", session.id, "入口函数是 cancel_order")]
 
 
-def test_completed_task_locks_composer_but_new_task_restores_it(root: tk.Toplevel) -> None:
+def test_completed_task_keeps_composer_available_for_follow_up(root: tk.Toplevel) -> None:
     session = _session(AgentStatus.COMPLETED)
-    client = DesktopClient(root, FakeApplication([session]))  # type: ignore[arg-type]
+    application = FakeApplication([session])
+    client = DesktopClient(root, application)  # type: ignore[arg-type]
     client.session_id = session.id
+    operations = _capture_operation(client)
 
     client._render_session(session)
-    assert client.prompt_input.cget("state") == "disabled"
+    assert client.prompt_input.cget("state") == "normal"
     assert client.workspace_entry.cget("state") == "disabled"
+    assert client.send_button.cget("text") == "继续对话"
+    assert "继续追问" in client.prompt_placeholder.cget("text")
+    client.prompt_input.insert("1.0", "继续说明重试边界")
+    client._send_message()
+    operations[0]()
+    assert application.calls == [("send", session.id, "继续说明重试边界")]
 
     client._new_task()
     assert client.prompt_input.cget("state") == "normal"
     assert client.workspace_entry.cget("state") == "normal"
+    assert client.send_button.cget("text") == "发送任务"
+    assert "任务目标" in client.prompt_placeholder.cget("text")
+
+
+def test_completed_incident_keeps_composer_available_for_follow_up(
+    root: tk.Toplevel,
+) -> None:
+    session = IncidentSession(
+        workspace=str(Path.cwd()),
+        problem="订单页面状态异常",
+        status=IncidentStatus.COMPLETED,
+        task_state=TaskState.COMPLETED,
+    )
+    incident_application = FakeIncidentApplication([session])
+    client = DesktopClient(
+        root,
+        FakeApplication(),  # type: ignore[arg-type]
+        incident_application,  # type: ignore[arg-type]
+    )
+    client._flow_session_ids[FlowKind.INCIDENT] = session.id
+    client._select_flow(FlowKind.INCIDENT)
+    operations = _capture_operation(client)
+
+    assert client.prompt_input.cget("state") == "normal"
+    assert client.send_button.cget("text") == "继续对话"
+    assert "异常线索" in client.prompt_placeholder.cget("text")
+    client.prompt_input.insert("1.0", "继续确认刷新按钮的查询")
+    client._send_message()
+    operations[0]()
+
+    assert incident_application.calls == [
+        ("send", session.id, "继续确认刷新按钮的查询")
+    ]
 
 
 def test_busy_state_blocks_conflicting_controls(root: tk.Toplevel) -> None:

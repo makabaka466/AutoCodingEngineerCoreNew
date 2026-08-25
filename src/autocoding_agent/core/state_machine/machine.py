@@ -119,7 +119,9 @@ _TRANSITIONS: Mapping[TaskState, frozenset[TaskState]] = {
     # FAILED remains reopenable during the JSON-session compatibility phase. A later recovery
     # phase will classify terminal versus recoverable failures before removing this edge.
     TaskState.FAILED: frozenset({TaskState.INSPECTING, TaskState.CANCELLED}),
-    TaskState.COMPLETED: frozenset(),
+    # Completion closes one work cycle. A new user-input command may explicitly reopen the same
+    # conversation without making completed tasks active during startup recovery scans.
+    TaskState.COMPLETED: frozenset({TaskState.INSPECTING}),
     TaskState.CANCELLED: frozenset(),
 }
 
@@ -137,6 +139,8 @@ class AgentStateMachine:
         return current == target or target in self.allowed_targets(current)
 
     def is_terminal(self, state: TaskState) -> bool:
+        """Return whether startup recovery can treat this state as inactive."""
+
         return state in self.terminal_states
 
     def transition(

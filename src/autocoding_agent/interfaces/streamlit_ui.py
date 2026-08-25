@@ -115,13 +115,16 @@ def main() -> None:
                 st.rerun()
 
         if session.status == AgentStatus.COMPLETED:
-            st.success("任务已完成")
+            st.success(f"第 {session.cycle_number} 轮任务已完成")
             if session.capability_document:
                 st.caption(f"能力文档：{session.capability_document}")
-            st.info("点击左侧“新建任务”开始下一项工作。")
-            return
+            st.info("可以在下方继续追问或补充要求；也可以点击左侧“新建任务”。")
 
-    prompt = st.chat_input("描述要调查或实现的开发任务…")
+    prompt = st.chat_input(
+        "继续追问，或者补充新的修改要求…"
+        if session is not None and session.status == AgentStatus.COMPLETED
+        else "描述要调查或实现的开发任务…"
+    )
     if prompt:
         if not st.session_state.session_id and not workspace.strip():
             st.error("请先填写项目路径。")

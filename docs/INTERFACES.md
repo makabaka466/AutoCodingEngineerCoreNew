@@ -1,6 +1,6 @@
 # AutoCoding Engineer 接口与数据契约
 
-本文记录当前 `0.5.2` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
+本文记录当前 `0.5.3` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
 Runtime、持久化和状态契约。
 设计动机和运行流程见[架构说明](ARCHITECTURE.md)。
 
@@ -44,7 +44,7 @@ def build_application(
 | 方法 | 输入 | 行为和返回 |
 | --- | --- | --- |
 | `start(workspace, message, project=None)` | `str | Path`, `str`, `str | None` | 新建任务，保存所选知识项目并执行首个只读轮次，返回 `AgentOutcome` |
-| `send(session_id, message, command_id=None)` | `str`, `str`, `str | None` | 补充澄清或修订指令，以只读模式继续；可用命令 ID 幂等重试 |
+| `send(session_id, message, command_id=None)` | `str`, `str`, `str | None` | 补充澄清、修订指令，或从 completed 开启同一会话的新工作轮次；可用命令 ID 幂等重试 |
 | `approve(session_id, command_id=None)` | `str`, `str | None` | 批准当前请求的精确 scope，并以对应模式继续 |
 | `reject(session_id, reason="", command_id=None)` | `str`, `str`, `str | None` | 拒绝当前请求，以只读模式继续并要求替代方案 |
 | `resume(session_id, action="read_only_inspect")` | `str`, `RecoveryAction | str` | 从 paused/recovery_required 以显式安全动作恢复 |
@@ -62,7 +62,7 @@ def build_application(
 
 - `start` 的工作区必须真实存在且为目录，任务消息不能为空；
 - `project` 对应当前流程 `knowledge/` 下的二级路径；桌面端要求新任务必须选择；
-- `send` 的消息不能为空，且不能继续已 `completed` 的任务；
+- `send` 的消息不能为空；`completed` 会开启下一工作轮次，`cancelled` 不能重新打开；
 - `approve`、`reject` 只适用于存在 `pending_approval` 的会话；
 - session ID 必须是已保存的 UUID。
 
@@ -88,7 +88,7 @@ def build_application(
 | `replanning` | 验证失败后的有上限重新规划 |
 | `paused` | 用户暂停或孤儿只读运行的安全停靠状态 |
 | `recovery_required` | 中断后副作用不确定，需要恢复决策 |
-| `completed` | 已完成终态 |
+| `completed` | 当前工作轮次已完成；新用户消息可转回 inspecting |
 | `failed` | 明确失败；兼容路径可允许 send 后重新调查 |
 | `cancelled` | 用户取消终态 |
 
@@ -107,7 +107,8 @@ def build_application(
 | `failed` | Runtime、输出契约或策略检查失败 |
 
 `AgentStatus` 是模型本轮结构化决定/公开 Outcome 类型，不是任务生命周期。`completed` 会触发
-能力文档保存；是否允许继续由 `TaskState` 判断。`failed` 当前可以通过 `send` 重新进入只读轮次。
+本轮独立能力文档保存；新的 `send` 会增加 cycle 并重新进入只读轮次。`failed` 当前也可以通过
+`send` 重新进入只读轮次。
 
 ### 2.3 `AgentMode`
 
@@ -127,7 +128,7 @@ def build_application(
 - `EventType`：除任务、状态、输入、审批、完成、失败、能力和数据库事件外，还包括
   `runtime_started/activity/completed/failed/interrupted`、`tool_started/finished`、
   `code_modified`、`test_executed`、`verification_failed`、`recovery_required`、
-  `decision_recorded`、`artifact_recorded/failed`。
+  `decision_recorded`、`artifact_recorded/failed`、`task_reopened`。
 - `RecoveryAction`：`read_only_inspect`、`replan`、`cancel`。
 
 ## 3. 结构化模型契约
@@ -317,6 +318,9 @@ AgentSession
   query_observations: list[QueryObservation] = []
   query_rounds: int = 0
   replan_rounds: int = 0
+  cycle_number: int = 1
+  cycle_objective: str | None = None
+  cycle_query_observation_start: int = 0
   messages: list[ChatMessage] = []
   events: list[AgentEvent] = []
   decision_records: list[DecisionRecord] = []
@@ -331,7 +335,9 @@ AgentSession
 两者不能假定始终相同。`workspace` 以严格解析后的绝对目录保存。
 `version` 只在生命周期转换时增加；`revision` 在每次 Task snapshot 保存时增加。旧 JSON 没有
 `task_state/version/revision` 时，会根据已有 status 和 pending approval 推导生命周期，以 0
-载入后导入 SQLite；旧文件不会被覆盖。
+载入后导入 SQLite；旧文件不会被覆盖。旧会话没有 cycle 字段时默认属于第 1 轮。
+`cycle_query_observation_start` 只划分当前轮次的公开结果和能力文档，历史查询审计仍保留在 Session
+和 Event 中。
 
 ### 3.6 Decision、Artifact 与 Runtime Run
 
@@ -368,6 +374,7 @@ AgentOutcome
   workspace: str
   status: AgentStatus
   task_state: TaskState
+  cycle_number: int
   message: str
   evidence: list[Evidence] = []
   next_actions: list[str] = []
@@ -381,7 +388,8 @@ AgentOutcome
 ```
 
 这是每次应用操作的公开返回值。`events` 当前包含该会话至今的完整事件列表，而不是仅本轮
-增量。`capability_document` 是状态目录中的绝对路径，不是目标仓库内路径。
+增量；`query_observations` 只返回当前 cycle 的查询摘要。`capability_document` 是当前完成轮次
+文档在状态目录中的绝对路径，不是目标仓库内路径。
 
 ## 4. Runtime 端口与 Claude Code 契约
 
@@ -570,14 +578,17 @@ CapabilityReceipt
 
 ### 6.1 task JSON
 
-`tasks/<session-id>.json` 当前包含：
+第 1 轮使用 `tasks/<session-id>.json`，后续使用
+`tasks/<session-id>-cycle-<NNN>.json`。共享字段和开发专有字段包括：
 
 ```text
 schema_version
 task_id
 session_id
+cycle_number
 workspace_id
 goal
+cycle_objective
 outcome
 changed_files
 test_summary
@@ -586,12 +597,16 @@ model
 completed_at
 ```
 
+异常记录使用相同的 `session_id/cycle_number/cycle_objective/document/model/completed_at`，并以
+`problem` 代替开发记录的 `goal`；开发记录另外保存 changed files 和 test summary。
+
 `document` 是相对于当前工作区能力目录的 POSIX 风格路径。task JSON 的存在也是当前
 幂等判断依据。
 
 ### 6.2 能力 Markdown
 
-文档 frontmatter 包含 `schema_version`、`session_id`、`model`、`completed_at`，正文包含：
+文档 frontmatter 包含 `schema_version`、`session_id`、`cycle_number`、`model`、`completed_at`，
+正文包含：
 
 - 标题和摘要；
 - 适用场景；
@@ -601,8 +616,9 @@ completed_at
 - 任务证据；
 - 来源目标、结果和变更文件。
 
-文件名为 `<session-id>.md`。文件名不使用模型生成的标题，从根本上避免标题里可能出现的
-敏感值通过文件名或索引链接泄漏。
+第 1 轮文件名为 `<session-id>.md`，后续为 `<session-id>-cycle-002.md` 等独立文件。同一轮
+重复记录返回已有文件，新一轮不会修改或追加旧 MD。文件名不使用模型生成的标题，从根本上
+避免标题里的敏感值通过文件名或索引链接泄漏。
 
 `CAPABILITIES.md` 由全部 task JSON 重建，每项链接到对应能力文档，并附最终结果的前
 240 个字符。该索引明确提示历史知识可能过期。
@@ -690,6 +706,7 @@ autocoding-agent-client
 - `recovery_required` 的只读检查、重新规划和取消恢复卡，并显示当前 TaskState；
 - evidence、changed files、测试摘要和能力文档路径；
 - `needs_input`、`approval_required`、`completed`、`failed` 状态提示。
+- 已完成会话保持输入框可用，按钮显示“继续对话”；发送后开启下一 cycle。
 
 应用方法是同步接口，因此客户端用一个后台工作线程执行每一轮，并通过 Tk 的事件队列回到
 主线程渲染。任务建立后会锁定所选项目，忙碌期间会禁用发送、会话切换和重复审批。Runtime
@@ -729,8 +746,8 @@ autocoding-agent-ui
 - 审批操作、拟执行动作展示和可选拒绝原因；
 - 完成状态和能力文档路径提示。
 
-首次消息调用 `start`，已有会话中的消息调用 `send`。完成后页面停止接收该任务的新消息，
-用户需点击“新建任务”。UI 当前没有独立展示完整 evidence、usage、event timeline，也没有
+首次消息调用 `start`，已有会话中的消息调用 `send`。完成后页面继续接收追问或补充要求，
+也允许用户点击“新建任务”另开会话。UI 当前没有独立展示完整 evidence、usage、event timeline，也没有
 流式 token 或后台任务接口。
 
 `start.cmd -Web` 或 `start.ps1 -Web` 才会启动该页面；`-Port` 与 `-NoBrowser` 仅作用于
@@ -787,7 +804,7 @@ outcome = incidents.start(
 | 方法 | 行为 |
 | --- | --- |
 | `start(workspace, problem, page_hint=None, *, project=None, source="manual", external_reference=None)` | 创建异常会话，保存所选知识项目，定位页面并在必要时查询数据库 |
-| `send(session_id, message, command_id=None)` | 回答模型澄清问题或补充异常上下文；command ID 可幂等重试 |
+| `send(session_id, message, command_id=None)` | 回答澄清、补充异常上下文，或从 completed 开启下一诊断 cycle；command ID 可幂等重试 |
 | `resume(session_id, action="read_only_inspect")` | 从 paused/recovery_required 明确继续或重新调查 |
 | `cancel(session_id)` | 取消非终态异常诊断，不运行模型或写数据库 |
 | `outcome(session_id)` | 返回最新 `IncidentOutcome` |
@@ -796,7 +813,8 @@ outcome = incidents.start(
 | `events(session_id)` / `runs(session_id)` | 返回可审计事件与 Runtime Run |
 
 `source` 与 `external_reference` 为钉钉消息来源和外部消息/工单 ID 预留。当前调用是同步的；
-`completed` 会话不能继续发送消息。`recovery_scan` 给出本次应用启动发现并暂停的孤儿异常任务。
+`completed` 会话允许继续发送并生成新的逐轮异常能力文档。`recovery_scan` 给出本次应用启动
+发现并暂停的孤儿异常任务。
 
 ### 11.2 状态与结构化决定
 
@@ -831,6 +849,8 @@ automation_candidate: bool
 执行调用中，完成后的持久化审计使用指纹。
 `IncidentSession.database_reference` 保存该会话的无凭据数据源引用，例如
 `sqlserver://server:1433/database`；它不保存数据库账号、密码或业务数据。
+`IncidentSession` 与开发会话一样保存 `cycle_number/cycle_objective` 和当前轮查询审计起点；
+`IncidentOutcome` 只返回本 cycle 的查询摘要，Session/Event 继续保留全部历史审计。
 
 ### 11.3 `DatabaseReader`
 

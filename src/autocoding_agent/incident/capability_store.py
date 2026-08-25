@@ -9,6 +9,7 @@ from typing import Any
 
 from autocoding_agent.adapters.capability_store import (
     CapabilityReceipt,
+    capability_cycle_key,
     pinned_markdown_entries,
     sanitize_text,
     sync_knowledge_documents,
@@ -43,8 +44,9 @@ class IncidentCapabilityStore:
         model: str,
     ) -> CapabilityReceipt:
         directory = self.prepare(session.workspace, session.project)
-        document = directory / "capabilities" / f"{session.id}.md"
-        task_record = directory / "tasks" / f"{session.id}.json"
+        record_key = capability_cycle_key(session.id, session.cycle_number)
+        document = directory / "capabilities" / f"{record_key}.md"
+        task_record = directory / "tasks" / f"{record_key}.json"
         index_file = directory / "CAPABILITIES.md"
         if task_record.exists():
             stored = json.loads(task_record.read_text(encoding="utf-8"))
@@ -64,9 +66,11 @@ class IncidentCapabilityStore:
             "domain": "incident",
             "task_id": session.id,
             "session_id": session.id,
+            "cycle_number": session.cycle_number,
             "workspace_id": directory.parent.name,
             "project": session.project,
             "problem": safe(session.problem),
+            "cycle_objective": safe(session.cycle_objective or session.problem),
             "outcome": safe(decision.message),
             "document": relative_document,
             "model": model,
@@ -108,7 +112,7 @@ class IncidentCapabilityStore:
                 if item.redacted_columns
                 else ""
             )
-            for item in session.query_observations
+            for item in session.query_observations[session.cycle_query_observation_start :]
         ]
 
         def bullets(values: list[str], empty: str) -> str:
@@ -118,6 +122,7 @@ class IncidentCapabilityStore:
 schema_version: 1
 domain: incident
 session_id: {json.dumps(session.id)}
+cycle_number: {session.cycle_number}
 model: {json.dumps(model)}
 completed_at: {json.dumps(session.updated_at.isoformat())}
 ---
@@ -126,7 +131,9 @@ completed_at: {json.dumps(session.updated_at.isoformat())}
 
 ## 适用问题
 
-- {safe(session.problem)}
+- 会话原始问题：{safe(session.problem)}
+- 本轮问题：{safe(session.cycle_objective or session.problem)}
+- 工作轮次：{session.cycle_number}
 - 页面线索：{safe(session.page_hint or "未提供")}
 
 ## 页面与代码定位
@@ -161,8 +168,18 @@ completed_at: {json.dumps(session.updated_at.isoformat())}
     def _rebuild_index(self, directory: Path, project: str | None = None) -> None:
         pinned = pinned_markdown_entries(directory, project)
         entries: list[str] = []
-        for record_file in sorted((directory / "tasks").glob("*.json")):
-            record = json.loads(record_file.read_text(encoding="utf-8"))
+        records = [
+            json.loads(record_file.read_text(encoding="utf-8"))
+            for record_file in (directory / "tasks").glob("*.json")
+        ]
+        records.sort(
+            key=lambda item: (
+                str(item.get("completed_at", "")),
+                str(item.get("session_id", "")),
+                int(item.get("cycle_number", 1)),
+            )
+        )
+        for record in records:
             document = directory / record["document"]
             title = next(
                 (
@@ -173,7 +190,10 @@ completed_at: {json.dumps(session.updated_at.isoformat())}
                 "Untitled incident capability",
             )
             summary = str(record.get("outcome", "")).replace("\n", " ").strip()
-            entries.append(f"- [{title}]({record['document']}) — {summary[:240]}")
+            cycle = int(record.get("cycle_number", 1))
+            entries.append(
+                f"- [第 {cycle} 轮 · {title}]({record['document']}) — {summary[:240]}"
+            )
         content = (
             """# Incident Capabilities
 

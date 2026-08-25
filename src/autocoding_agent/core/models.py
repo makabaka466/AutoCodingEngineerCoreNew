@@ -74,6 +74,7 @@ class EventType(StrEnum):
     CAPABILITY_FAILED = "capability_failed"
     DATABASE_QUERIES_EXECUTED = "database_queries_executed"
     DATABASE_QUERY_FAILED = "database_query_failed"
+    TASK_REOPENED = "task_reopened"
 
 
 class ChatMessage(BaseModel):
@@ -218,6 +219,9 @@ class AgentSession(BaseModel):
     query_observations: list[QueryObservation] = Field(default_factory=list)
     query_rounds: int = 0
     replan_rounds: int = 0
+    cycle_number: int = Field(default=1, ge=1)
+    cycle_objective: str | None = None
+    cycle_query_observation_start: int = Field(default=0, ge=0)
     messages: list[ChatMessage] = Field(default_factory=list)
     events: list[AgentEvent] = Field(default_factory=list)
     decision_records: list[DecisionRecord] = Field(default_factory=list)
@@ -263,6 +267,12 @@ class AgentSession(BaseModel):
         restored.setdefault("revision", 0)
         return restored
 
+    @model_validator(mode="after")
+    def validate_cycle_observation_offset(self) -> AgentSession:
+        if self.cycle_query_observation_start > len(self.query_observations):
+            raise ValueError("cycle query observation offset exceeds stored observations")
+        return self
+
 
 class RuntimeTurn(BaseModel):
     session_id: str
@@ -289,6 +299,7 @@ class AgentOutcome(BaseModel):
     workspace: str
     status: AgentStatus
     task_state: TaskState = TaskState.CREATED
+    cycle_number: int = Field(default=1, ge=1)
     message: str
     evidence: list[Evidence] = Field(default_factory=list)
     next_actions: list[str] = Field(default_factory=list)

@@ -1,6 +1,6 @@
 # AutoCodingEngineerCoreNew 项目开发与工程经验
 
-> 文档基线：2026-08-25，项目版本 `0.5.2`。本文以当前代码为准，并明确区分“已实现”、
+> 文档基线：2026-08-25，项目版本 `0.5.3`。本文以当前代码为准，并明确区分“已实现”、
 > “当前限制”和“后续规划”。本版本完成任务卡 `ACE-RUNTIME-001`：开发 Agent 已升级为由
 > 状态机、追加事件、运行记录、决策审计、任务产物和保守恢复共同驱动的可恢复 Runtime。
 
@@ -1574,3 +1574,84 @@ SQLite 乐观并发拒绝、异常孤儿 run 启动暂停和显式恢复，以�
 聚焦测试分别确认共享 Settings 默认值、`DataQuery` 默认值、SQL Server connection 超时、实际
 `fetchmany(101)` 调用，以及 SQLite 对 105 条测试数据只返回 100 条并标记截断。发布前还需运行
 完整非 live 回归、Ruff 与 diff 检查；最终结果记录在 `docs/tasks/ACE-DATA-005-query-timeout-row-limit.md`。
+
+---
+
+## 23. 已完成会话续聊与逐轮能力文档
+
+### 23.1 背景问题
+
+早期实现把 `completed` 同时解释为“模型已经完成本次工作”和“整个会话永久关闭”：状态转换表
+不给 `completed` 出边，开发与异常 Engine 拒绝 `send()`，桌面和备用 Web UI 也关闭输入入口。
+这保证了终态清晰，却不符合真实工程沟通——用户常在结果之后继续追问原因、补充一个约束，或
+要求在同一上下文上追加修改。
+
+简单开放输入框仍不够。Session 的数据库查询和重新规划计数原本累计到会话结束；直接复用会让
+第二轮继承第一轮预算。Capability 又以 Session ID 作为唯一幂等键，第二次完成会被识别成重复
+保存而不产生新经验。必须同时重新定义生命周期、预算和知识产物边界。
+
+### 23.2 业务语义：Session 与 Cycle 分离
+
+本次把 Session 定义为可持续的工程对话，把 Cycle 定义为一次从用户目标到真实完成的工作轮次：
+
+```text
+Session
+├─ Cycle 1：创建 → 调查/审批/实施/验证 → completed → capability 1
+├─ Cycle 2：用户追问 → 调查/审批/实施/验证 → completed → capability 2
+└─ Cycle 3：用户补充 → …… → completed → capability 3
+```
+
+`needs_input`、`query_required`、等待审批、实施和验证都是一个 Cycle 的中间状态，不会各写一份
+Markdown。只有重新到达 `completed` 才形成一份独立能力文档。旧 Cycle 的 MD 不追加、不覆盖；
+Project Knowledge 和 Engineering Experience 总文档也不会自动混入完整对话。
+
+### 23.3 核心实现
+
+- `AgentSession` 与 `IncidentSession` 增加 `cycle_number`、`cycle_objective` 和本轮查询审计起点；
+  旧持久化数据缺少这些字段时自动按第 1 轮加载；
+- 状态机允许 `completed -> inspecting`，但 `is_terminal(completed)` 仍返回 true，使启动 Recovery
+  不会把静止完成会话当成待恢复任务；只有新的用户 command 可以显式重新打开；
+- Engine 在重新打开时记录 `task_reopened`，增加 cycle，清除旧的当前决定、审批和能力文档指针，
+  重置查询/重规划计数；消息、Claude Runtime Session、Event、Decision、Run、Artifact 和累计
+  查询审计继续保留；
+- Engine 先检查 CommandReceipt，再判断是否重新打开。相同 command ID 重试直接返回原结果，
+  不会因为网络重试创建多余 Cycle；
+- 第 1 轮 Capability 沿用 `<session-id>.md`；从第 2 轮开始写
+  `<session-id>-cycle-002.md` 及对应 task JSON。每个 Cycle 拥有自己的幂等键和索引项；
+- Artifact 文件继续使用不可变 UUID 文件名，并在 Event、metadata 和 final report 中记录
+  `cycle_number`；
+- 桌面和 Streamlit 在完成后继续开放输入，主按钮显示“继续对话”，发送后使用原 Runtime
+  Session 回到只读调查。`cancelled` 仍永久封闭，paused/recovery_required 仍走显式恢复入口。
+
+### 23.4 技术难点与解决方案
+
+**可重新打开与 Recovery 终态看似矛盾。** 如果把 completed 从 terminal set 移除，启动扫描会把
+大量正常完成任务当成候选，污染恢复逻辑。解决方式是区分“Recovery 是否需要处理”和“用户命令
+是否允许转换”：completed 对扫描仍是静止终态，但转换表允许有审计的新消息进入 inspecting。
+
+**知识幂等键不能只用 Session ID。** 原设计保证重复完成不会覆盖 MD，但也会吞掉合法第二轮。
+解决方式是使用 `(session_id, cycle_number)` 作为能力产物身份，并保留第 1 轮旧文件名以兼容
+已有数据。重复保存同一 Cycle 返回 `created=false`，下一 Cycle 一定获得新文件。
+
+**预算重置不能丢失历史审计。** 直接清空 QueryObservation 会破坏追溯；完全累计又会把旧轮结果
+混进新能力文档。解决方式是保留累计 observation，同时记录本轮起点；查询次数按 Cycle 归零，
+公开 Outcome、UI 和异常能力文档只读取当前切片，Event/Session 仍保留完整历史。
+
+**继续对话不能把旧结论当成当前事实。** 保留 Claude Runtime Session 可以减少重复解释，但代码
+和业务数据可能已经变化。开发与异常 Prompt 明确把最新消息视为新工作轮次：可以复用相关历史，
+但必须重新核对当前仓库和授权数据。
+
+### 23.5 决策记录
+
+- ADR-031：`completed` 表示当前工作轮次完成，`cancelled` 才表示会话永久封闭；
+- ADR-032：同一 Session 使用持久化 cycle 编号，重新打开时重置执行预算但保留历史事实；
+- ADR-033：每个 completed Cycle 生成独立 Capability MD，幂等身份为 session + cycle；
+- ADR-034：completed 对 Recovery 保持 inactive，只有显式用户 command 可以重新打开；
+- ADR-035：当前轮 UI/Outcome/能力文档使用查询审计切片，完整审计保留在 Session/Event。
+
+### 23.6 验证策略
+
+确定性测试覆盖开发与异常的两次完成、`task_reopened`、`completed -> inspecting -> completed`
+SQLite 回放、Runtime Session 复用、查询/重规划预算重置、逐轮 MD 命名、同 command ID 幂等、
+Artifact cycle metadata，以及桌面两套流程完成后继续输入。最终验证结果记录在
+`docs/tasks/ACE-RUNTIME-006-reopen-completed-session.md`。

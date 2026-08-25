@@ -101,6 +101,9 @@ class IncidentSession(BaseModel):
     messages: list[ChatMessage] = Field(default_factory=list)
     query_observations: list[QueryObservation] = Field(default_factory=list)
     query_rounds: int = 0
+    cycle_number: int = Field(default=1, ge=1)
+    cycle_objective: str | None = None
+    cycle_query_observation_start: int = Field(default=0, ge=0)
     capability_document: str | None = None
     events: list[AgentEvent] = Field(default_factory=list)
     runs: list[RuntimeRunRecord] = Field(default_factory=list)
@@ -130,12 +133,19 @@ class IncidentSession(BaseModel):
         restored.setdefault("command_receipts", [])
         return restored
 
+    @model_validator(mode="after")
+    def validate_cycle_observation_offset(self) -> IncidentSession:
+        if self.cycle_query_observation_start > len(self.query_observations):
+            raise ValueError("cycle query observation offset exceeds stored observations")
+        return self
+
 
 class IncidentOutcome(BaseModel):
     session_id: str
     workspace: str
     status: IncidentStatus
     task_state: TaskState = TaskState.CREATED
+    cycle_number: int = Field(default=1, ge=1)
     message: str
     question: str | None = None
     page: LocatedPage | None = None

@@ -92,6 +92,7 @@ class IncidentEngine:
             database_reference=self.database_reference,
             source=source.strip() or "manual",
             external_reference=external_reference,
+            cycle_objective=problem.strip(),
         )
         session.events.append(
             AgentEvent(
@@ -120,21 +121,51 @@ class IncidentEngine:
         command_id: str | None = None,
     ) -> IncidentOutcome:
         session = self.sessions.load(session_id)
-        if session.status == IncidentStatus.COMPLETED:
-            raise ValueError("This incident is complete. Start a new incident for a new problem.")
-        if session.task_state in {TaskState.PAUSED, TaskState.RECOVERY_REQUIRED}:
-            raise ValueError("This incident is paused. Choose an explicit recovery action.")
-        if not message.strip():
-            raise ValueError("Message cannot be empty.")
         if duplicate := self._duplicate_command_outcome(session, command_id):
             return duplicate
+        if not message.strip():
+            raise ValueError("Message cannot be empty.")
+        if session.task_state == TaskState.CANCELLED:
+            raise ValueError("This incident was cancelled and cannot be reopened.")
+        if session.task_state in {TaskState.PAUSED, TaskState.RECOVERY_REQUIRED}:
+            raise ValueError("This incident is paused. Choose an explicit recovery action.")
         command = AgentCommand(
             id=command_id or str(uuid4()),
             task_id=session.id,
             type=AgentCommandType.SUBMIT_USER_INPUT,
             expected_version=session.version,
         )
+        if session.task_state == TaskState.COMPLETED:
+            self._reopen_completed_cycle(session, message.strip(), command)
         return self._execute(session, message.strip(), command)
+
+    @staticmethod
+    def _reopen_completed_cycle(
+        session: IncidentSession,
+        message: str,
+        command: AgentCommand,
+    ) -> None:
+        previous_cycle = session.cycle_number
+        session.cycle_number += 1
+        session.cycle_objective = message
+        session.cycle_query_observation_start = len(session.query_observations)
+        session.query_rounds = 0
+        session.status = None
+        session.last_decision = None
+        session.capability_document = None
+        session.events.append(
+            AgentEvent(
+                type=EventType.TASK_REOPENED,
+                message="Reopened the completed incident for a new investigation cycle.",
+                actor=command.actor,
+                command_id=command.id,
+                data={
+                    "from_cycle": previous_cycle,
+                    "to_cycle": session.cycle_number,
+                    "workflow": "incident",
+                },
+            )
+        )
 
     def resume(
         self,
@@ -329,11 +360,37 @@ class IncidentEngine:
                     try:
                         receipt = self.capabilities.record(session, decision, self.model)
                         session.capability_document = receipt.document_path
+                        session.events.append(
+                            AgentEvent(
+                                type=EventType.CAPABILITY_SAVED,
+                                message="Saved reusable incident capability knowledge.",
+                                actor="host",
+                                command_id=command.id,
+                                data={
+                                    "path": receipt.document_path,
+                                    "created": receipt.created,
+                                    "cycle_number": session.cycle_number,
+                                    "workflow": "incident",
+                                },
+                            )
+                        )
                     except Exception as exc:
                         session.messages.append(
                             ChatMessage(
                                 role=MessageRole.SYSTEM,
                                 content=f"Incident completed, but capability storage failed: {exc}",
+                            )
+                        )
+                        session.events.append(
+                            AgentEvent(
+                                type=EventType.CAPABILITY_FAILED,
+                                message=f"Incident completed, but capability storage failed: {exc}",
+                                actor="host",
+                                command_id=command.id,
+                                data={
+                                    "cycle_number": session.cycle_number,
+                                    "workflow": "incident",
+                                },
                             )
                         )
                 session.events.append(
@@ -348,7 +405,11 @@ class IncidentEngine:
                         message=decision.message,
                         actor="host",
                         command_id=command.id,
-                        data={"status": decision.status.value, "workflow": "incident"},
+                        data={
+                            "status": decision.status.value,
+                            "workflow": "incident",
+                            "cycle_number": session.cycle_number,
+                        },
                     )
                 )
                 self._complete_command(session, command)
@@ -561,6 +622,7 @@ class IncidentEngine:
                 command_id=command_id,
                 data={
                     "query_round": session.query_rounds,
+                    "cycle_number": session.cycle_number,
                     "queries": [
                         {
                             **audit,
@@ -770,6 +832,7 @@ class IncidentEngine:
             workspace=session.workspace,
             status=session.status,
             task_state=session.task_state,
+            cycle_number=session.cycle_number,
             message=decision.message,
             question=decision.question,
             page=decision.page,
@@ -778,7 +841,9 @@ class IncidentEngine:
             recommended_actions=decision.recommended_actions,
             confidence=decision.confidence,
             automation_candidate=decision.automation_candidate,
-            query_observations=session.query_observations,
+            query_observations=session.query_observations[
+                session.cycle_query_observation_start :
+            ],
             capability_document=session.capability_document,
             usage=session.last_usage,
             events=session.events,
@@ -839,6 +904,10 @@ Workflow rules:
    within the bounded attempts or finish with an explicit evidence gap. It is valid to conclude
    that the cause is not yet proven.
 5. Never invent a page, schema, row, root cause, remediation, or test result.
+
+A completed incident may be reopened by a later user message. Treat it as a new investigation cycle
+in the same conversation: reuse relevant history and page context, but recheck current code and
+authorized data. Intermediate questions and database rounds do not create separate completed cycles.
 
 Completed incidents are written by the host into incident-only Markdown capability memory. Never
 modify that memory yourself. {capability_note}
