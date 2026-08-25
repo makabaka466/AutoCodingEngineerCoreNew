@@ -28,12 +28,12 @@ from autocoding_agent.workspace_knowledge import (
     WorkspaceKnowledgeError,
 )
 
-WINDOW = "#F7F8FA"
+WINDOW = "#F5F7FB"
 CARD = "#FFFFFF"
-PANEL = "#F1F3F5"
-BORDER = "#D7DCE2"
-TEXT = "#1F2937"
-MUTED = "#667085"
+PANEL = "#F1F5F9"
+BORDER = "#E2E8F0"
+TEXT = "#0F172A"
+MUTED = "#64748B"
 ACCENT = "#2563EB"
 SUCCESS = "#15803D"
 DANGER = "#DC2626"

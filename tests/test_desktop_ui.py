@@ -30,6 +30,7 @@ from autocoding_agent.interfaces.desktop_ui import (
     COLORS,
     DesktopClient,
     FlowKind,
+    RoundedButton,
     format_approval_details,
     session_list_label,
 )
@@ -487,11 +488,14 @@ def test_system_settings_combines_model_and_shared_database_without_revealing_se
 def test_light_theme_and_workspace_row_are_part_of_composer(root: tk.Toplevel) -> None:
     client = DesktopClient(root, FakeApplication())  # type: ignore[arg-type]
 
-    assert COLORS["window"] == "#F7F8FA"
+    assert COLORS["window"] == "#F5F7FB"
     assert client.workspace_entry.master.master == client.composer_frame
+    assert isinstance(client.send_button, RoundedButton)
     assert client.send_button.cget("background") == COLORS["accent"]
     assert client.send_button.cget("foreground") == "#FFFFFF"
     assert client.browse_button.cget("background") == COLORS["panel"]
+    assert client.transcript.tag_cget("user_message", "background") == COLORS["accent_soft"]
+    assert client.status_badge.cget("highlightthickness") == 1
 
 
 def test_flow_selector_shows_active_flow_and_reveals_incident_fields(
