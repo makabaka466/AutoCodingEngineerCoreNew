@@ -13,7 +13,12 @@ from autocoding_agent.adapters.database_safety import (
     sensitive_columns,
     validate_read_only_sql,
 )
-from autocoding_agent.database_models import DataQuery, QueryResult
+from autocoding_agent.database_models import (
+    DEFAULT_QUERY_MAX_ROWS,
+    DEFAULT_QUERY_TIMEOUT_SECONDS,
+    DataQuery,
+    QueryResult,
+)
 
 
 class SQLiteDatabaseReader:
@@ -22,8 +27,8 @@ class SQLiteDatabaseReader:
     def __init__(
         self,
         path: str | Path,
-        max_rows: int = 50,
-        query_timeout_seconds: int = 5,
+        max_rows: int = DEFAULT_QUERY_MAX_ROWS,
+        query_timeout_seconds: int = DEFAULT_QUERY_TIMEOUT_SECONDS,
     ) -> None:
         resolved = Path(path).expanduser().resolve(strict=True)
         if not resolved.is_file():

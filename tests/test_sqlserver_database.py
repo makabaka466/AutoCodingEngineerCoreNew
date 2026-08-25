@@ -35,10 +35,11 @@ class FakeSecrets:
 
 
 class FakeCursor:
-    __slots__ = ("description", "executions")
+    __slots__ = ("description", "executions", "fetch_counts")
 
     def __init__(self) -> None:
         self.executions: list[tuple[str, tuple[object, ...]]] = []
+        self.fetch_counts: list[int] = []
         self.description = [("id",), ("email",), ("auth_token",)]
 
     def execute(self, sql: str, *parameters: object) -> FakeCursor:
@@ -46,6 +47,7 @@ class FakeCursor:
         return self
 
     def fetchmany(self, count: int) -> list[tuple[object, ...]]:
+        self.fetch_counts.append(count)
         return [
             (1, "one@example.com", "secret-one"),
             (2, "two@example.com", "secret-two"),
@@ -192,6 +194,26 @@ def test_sqlserver_reader_binds_parameters_bounds_rows_and_redacts() -> None:
     assert result.truncated is True
     assert result.redacted_columns == ["auth_token"]
     assert result.rows[0]["auth_token"] == "[REDACTED]"
+
+
+def test_sqlserver_reader_defaults_to_60_seconds_and_100_rows() -> None:
+    connection = FakeConnection()
+    reader = SQLServerDatabaseReader(
+        _config(),
+        connector=lambda *_args, **_kwargs: connection,
+    )
+    query = DataQuery(
+        name="bounded_default",
+        purpose="Use the shared default result boundary.",
+        sql="SELECT id, email, auth_token FROM dbo.users",
+    )
+
+    reader.execute(query)
+
+    assert query.max_rows == 100
+    assert reader.max_rows == 100
+    assert connection.timeout == 60
+    assert connection.cursor_value.fetch_counts == [101]
 
 
 def test_sqlserver_parameter_binding_ignores_colons_inside_literals() -> None:

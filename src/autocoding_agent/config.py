@@ -10,6 +10,11 @@ from pathlib import Path
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from autocoding_agent.database_models import (
+    DEFAULT_QUERY_MAX_ROWS,
+    DEFAULT_QUERY_TIMEOUT_SECONDS,
+)
+
 
 def _default_claude_command() -> str:
     """Prefer a directly executable Claude binary, especially on Windows."""
@@ -42,8 +47,12 @@ class Settings(BaseSettings):
     max_budget_usd: float | None = Field(default=None, gt=0)
     data_dir: Path = Field(default_factory=lambda: Path.home() / ".autocoding-agent")
     incident_sqlite_path: Path | None = None
-    database_max_rows: int = Field(default=50, ge=1, le=1000)
-    database_query_timeout_seconds: int = Field(default=5, ge=1, le=60)
+    database_max_rows: int = Field(default=DEFAULT_QUERY_MAX_ROWS, ge=1, le=1000)
+    database_query_timeout_seconds: int = Field(
+        default=DEFAULT_QUERY_TIMEOUT_SECONDS,
+        ge=1,
+        le=60,
+    )
     database_max_query_rounds: int = Field(default=2, ge=1, le=5)
     agent_max_replan_rounds: int = Field(default=2, ge=1, le=10)
     runtime_lease_seconds: int = Field(default=30, ge=5, le=3600)

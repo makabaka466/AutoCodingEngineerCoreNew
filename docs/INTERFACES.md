@@ -1,6 +1,6 @@
 # AutoCoding Engineer 接口与数据契约
 
-本文记录当前 `0.5.1` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
+本文记录当前 `0.5.2` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
 Runtime、持久化和状态契约。
 设计动机和运行流程见[架构说明](ARCHITECTURE.md)。
 
@@ -750,8 +750,8 @@ Web 模式。
 | `AUTO_CODING_MAX_BUDGET_USD` | `None` | 可选单轮 Claude Code 预算参数，必须大于 0 |
 | `AUTO_CODING_DATA_DIR` | `~/.autocoding-agent` | 会话与能力数据根目录 |
 | `AUTO_CODING_INCIDENT_SQLITE_PATH` | `None` | 可选的异常诊断 SQLite 文件路径；连接始终以只读模式打开 |
-| `AUTO_CODING_DATABASE_MAX_ROWS` | `50` | 两套流程每条查询的主机返回行数上限，范围 1–1000 |
-| `AUTO_CODING_DATABASE_QUERY_TIMEOUT_SECONDS` | `5` | SQL Server/SQLite 单条查询超时，范围 1–60 秒 |
+| `AUTO_CODING_DATABASE_MAX_ROWS` | `100` | 两套流程每条查询的主机返回行数上限，范围 1–1000；模型契约最多请求 100 行 |
+| `AUTO_CODING_DATABASE_QUERY_TIMEOUT_SECONDS` | `60` | SQL Server/SQLite 单条查询超时，范围 1–60 秒 |
 | `AUTO_CODING_DATABASE_MAX_QUERY_ROUNDS` | `2` | 每个开发或异常会话最多自动查询轮次，范围 1–5 |
 | `AUTO_CODING_AGENT_MAX_REPLAN_ROUNDS` | `2` | 验证失败后的最大重规划轮数，范围 1–10 |
 | `AUTO_CODING_RUNTIME_LEASE_SECONDS` | `30` | 启动恢复扫描使用的本地运行租约秒数，范围 5–3600 |
@@ -822,8 +822,9 @@ automation_candidate: bool
 ```
 
 `LocatedPage` 保存名称、可选 route、页面源码路径、相关后端路径和定位依据。所有源码路径必须
-是安全的工作区相对路径。`DataQuery` 保存名称、用途、SQL、命名参数和 1–100 的请求行数；
-数据库适配器仍会应用更小的主机上限。
+是安全的工作区相对路径。`DataQuery` 保存名称、用途、SQL、命名参数和 1–100 的请求行数，默认
+为 100；数据库适配器仍会应用更小的主机上限。结果数量未知时，开发与异常 Prompt 都要求模型
+先做 100 条有界采样并在 SQL 中使用适合方言的 `TOP`/`LIMIT`；已知少量结果时应使用更小限制。
 
 `IncidentOutcome.query_observations` 只包含查询名称、用途、SQL 指纹、参数名、返回行数、截断标记
 和脱敏列。SQL 参数值和原始业务行不会写入运行时数据库；结构化 SQL 只存在于当前模型决定和

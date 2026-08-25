@@ -15,7 +15,12 @@ from autocoding_agent.adapters.database_safety import (
     sensitive_columns,
     validate_read_only_sql,
 )
-from autocoding_agent.database_models import DataQuery, QueryResult
+from autocoding_agent.database_models import (
+    DEFAULT_QUERY_MAX_ROWS,
+    DEFAULT_QUERY_TIMEOUT_SECONDS,
+    DataQuery,
+    QueryResult,
+)
 from autocoding_agent.sqlserver_config import (
     SQLServerAuthentication,
     SQLServerConnectionConfig,
@@ -47,8 +52,8 @@ class SQLServerDatabaseReader:
         config: SQLServerConnectionConfig,
         password: str | None = None,
         *,
-        max_rows: int = 50,
-        query_timeout_seconds: int = 5,
+        max_rows: int = DEFAULT_QUERY_MAX_ROWS,
+        query_timeout_seconds: int = DEFAULT_QUERY_TIMEOUT_SECONDS,
         connector: Connector = pyodbc.connect,
     ) -> None:
         if max_rows < 1 or max_rows > 1000:

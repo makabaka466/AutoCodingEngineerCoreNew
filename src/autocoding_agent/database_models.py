@@ -12,6 +12,10 @@ from pydantic import BaseModel, Field, StringConstraints
 NonEmptyText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 QueryParameter = str | int | float | bool | None
 
+# Shared conservative defaults for database evidence in both workflows.
+DEFAULT_QUERY_MAX_ROWS = 100
+DEFAULT_QUERY_TIMEOUT_SECONDS = 60
+
 
 class DataQuery(BaseModel):
     """A minimal parameterized read-only query proposed by either workflow."""
@@ -20,7 +24,7 @@ class DataQuery(BaseModel):
     purpose: NonEmptyText
     sql: NonEmptyText
     parameters: dict[str, QueryParameter] = Field(default_factory=dict)
-    max_rows: int = Field(default=20, ge=1, le=100)
+    max_rows: int = Field(default=DEFAULT_QUERY_MAX_ROWS, ge=1, le=DEFAULT_QUERY_MAX_ROWS)
 
 
 class QueryResult(BaseModel):

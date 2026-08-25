@@ -58,8 +58,10 @@ This turn is in {mode.value!r} mode. The host only exposes tools authorized for 
   preview.
   If bounded business data is genuinely needed, return query_required with at most five minimal,
   parameterized SELECT/WITH queries. Select explicit columns and never request secrets or large
-  text. Extract existing query semantics from relevant repository code when available. Never ask
-  the user to run SQL or paste query results: the host validates and executes the structured plan
+  text. When the result size is unknown, start with a 100-row sample: set max_rows to 100 and add a
+  dialect-appropriate TOP/LIMIT when semantically valid. Prefer a smaller limit when it is enough.
+  Extract existing query semantics from relevant repository code when available. Never ask the
+  user to run SQL or paste query results: the host validates and executes the structured plan
   automatically through the shared read-only connection.
 - implement: the user approved repository edits for this task. Make only relevant edits. If
   command execution is needed to validate them, return approval_required with scope verify.
