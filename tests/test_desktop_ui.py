@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import tkinter as tk
 from collections.abc import Callable, Iterator
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
 
@@ -542,7 +542,7 @@ def test_system_settings_combines_model_and_shared_database_without_revealing_se
 def test_light_theme_and_workspace_row_are_part_of_composer(root: tk.Toplevel) -> None:
     client = DesktopClient(root, FakeApplication())  # type: ignore[arg-type]
 
-    assert COLORS["window"] == "#F5F7FB"
+    assert COLORS["window"] == "#EEF3FA"
     assert client.workspace_entry.master.master == client.composer_frame
     assert isinstance(client.send_button, RoundedButton)
     assert client.send_button.cget("background") == COLORS["accent"]
@@ -550,6 +550,32 @@ def test_light_theme_and_workspace_row_are_part_of_composer(root: tk.Toplevel) -
     assert client.browse_button.cget("background") == COLORS["panel"]
     assert client.transcript.tag_cget("user_message", "background") == COLORS["accent_soft"]
     assert client.status_badge.cget("highlightthickness") == 1
+
+
+def test_overview_uses_real_sessions_and_hides_at_compact_width(
+    root: tk.Toplevel,
+) -> None:
+    now = datetime.now(timezone.utc)
+    completed = _session(AgentStatus.COMPLETED)
+    completed.created_at = now
+    active = _session(AgentStatus.NEEDS_INPUT)
+    active.created_at = now
+    failed = _session(AgentStatus.FAILED)
+    failed.created_at = now - timedelta(days=1)
+    client = DesktopClient(
+        root,
+        FakeApplication([completed, active, failed]),  # type: ignore[arg-type]
+    )
+
+    assert client.overview_today_var.get() == "2"
+    assert client.overview_completed_var.get() == "1"
+    assert client.overview_active_var.get() == "1"
+    assert client.overview_rate_var.get() == "33%"
+    assert sum(client._trend_counts) == 3
+
+    event = type("ResizeEvent", (), {"widget": root, "width": 1000})()
+    client._update_responsive_layout(event)  # type: ignore[arg-type]
+    assert client.overview_panel.winfo_manager() == ""
 
 
 def test_flow_selector_shows_active_flow_and_reveals_incident_fields(

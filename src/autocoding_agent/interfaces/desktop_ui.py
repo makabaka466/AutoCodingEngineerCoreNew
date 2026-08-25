@@ -9,6 +9,7 @@ import threading
 import tkinter as tk
 import webbrowser
 from collections.abc import Callable
+from datetime import datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
@@ -43,17 +44,23 @@ from autocoding_agent.workspace_knowledge import (
 )
 
 COLORS = {
-    "window": "#F5F7FB",
+    "window": "#EEF3FA",
+    "ambient": "#E7EFFB",
     "sidebar": "#F8FAFC",
-    "surface": "#FFFFFF",
+    "surface": "#FCFDFE",
     "surface_subtle": "#F8FAFC",
+    "glass": "#F9FBFE",
+    "glass_floating": "#F5F8FC",
     "panel": "#F1F5F9",
-    "panel_hover": "#E8EEF6",
+    "panel_hover": "#E7EEF8",
     "input": "#FFFFFF",
-    "border": "#E2E8F0",
-    "border_strong": "#CBD5E1",
-    "text": "#0F172A",
-    "muted": "#64748B",
+    "border": "#FFFFFF",
+    "border_soft": "#DCE5F0",
+    "border_strong": "#CBD8E8",
+    "shadow": "#D9E3F0",
+    "shadow_soft": "#E5EBF4",
+    "text": "#111827",
+    "muted": "#475569",
     "subtle": "#94A3B8",
     "accent": "#2563EB",
     "accent_hover": "#1D4ED8",
@@ -67,6 +74,122 @@ COLORS = {
     "danger": "#DC2626",
     "danger_soft": "#FEF2F2",
 }
+
+
+def _rounded_points(
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    radius: float,
+) -> list[float]:
+    """Return one reusable smooth-polygon path for native rounded surfaces."""
+
+    return [
+        x1 + radius,
+        y1,
+        x2 - radius,
+        y1,
+        x2,
+        y1,
+        x2,
+        y1 + radius,
+        x2,
+        y2 - radius,
+        x2,
+        y2,
+        x2 - radius,
+        y2,
+        x1 + radius,
+        y2,
+        x1,
+        y2,
+        x1,
+        y2 - radius,
+        x1,
+        y1 + radius,
+        x1,
+        y1,
+    ]
+
+
+class GlassPanel(tk.Canvas):
+    """Rounded, layered surface that approximates frosted glass in native Tk."""
+
+    def __init__(
+        self,
+        parent: tk.Misc,
+        *,
+        fill: str = COLORS["glass"],
+        radius: int = 22,
+        padding: int = 14,
+        width: int = 0,
+        height: int = 0,
+        autosize_height: bool = False,
+    ) -> None:
+        super().__init__(
+            parent,
+            width=width,
+            height=height,
+            bg=parent.cget("bg"),
+            highlightthickness=0,
+            borderwidth=0,
+        )
+        self._fill = fill
+        self._radius = radius
+        self._padding = padding
+        self._autosize_height = autosize_height
+        self.content = tk.Frame(self, bg=fill)
+        self._content_window = self.create_window(
+            padding,
+            padding,
+            anchor="nw",
+            window=self.content,
+        )
+        self.bind("<Configure>", self._redraw)
+        if autosize_height:
+            self.content.bind("<Configure>", self._sync_height)
+            self.after_idle(self._apply_requested_height)
+        self._redraw()
+
+    def _sync_height(self, _event: tk.Event[tk.Misc]) -> None:
+        self.after_idle(self._apply_requested_height)
+
+    def _apply_requested_height(self) -> None:
+        requested = self.content.winfo_reqheight() + self._padding * 2 + 5
+        if requested > 1 and int(float(self.cget("height"))) != requested:
+            super().configure(height=requested)
+
+    def _redraw(self, _event: tk.Event[tk.Misc] | None = None) -> None:
+        width = max(self.winfo_width(), self.winfo_reqwidth(), 40)
+        height = max(self.winfo_height(), self.winfo_reqheight(), 40)
+        self.delete("glass_surface")
+        # Two quiet layers create depth without a hard border or heavy contrast.
+        self.create_polygon(
+            _rounded_points(5, 7, width - 2, height - 2, self._radius),
+            smooth=True,
+            splinesteps=24,
+            fill=COLORS["shadow_soft"],
+            outline="",
+            tags="glass_surface",
+        )
+        self.create_polygon(
+            _rounded_points(2, 2, width - 5, height - 5, self._radius),
+            smooth=True,
+            splinesteps=24,
+            fill=self._fill,
+            outline=COLORS["border"],
+            width=1,
+            tags="glass_surface",
+        )
+        self.tag_lower("glass_surface")
+        inner_width = max(1, width - self._padding * 2 - 5)
+        inner_height = max(1, height - self._padding * 2 - 5)
+        self.coords(self._content_window, self._padding, self._padding)
+        window_options: dict[str, object] = {"width": inner_width}
+        if not self._autosize_height:
+            window_options["height"] = inner_height
+        self.itemconfigure(self._content_window, **window_options)
 
 STATUS_PRESENTATION: dict[AgentStatus | None, tuple[str, str]] = {
     None: ("就绪", COLORS["muted"]),
@@ -176,8 +299,8 @@ class FlowPill(tk.Canvas):
     ) -> None:
         super().__init__(
             parent,
-            width=102,
-            height=38,
+            width=116,
+            height=44,
             bg=parent.cget("bg"),
             highlightthickness=0,
             borderwidth=0,
@@ -212,16 +335,16 @@ class FlowPill(tk.Canvas):
 
     def _redraw(self) -> None:
         self.delete("all")
-        fill = COLORS["accent"] if self._selected else COLORS["panel"]
-        outline = COLORS["accent"] if self._selected else COLORS["border"]
+        fill = COLORS["accent"] if self._selected else COLORS["glass_floating"]
+        outline = COLORS["accent"] if self._selected else COLORS["border_soft"]
         foreground = "#FFFFFF" if self._selected else COLORS["text"]
         if not self._enabled:
             fill = COLORS["panel"]
             foreground = "#98A2B3"
-        self._rounded_rectangle(2, 2, 100, 36, radius=17, fill=fill, outline=outline)
+        self._rounded_rectangle(2, 2, 114, 42, radius=19, fill=fill, outline=outline)
         self.create_text(
-            51,
-            19,
+            58,
+            22,
             text=self._label,
             fill=foreground,
             font=("Microsoft YaHei UI", 9, "bold"),
@@ -288,11 +411,11 @@ class RoundedButton(tk.Canvas):
         anchor: str = "center",
         width: int = 0,
     ) -> None:
-        requested_width = width or max(82, len(text) * 14 + 30)
+        requested_width = width or max(88, len(text) * 14 + 34)
         super().__init__(
             parent,
             width=requested_width,
-            height=38,
+            height=44,
             bg=parent.cget("bg"),
             highlightthickness=0,
             borderwidth=0,
@@ -398,13 +521,23 @@ class RoundedButton(tk.Canvas):
             fill if primary else COLORS["border_strong"]
         )
         canvas_width = max(self.winfo_width(), self.winfo_reqwidth())
-        canvas_height = max(self.winfo_height(), 38)
+        canvas_height = max(self.winfo_height(), 44)
+        if primary and state == "normal":
+            self._rounded_rectangle(
+                4,
+                5,
+                canvas_width - 2,
+                canvas_height - 1,
+                radius=14,
+                fill="#D5E2F7",
+                outline="",
+            )
         self._rounded_rectangle(
             2,
             2,
             canvas_width - 2,
             canvas_height - 2,
-            radius=11,
+            radius=14,
             fill=fill,
             outline=outline,
             width=2 if self._focused else 1,
@@ -429,33 +562,12 @@ class RoundedButton(tk.Canvas):
         radius: float,
         **kwargs: object,
     ) -> None:
-        points = [
-            x1 + radius,
-            y1,
-            x2 - radius,
-            y1,
-            x2,
-            y1,
-            x2,
-            y1 + radius,
-            x2,
-            y2 - radius,
-            x2,
-            y2,
-            x2 - radius,
-            y2,
-            x1 + radius,
-            y2,
-            x1,
-            y2,
-            x1,
-            y2 - radius,
-            x1,
-            y1 + radius,
-            x1,
-            y1,
-        ]
-        self.create_polygon(points, smooth=True, splinesteps=24, **kwargs)
+        self.create_polygon(
+            _rounded_points(x1, y1, x2, y2, radius),
+            smooth=True,
+            splinesteps=24,
+            **kwargs,
+        )
 
 
 class DesktopClient:
@@ -497,6 +609,11 @@ class DesktopClient:
             FlowKind.INCIDENT: None,
         }
         self._session_ids: list[str] = []
+        self._recent_sessions: list[AgentSession | IncidentSession] = []
+        self._trend_counts: list[int] = [0] * 7
+        self._overview_visible = True
+        self._model_ready_cache: bool | None = None
+        self._database_ready_cache: bool | None = None
         self._result_queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self._busy = False
         self._busy_label = ""
@@ -515,9 +632,18 @@ class DesktopClient:
         self.status_var = tk.StringVar(value="就绪")
         self.task_title_var = tk.StringVar(value="新开发任务")
         self.flow_caption_var = tk.StringVar(value="开发流程 · AI 工程工作台")
+        self.overview_today_var = tk.StringVar(value="0")
+        self.overview_completed_var = tk.StringVar(value="0")
+        self.overview_active_var = tk.StringVar(value="0")
+        self.overview_rate_var = tk.StringVar(value="0%")
+        self.engine_health_var = tk.StringVar(value="运行中")
+        self.knowledge_health_var = tk.StringVar(value="未配置")
+        self.model_health_var = tk.StringVar(value="未配置")
+        self.database_health_var = tk.StringVar(value="未配置")
 
         self._configure_window()
         self._build_layout()
+        self.root.bind("<Configure>", self._update_responsive_layout, add="+")
         self._refresh_flow_presentation()
         self._load_recent_sessions()
         self._render_welcome()
@@ -529,38 +655,45 @@ class DesktopClient:
         self.root.configure(bg=COLORS["window"])
         screen_width = self.root.winfo_screenwidth()
         screen_height = self.root.winfo_screenheight()
-        width = min(1240, max(860, screen_width - 48), screen_width - 16)
-        height = min(820, max(620, screen_height - 80), screen_height - 48)
+        width = min(1540, max(1080, screen_width - 96), screen_width - 24)
+        height = min(940, max(700, screen_height - 100), screen_height - 48)
         left = max(0, (screen_width - width) // 2)
         top = max(0, (screen_height - height) // 2)
         self.root.geometry(f"{width}x{height}+{left}+{top}")
-        self.root.minsize(min(860, width), min(620, height))
+        self.root.minsize(min(940, width), min(660, height))
 
     def _build_layout(self) -> None:
+        self.root.grid_columnconfigure(0, minsize=286)
         self.root.grid_columnconfigure(1, weight=1)
         self.root.grid_rowconfigure(0, weight=1)
         self._build_sidebar()
         self._build_conversation_area()
 
     def _build_sidebar(self) -> None:
-        sidebar = tk.Frame(
+        self.sidebar_panel = GlassPanel(
             self.root,
-            bg=COLORS["sidebar"],
-            width=268,
-            highlightthickness=1,
-            highlightbackground=COLORS["border"],
+            fill=COLORS["sidebar"],
+            radius=24,
+            padding=10,
+            width=274,
         )
-        sidebar.grid(row=0, column=0, sticky="nsew")
-        sidebar.grid_propagate(False)
+        self.sidebar_panel.grid(
+            row=0,
+            column=0,
+            sticky="nsew",
+            padx=(14, 8),
+            pady=14,
+        )
+        sidebar = self.sidebar_panel.content
         sidebar.grid_rowconfigure(3, weight=1)
         sidebar.grid_columnconfigure(0, weight=1)
 
         brand = tk.Frame(sidebar, bg=COLORS["sidebar"])
-        brand.grid(row=0, column=0, sticky="ew", padx=18, pady=(22, 18))
+        brand.grid(row=0, column=0, sticky="ew", padx=12, pady=(14, 18))
         tk.Label(
             brand,
             text="AC",
-            font=("Segoe UI", 11, "bold"),
+            font=("Segoe UI Variable Display", 12, "bold"),
             fg=COLORS["accent"],
             bg=COLORS["accent_soft"],
             width=3,
@@ -570,14 +703,15 @@ class DesktopClient:
         brand_copy.pack(side="left", padx=(10, 0), fill="x", expand=True)
         tk.Label(
             brand_copy,
-            text="AutoCoding",
-            font=("Microsoft YaHei UI", 10, "bold"),
+            text="AutoCoding\nEngineer",
+            font=("Segoe UI Variable Display", 11, "bold"),
             fg=COLORS["text"],
             bg=COLORS["sidebar"],
+            justify="left",
         ).pack(anchor="w")
         tk.Label(
             brand_copy,
-            text="ENGINEERING AGENT",
+            text="LOCAL AGENT WORKSPACE",
             font=("Segoe UI", 7, "bold"),
             fg=COLORS["subtle"],
             bg=COLORS["sidebar"],
@@ -587,11 +721,11 @@ class DesktopClient:
             sidebar,
             "新建任务",
             self._new_task,
-            background=COLORS["panel"],
-            active_background=COLORS["panel_hover"],
+            background=COLORS["accent"],
+            active_background=COLORS["accent_hover"],
             anchor="w",
         )
-        self.new_task_button.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 20))
+        self.new_task_button.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 22))
 
         tk.Label(
             sidebar,
@@ -599,17 +733,17 @@ class DesktopClient:
             font=("Microsoft YaHei UI", 8, "bold"),
             fg=COLORS["muted"],
             bg=COLORS["sidebar"],
-        ).grid(row=2, column=0, sticky="w", padx=18, pady=(2, 8))
+        ).grid(row=2, column=0, sticky="w", padx=12, pady=(2, 9))
 
         sessions_frame = tk.Frame(sidebar, bg=COLORS["sidebar"])
-        sessions_frame.grid(row=3, column=0, sticky="nsew", padx=(10, 5), pady=(0, 10))
+        sessions_frame.grid(row=3, column=0, sticky="nsew", padx=(7, 3), pady=(0, 12))
         sessions_frame.grid_rowconfigure(0, weight=1)
         sessions_frame.grid_columnconfigure(0, weight=1)
         self.sessions_list = tk.Listbox(
             sessions_frame,
             bg=COLORS["sidebar"],
             fg=COLORS["text"],
-            selectbackground=COLORS["accent_soft"],
+            selectbackground="#E3EDFF",
             selectforeground=COLORS["text"],
             borderwidth=0,
             highlightthickness=0,
@@ -634,7 +768,7 @@ class DesktopClient:
             active_background=COLORS["panel_hover"],
             anchor="w",
         )
-        self.model_config_button.grid(row=4, column=0, sticky="ew", padx=14, pady=(2, 6))
+        self.model_config_button.grid(row=4, column=0, sticky="ew", padx=8, pady=(2, 6))
 
         self.log_button = self._button(
             sidebar,
@@ -644,7 +778,7 @@ class DesktopClient:
             active_background=COLORS["panel_hover"],
             anchor="w",
         )
-        self.log_button.grid(row=5, column=0, sticky="ew", padx=14, pady=(0, 8))
+        self.log_button.grid(row=5, column=0, sticky="ew", padx=8, pady=(0, 8))
 
         tk.Label(
             sidebar,
@@ -652,37 +786,46 @@ class DesktopClient:
             font=("Microsoft YaHei UI", 8),
             fg=COLORS["muted"],
             bg=COLORS["sidebar"],
-        ).grid(row=6, column=0, sticky="w", padx=16, pady=(5, 15))
+        ).grid(row=6, column=0, sticky="w", padx=10, pady=(7, 8))
 
     def _build_conversation_area(self) -> None:
         main = tk.Frame(self.root, bg=COLORS["window"])
-        main.grid(row=0, column=1, sticky="nsew")
+        main.grid(row=0, column=1, sticky="nsew", padx=(0, 14), pady=14)
         main.grid_columnconfigure(0, weight=1)
+        main.grid_columnconfigure(1, minsize=320)
         main.grid_rowconfigure(1, weight=1)
+        self.main_frame = main
 
-        header = tk.Frame(main, bg=COLORS["surface"], height=84)
-        header.grid(row=0, column=0, sticky="ew")
+        self.header_panel = GlassPanel(
+            main,
+            fill=COLORS["glass"],
+            radius=24,
+            padding=14,
+            height=98,
+        )
+        self.header_panel.grid(row=0, column=0, columnspan=2, sticky="ew")
+        header = self.header_panel.content
         header.grid_columnconfigure(0, weight=1)
-        title_group = tk.Frame(header, bg=COLORS["surface"])
-        title_group.grid(row=0, column=0, sticky="w", padx=(32, 12), pady=(14, 12))
+        title_group = tk.Frame(header, bg=COLORS["glass"])
+        title_group.grid(row=0, column=0, sticky="w", padx=(10, 12), pady=(6, 4))
         tk.Label(
             title_group,
             textvariable=self.flow_caption_var,
-            font=("Segoe UI", 8, "bold"),
+            font=("Segoe UI Variable Text", 8, "bold"),
             fg=COLORS["muted"],
-            bg=COLORS["surface"],
+            bg=COLORS["glass"],
             anchor="w",
         ).pack(anchor="w")
         tk.Label(
             title_group,
             textvariable=self.task_title_var,
-            font=("Microsoft YaHei UI", 15, "bold"),
+            font=("Microsoft YaHei UI", 17, "bold"),
             fg=COLORS["text"],
-            bg=COLORS["surface"],
+            bg=COLORS["glass"],
             anchor="w",
         ).pack(anchor="w", pady=(2, 0))
-        flow_selector = tk.Frame(header, bg=COLORS["surface"])
-        flow_selector.grid(row=0, column=1, padx=(12, 18), pady=12)
+        flow_selector = tk.Frame(header, bg=COLORS["glass"])
+        flow_selector.grid(row=0, column=1, padx=(12, 12), pady=4)
         self.development_flow_button = FlowPill(
             flow_selector,
             "开发",
@@ -702,30 +845,41 @@ class DesktopClient:
             font=("Microsoft YaHei UI", 9, "bold"),
             fg=COLORS["muted"],
             bg=COLORS["surface_subtle"],
-            padx=12,
-            pady=7,
+            padx=14,
+            pady=8,
             highlightthickness=1,
-            highlightbackground=COLORS["border"],
+            highlightbackground=COLORS["border_soft"],
         )
-        self.status_badge.grid(row=0, column=2, sticky="e", padx=(0, 30), pady=12)
-        tk.Frame(main, bg=COLORS["border"], height=1).grid(row=0, column=0, sticky="sew")
+        self.status_badge.grid(row=0, column=2, sticky="e", padx=(0, 10), pady=4)
 
-        transcript_frame = tk.Frame(main, bg=COLORS["window"])
-        transcript_frame.grid(row=1, column=0, sticky="nsew", padx=(48, 30), pady=(18, 0))
+        self.transcript_panel = GlassPanel(
+            main,
+            fill=COLORS["glass"],
+            radius=24,
+            padding=12,
+        )
+        self.transcript_panel.grid(
+            row=1,
+            column=0,
+            sticky="nsew",
+            padx=(0, 14),
+            pady=(14, 0),
+        )
+        transcript_frame = self.transcript_panel.content
         transcript_frame.grid_rowconfigure(0, weight=1)
         transcript_frame.grid_columnconfigure(0, weight=1)
         self.transcript = tk.Text(
             transcript_frame,
             height=1,
-            bg=COLORS["window"],
+            bg=COLORS["glass"],
             fg=COLORS["text"],
             insertbackground=COLORS["text"],
             relief="flat",
             borderwidth=0,
             highlightthickness=0,
             wrap="word",
-            padx=14,
-            pady=12,
+            padx=16,
+            pady=14,
             spacing1=2,
             spacing3=6,
             font=("Microsoft YaHei UI", 10),
@@ -883,14 +1037,21 @@ class DesktopClient:
             active_background="#D8E4F7",
         )
 
-        self.composer_frame = tk.Frame(
+        self.composer_panel = GlassPanel(
             main,
-            bg=COLORS["input"],
-            highlightthickness=1,
-            highlightbackground=COLORS["border_strong"],
-            highlightcolor=COLORS["accent"],
+            fill=COLORS["input"],
+            radius=24,
+            padding=12,
+            autosize_height=True,
         )
-        self.composer_frame.grid(row=3, column=0, sticky="ew", padx=48, pady=(16, 10))
+        self.composer_panel.grid(
+            row=3,
+            column=0,
+            sticky="ew",
+            padx=(0, 14),
+            pady=(14, 10),
+        )
+        self.composer_frame = self.composer_panel.content
         self.composer_frame.grid_columnconfigure(0, weight=1)
 
         composer_header = tk.Frame(self.composer_frame, bg=COLORS["input"])
@@ -1023,6 +1184,19 @@ class DesktopClient:
             row=4, column=0, sticky="ew", padx=14, pady=(5, 0)
         )
         self.prompt_input.grid(row=5, column=0, sticky="ew", padx=2)
+        self.prompt_placeholder = tk.Label(
+            self.prompt_input,
+            text="描述任务目标、约束条件，以及相关文件或页面线索…",
+            font=("Microsoft YaHei UI", 9),
+            fg=COLORS["subtle"],
+            bg=COLORS["input"],
+            cursor="xterm",
+        )
+        self.prompt_placeholder.place(x=13, y=11)
+        self.prompt_placeholder.bind("<Button-1>", self._focus_prompt)
+        self.prompt_input.bind("<FocusIn>", self._hide_prompt_placeholder, add="+")
+        self.prompt_input.bind("<FocusOut>", self._restore_prompt_placeholder, add="+")
+        self.prompt_input.bind("<KeyPress>", self._hide_prompt_placeholder, add="+")
         self.prompt_input.bind("<Return>", self._on_return)
         self.prompt_input.bind("<Control-Return>", self._on_control_return)
         action_row = tk.Frame(self.composer_frame, bg=COLORS["input"])
@@ -1044,20 +1218,30 @@ class DesktopClient:
         )
         self.send_button.grid(row=0, column=1, sticky="e")
 
-        footer = tk.Frame(
+        self._build_overview_panel(main)
+
+        self.footer_panel = GlassPanel(
             main,
-            bg=COLORS["surface"],
-            highlightthickness=1,
-            highlightbackground=COLORS["border"],
+            fill=COLORS["glass_floating"],
+            radius=18,
+            padding=8,
+            autosize_height=True,
         )
-        footer.grid(row=4, column=0, sticky="ew", padx=48, pady=(0, 14))
+        self.footer_panel.grid(
+            row=4,
+            column=0,
+            columnspan=2,
+            sticky="ew",
+            pady=(0, 0),
+        )
+        footer = self.footer_panel.content
         footer.grid_columnconfigure(0, weight=1)
         tk.Label(
             footer,
             textvariable=self.status_var,
             font=("Microsoft YaHei UI", 8),
             fg=COLORS["muted"],
-            bg=COLORS["surface"],
+            bg=COLORS["glass_floating"],
             anchor="w",
         ).grid(row=0, column=0, sticky="w", padx=(12, 8), pady=7)
         tk.Label(
@@ -1065,8 +1249,294 @@ class DesktopClient:
             text="本地执行 · 过程可追溯 · 中断可恢复",
             font=("Microsoft YaHei UI", 8),
             fg=COLORS["muted"],
-            bg=COLORS["surface"],
+            bg=COLORS["glass_floating"],
         ).grid(row=0, column=1, sticky="e", padx=(8, 12), pady=7)
+
+    def _build_overview_panel(self, main: tk.Frame) -> None:
+        """Build a real-data operational overview inspired by the visual reference."""
+
+        self.overview_panel = GlassPanel(
+            main,
+            fill=COLORS["glass"],
+            radius=24,
+            padding=16,
+            width=318,
+        )
+        self.overview_panel.grid(
+            row=1,
+            column=1,
+            rowspan=3,
+            sticky="nsew",
+            pady=(14, 10),
+        )
+        overview = self.overview_panel.content
+        overview.grid_columnconfigure(0, weight=1)
+        overview.grid_rowconfigure(3, weight=1)
+
+        tk.Label(
+            overview,
+            text="任务概览",
+            font=("Microsoft YaHei UI", 12, "bold"),
+            fg=COLORS["text"],
+            bg=COLORS["glass"],
+        ).grid(row=0, column=0, sticky="w", padx=2, pady=(2, 12))
+
+        metrics = tk.Frame(overview, bg=COLORS["glass"])
+        metrics.grid(row=1, column=0, sticky="ew")
+        for column in (0, 1):
+            metrics.grid_columnconfigure(column, weight=1, uniform="overview")
+        self._overview_metric(metrics, 0, 0, "今日任务", self.overview_today_var)
+        self._overview_metric(metrics, 0, 1, "已完成", self.overview_completed_var)
+        self._overview_metric(metrics, 1, 0, "进行中", self.overview_active_var)
+        self._overview_metric(metrics, 1, 1, "完成率", self.overview_rate_var)
+
+        trend = tk.Frame(overview, bg=COLORS["glass"])
+        trend.grid(row=2, column=0, sticky="ew", pady=(18, 12))
+        trend.grid_columnconfigure(0, weight=1)
+        tk.Label(
+            trend,
+            text="任务趋势 · 近 7 天",
+            font=("Microsoft YaHei UI", 9, "bold"),
+            fg=COLORS["text"],
+            bg=COLORS["glass"],
+        ).grid(row=0, column=0, sticky="w", pady=(0, 7))
+        self.trend_canvas = tk.Canvas(
+            trend,
+            height=126,
+            bg=COLORS["glass_floating"],
+            highlightthickness=1,
+            highlightbackground=COLORS["border"],
+            borderwidth=0,
+        )
+        self.trend_canvas.grid(row=1, column=0, sticky="ew")
+        self.trend_canvas.bind("<Configure>", lambda _event: self._draw_task_trend())
+
+        runtime = tk.Frame(
+            overview,
+            bg=COLORS["glass_floating"],
+            highlightthickness=1,
+            highlightbackground=COLORS["border"],
+        )
+        runtime.grid(row=3, column=0, sticky="nsew", pady=(0, 2))
+        runtime.grid_columnconfigure(1, weight=1)
+        runtime.grid_rowconfigure(5, weight=1)
+        tk.Label(
+            runtime,
+            text="运行状态",
+            font=("Microsoft YaHei UI", 10, "bold"),
+            fg=COLORS["text"],
+            bg=COLORS["glass_floating"],
+        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=12, pady=(12, 8))
+        self.engine_health_label = self._runtime_status_row(
+            runtime, 1, "本地引擎", self.engine_health_var
+        )
+        self.knowledge_health_label = self._runtime_status_row(
+            runtime, 2, "项目知识", self.knowledge_health_var
+        )
+        self.model_health_label = self._runtime_status_row(
+            runtime, 3, "模型服务", self.model_health_var
+        )
+        self.database_health_label = self._runtime_status_row(
+            runtime, 4, "SQL Server", self.database_health_var
+        )
+        tk.Label(
+            runtime,
+            text="本机状态 · 不包含远端实时健康探测",
+            font=("Microsoft YaHei UI", 7),
+            fg=COLORS["subtle"],
+            bg=COLORS["glass_floating"],
+        ).grid(row=6, column=0, columnspan=2, sticky="s", padx=12, pady=(10, 12))
+
+    @staticmethod
+    def _overview_metric(
+        parent: tk.Frame,
+        row: int,
+        column: int,
+        title: str,
+        variable: tk.StringVar,
+    ) -> None:
+        card = tk.Frame(
+            parent,
+            bg=COLORS["glass_floating"],
+            highlightthickness=1,
+            highlightbackground=COLORS["border"],
+        )
+        card.grid(
+            row=row,
+            column=column,
+            sticky="nsew",
+            padx=(0, 5) if column == 0 else (5, 0),
+            pady=(0, 5) if row == 0 else (5, 0),
+        )
+        tk.Label(
+            card,
+            text=title,
+            font=("Microsoft YaHei UI", 8),
+            fg=COLORS["muted"],
+            bg=COLORS["glass_floating"],
+        ).pack(anchor="w", padx=12, pady=(10, 1))
+        tk.Label(
+            card,
+            textvariable=variable,
+            font=("Segoe UI Variable Display", 17, "bold"),
+            fg=COLORS["text"],
+            bg=COLORS["glass_floating"],
+        ).pack(anchor="w", padx=12, pady=(0, 10))
+
+    @staticmethod
+    def _runtime_status_row(
+        parent: tk.Frame,
+        row: int,
+        label: str,
+        variable: tk.StringVar,
+    ) -> tk.Label:
+        tk.Label(
+            parent,
+            text=label,
+            font=("Microsoft YaHei UI", 8),
+            fg=COLORS["muted"],
+            bg=COLORS["glass_floating"],
+        ).grid(row=row, column=0, sticky="w", padx=12, pady=5)
+        status_label = tk.Label(
+            parent,
+            textvariable=variable,
+            font=("Microsoft YaHei UI", 8, "bold"),
+            fg=COLORS["success"],
+            bg=COLORS["glass_floating"],
+        )
+        status_label.grid(row=row, column=1, sticky="e", padx=12, pady=5)
+        return status_label
+
+    def _refresh_overview(
+        self,
+        sessions: list[AgentSession | IncidentSession] | None = None,
+    ) -> None:
+        """Refresh dashboard values from durable sessions and local configuration."""
+
+        if sessions is not None:
+            self._recent_sessions = sessions
+        sessions = self._recent_sessions
+        today = datetime.now().astimezone().date()
+        completed = sum(
+            item.status in {AgentStatus.COMPLETED, IncidentStatus.COMPLETED}
+            for item in sessions
+        )
+        failed = sum(
+            item.status in {AgentStatus.FAILED, IncidentStatus.FAILED}
+            for item in sessions
+        )
+        active = max(0, len(sessions) - completed - failed)
+        today_count = sum(item.created_at.astimezone().date() == today for item in sessions)
+        rate = round(completed / len(sessions) * 100) if sessions else 0
+        self.overview_today_var.set(str(today_count))
+        self.overview_completed_var.set(str(completed))
+        self.overview_active_var.set(str(active))
+        self.overview_rate_var.set(f"{rate}%")
+
+        dates = [today - timedelta(days=offset) for offset in range(6, -1, -1)]
+        self._trend_counts = [
+            sum(item.created_at.astimezone().date() == day for item in sessions)
+            for day in dates
+        ]
+        self._draw_task_trend()
+
+        try:
+            knowledge_count = len(
+                self.knowledge_service.list_branches(self._knowledge_domain())
+            )
+        except Exception:
+            knowledge_count = 0
+        self.knowledge_health_var.set(
+            f"已连接 · {knowledge_count} 项" if knowledge_count else "未配置"
+        )
+        self.knowledge_health_label.configure(
+            fg=COLORS["success"] if knowledge_count else COLORS["muted"]
+        )
+
+        if self._model_ready_cache is None:
+            try:
+                self._model_ready_cache = self.setup_service.inspect().ready
+            except Exception:
+                self._model_ready_cache = False
+        model_ready = self._model_ready_cache
+        self.model_health_var.set("可用" if model_ready else "未配置")
+        self.model_health_label.configure(
+            fg=COLORS["success"] if model_ready else COLORS["muted"]
+        )
+
+        if self._database_ready_cache is None:
+            try:
+                self._database_ready_cache = self.sqlserver_service.inspect().configured
+            except Exception:
+                self._database_ready_cache = False
+        database_ready = self._database_ready_cache
+        self.database_health_var.set("已配置" if database_ready else "未配置")
+        self.database_health_label.configure(
+            fg=COLORS["success"] if database_ready else COLORS["muted"]
+        )
+
+    def _draw_task_trend(self) -> None:
+        if not hasattr(self, "trend_canvas"):
+            return
+        canvas = self.trend_canvas
+        canvas.delete("all")
+        width = max(canvas.winfo_width(), 240)
+        height = max(canvas.winfo_height(), 126)
+        left, top, right, bottom = 16, 18, width - 16, height - 24
+        for index in range(3):
+            y = top + (bottom - top) * index / 2
+            canvas.create_line(left, y, right, y, fill="#E3EAF3", width=1)
+        maximum = max(max(self._trend_counts, default=0), 1)
+        step = (right - left) / 6
+        points: list[float] = []
+        for index, count in enumerate(self._trend_counts):
+            x = left + index * step
+            y = bottom - (bottom - top) * count / maximum
+            points.extend([x, y])
+        if points:
+            fill_points = [left, bottom, *points, right, bottom]
+            canvas.create_polygon(fill_points, fill="#E7F0FF", outline="")
+            canvas.create_line(*points, fill=COLORS["accent"], width=2, smooth=True)
+            for index in range(0, len(points), 2):
+                canvas.create_oval(
+                    points[index] - 3,
+                    points[index + 1] - 3,
+                    points[index] + 3,
+                    points[index + 1] + 3,
+                    fill=COLORS["accent"],
+                    outline="#FFFFFF",
+                    width=1,
+                )
+        for offset in (6, 3, 0):
+            x = left + (6 - offset) * step
+            label = (datetime.now().astimezone().date() - timedelta(days=offset)).strftime(
+                "%m-%d"
+            )
+            canvas.create_text(
+                x,
+                height - 10,
+                text=label,
+                fill=COLORS["subtle"],
+                font=("Segoe UI", 7),
+            )
+
+    def _update_responsive_layout(self, event: tk.Event[tk.Misc]) -> None:
+        if event.widget is not self.root or not hasattr(self, "overview_panel"):
+            return
+        should_show = event.width >= 1180
+        if should_show == self._overview_visible:
+            return
+        self._overview_visible = should_show
+        if should_show:
+            self.main_frame.grid_columnconfigure(1, minsize=320)
+            self.overview_panel.grid()
+            self.header_panel.grid_configure(columnspan=2)
+            self.footer_panel.grid_configure(columnspan=2)
+        else:
+            self.overview_panel.grid_remove()
+            self.main_frame.grid_columnconfigure(1, minsize=0)
+            self.header_panel.grid_configure(columnspan=1)
+            self.footer_panel.grid_configure(columnspan=1)
 
     @staticmethod
     def _button(
@@ -1135,6 +1605,13 @@ class DesktopClient:
             self.incident_context_frame.grid_remove()
         else:
             self.incident_context_frame.grid()
+        self.prompt_placeholder.configure(
+            text=(
+                "描述任务目标、约束条件，以及相关文件或页面线索…"
+                if is_development
+                else "描述异常现象、影响范围，以及可复现条件…"
+            )
+        )
         self._refresh_project_options()
 
     def _knowledge_domain(self) -> KnowledgeDomain:
@@ -1153,6 +1630,8 @@ class DesktopClient:
         self.project_var.set(selected)
         self._flow_projects[self.flow] = selected
         self._refresh_project_path()
+        if hasattr(self, "knowledge_health_label"):
+            self._refresh_overview()
 
     def _on_project_selected(self, _event: tk.Event[tk.Misc]) -> None:
         self._flow_projects[self.flow] = self.project_var.get()
@@ -1362,12 +1841,13 @@ class DesktopClient:
             return
         self.sessions_list.delete(0, "end")
         self._session_ids = [item.id for item in sessions]
+        self._refresh_overview(sessions)
         for session in sessions:
             # Listbox has no multiline row spacing, so keep one readable line per task.
             label = (
-                session_list_label(session)
+                session_list_label(session, max_length=14)
                 if isinstance(session, AgentSession)
-                else incident_session_list_label(session)
+                else incident_session_list_label(session, max_length=14)
             )
             self.sessions_list.insert("end", label.replace("\n", "  "))
         if sessions and not self.session_id:
@@ -1449,6 +1929,7 @@ class DesktopClient:
         if not state.configured or state.config is None:
             self.status_var.set("SQL Server 连接尚未配置完成。")
             return
+        self._database_ready_cache = state.configured
         active_development = self._flow_session_ids[FlowKind.DEVELOPMENT]
         active_incident = self._flow_session_ids[FlowKind.INCIDENT]
         if not self._applications_injected and not active_development:
@@ -1460,6 +1941,7 @@ class DesktopClient:
             if active_development or active_incident
             else "SQL Server 配置已保存，两套流程立即共享。"
         )
+        self._refresh_overview()
         self._sync_controls()
 
     def _open_log_directory(self) -> None:
@@ -1491,6 +1973,7 @@ class DesktopClient:
         if not state.ready:
             self.status_var.set("模型配置尚未就绪。")
             return
+        self._model_ready_cache = state.ready
         if not self._applications_injected:
             if not self._flow_session_ids[FlowKind.DEVELOPMENT]:
                 self.application = self._build_current_development_application()
@@ -1499,6 +1982,7 @@ class DesktopClient:
             self._incident_application_injected = False
             self._load_recent_sessions(select_current=bool(self.session_id))
         self.status_var.set("模型配置已保存并立即生效。")
+        self._refresh_overview()
         self._sync_controls()
 
     def _incident_application_for_database(self, reference: str | None) -> IncidentApplication:
@@ -1857,7 +2341,13 @@ class DesktopClient:
             )
             self.recovery_replan_button.grid(row=0, column=2, padx=4)
             self.approve_button.grid_configure(column=3)
-            self.approval_frame.grid(row=2, column=0, sticky="ew", padx=48, pady=(10, 0))
+            self.approval_frame.grid(
+                row=2,
+                column=0,
+                sticky="ew",
+                padx=(0, 14),
+                pady=(10, 0),
+            )
             return
         if approval is None:
             self._hide_approval()
@@ -1891,7 +2381,13 @@ class DesktopClient:
         self.approval_text.insert("1.0", format_approval_details(approval))
         self.approval_text.yview_moveto(0.0)
         self.approval_text.configure(state="disabled")
-        self.approval_frame.grid(row=2, column=0, sticky="ew", padx=48, pady=(10, 0))
+        self.approval_frame.grid(
+            row=2,
+            column=0,
+            sticky="ew",
+            padx=(0, 14),
+            pady=(10, 0),
+        )
 
     def _show_incident_recovery(self, session: IncidentSession) -> None:
         self._approval_can_execute = True
@@ -1909,13 +2405,30 @@ class DesktopClient:
         self.recovery_replan_button.configure(text="重新调查", command=self._replan_recovery)
         self.recovery_replan_button.grid(row=0, column=2, padx=4)
         self.approve_button.grid_configure(column=3)
-        self.approval_frame.grid(row=2, column=0, sticky="ew", padx=48, pady=(10, 0))
+        self.approval_frame.grid(
+            row=2,
+            column=0,
+            sticky="ew",
+            padx=(0, 14),
+            pady=(10, 0),
+        )
 
     def _hide_approval(self) -> None:
         self._approval_can_execute = True
         self.recovery_replan_button.grid_remove()
         self.approve_button.grid_configure(column=2)
         self.approval_frame.grid_remove()
+
+    def _focus_prompt(self, _event: tk.Event[tk.Misc]) -> None:
+        self.prompt_input.focus_set()
+        self.prompt_placeholder.place_forget()
+
+    def _hide_prompt_placeholder(self, _event: tk.Event[tk.Misc]) -> None:
+        self.prompt_placeholder.place_forget()
+
+    def _restore_prompt_placeholder(self, _event: tk.Event[tk.Misc]) -> None:
+        if not self.prompt_input.get("1.0", "end-1c").strip():
+            self.prompt_placeholder.place(x=13, y=11)
 
     def _on_return(self, event: tk.Event[tk.Text]) -> str | None:
         if event.state & 0x0001:  # Shift+Enter keeps the normal newline behavior.

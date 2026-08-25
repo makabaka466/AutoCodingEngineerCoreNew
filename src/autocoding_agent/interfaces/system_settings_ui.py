@@ -28,12 +28,12 @@ from autocoding_agent.workspace_knowledge import (
     WorkspaceKnowledgeError,
 )
 
-WINDOW = "#F5F7FB"
-CARD = "#FFFFFF"
+WINDOW = "#EEF3FA"
+CARD = "#F9FBFE"
 PANEL = "#F1F5F9"
-BORDER = "#E2E8F0"
-TEXT = "#0F172A"
-MUTED = "#64748B"
+BORDER = "#DCE5F0"
+TEXT = "#111827"
+MUTED = "#475569"
 ACCENT = "#2563EB"
 SUCCESS = "#15803D"
 DANGER = "#DC2626"
@@ -124,7 +124,12 @@ class SystemSettingsDialog:
         style.configure(
             "Settings.TNotebook.Tab",
             font=("Microsoft YaHei UI", 9, "bold"),
-            padding=(18, 8),
+            padding=(20, 10),
+        )
+        style.map(
+            "Settings.TNotebook.Tab",
+            background=[("selected", "#FFFFFF"), ("active", "#EAF2FF")],
+            foreground=[("selected", ACCENT), ("!selected", MUTED)],
         )
         self.notebook = ttk.Notebook(
             self.window,
@@ -408,8 +413,11 @@ class SystemSettingsDialog:
             bg="#FFFFFF",
             insertbackground=TEXT,
             selectbackground="#BFDBFE",
-            relief="solid",
-            borderwidth=1,
+            relief="flat",
+            borderwidth=0,
+            highlightthickness=1,
+            highlightbackground=BORDER,
+            highlightcolor=ACCENT,
             padx=10,
             pady=8,
         )
@@ -804,8 +812,11 @@ class SystemSettingsDialog:
             fg=TEXT,
             bg="#FFFFFF",
             insertbackground=TEXT,
-            relief="solid",
-            borderwidth=1,
+            relief="flat",
+            borderwidth=0,
+            highlightthickness=1,
+            highlightbackground=BORDER,
+            highlightcolor=ACCENT,
         )
 
     @staticmethod
@@ -827,8 +838,8 @@ class SystemSettingsDialog:
             activebackground=background,
             relief="flat",
             borderwidth=0,
-            padx=16,
-            pady=8,
+            padx=18,
+            pady=10,
             cursor="hand2",
         )
 
