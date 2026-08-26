@@ -46,22 +46,22 @@
 能力文档仍按目标工作区和流程分开保存；每个 Session 对应一份自动能力 MD，后续完成内容以
 明确的工作轮次章节追加。新建任务会创建新 Session，因此会形成新的 MD。
 
-### 手动 RAG 知识库（当前为模拟接口）
+### 手动 RAG 知识库与 Voyage Embedding
 
 左侧“知识库管理”会发现 Project Knowledge、两套流程生成的 Capability，以及本项目的工程
 经验文档，但不会自动上传或索引。用户可以预览 Markdown 分块，手动选择“加入 / 重建索引”、
 移除索引或测试检索；移除只删除可重建索引，不删除源 Markdown。文档修改后会显示“内容已更新”，
 由用户决定何时重建。
 
-当前版本使用 `fake-hash-embedding-v1` 确定性伪 Embedding，并把模拟向量、Chunk 正文和 FTS5
-索引持久化到 `~/.autocoding-agent/rag/knowledge-fake.db`。它只用于打通管理、分块、过滤、混合
-检索、Agent 注入和审计流程，不代表 `Qwen3-Embedding-0.6B` 的语义效果。查询并行取得模拟
-Dense Top 20 与 BM25 Top 20，再通过 RRF 融合，默认向 Agent 返回最多 6 个 Chunk、每篇文档
-最多 2 个。开发与异常按领域、项目和工作区过滤；检索失败会留下事件并降级为无 RAG 继续执行。
+系统配置的“Embedding”页可保存 Voyage API 地址、模型名、输出维度和 API Key，并在后台测试
+连接。默认使用 `https://api.voyageai.com/v1/embeddings`、`voyage-code-4` 和 1024 维；文档与查询
+分别使用 `input_type=document/query`。API Key 保存到 Windows 凭据管理器，不回填到页面。
 
-`EmbeddingProvider` 和 `VectorStore` 已抽象为稳定端口。Ollama 与真实向量数据库就绪后，应新增
-正式 Adapter、使用独立模型/Collection 标识并对已选择文档执行全量重建，禁止与当前伪向量混用。
-任务完成生成的 MD 仍只进入“待加入”列表，不会自动上传。
+未配置 Voyage 时，系统继续使用明确标识的 `fake-hash-embedding-v1`，只验证工作流；配置完成后，
+知识库管理页显示正式 Voyage 模型身份。不同 API 地址、模型或维度使用独立的本地 SQLite 向量/
+FTS5 数据库，切换配置不会复用旧模拟向量，也不会自动上传 Markdown；用户需要重新选择文档并
+手动建立索引。查询同时取得 Dense Top 20 与 BM25 Top 20，再通过 RRF 融合，默认向 Agent 返回
+最多 6 个 Chunk、每篇文档最多 2 个。检索失败会留下事件并降级为无 RAG 继续执行。
 
 ## 异常处理流程
 
@@ -90,6 +90,7 @@ password/token/secret 等敏感列脱敏。接口已预留 `source` 与 `externa
 - Python 3.12+
 - Claude Code（客户端启动时自动检测；未检测到时会在配置页提示安装或选择 `claude.exe`）
 - 一个可用的 Anthropic 兼容端点、模型名和 API Key
+- 需要真实语义 RAG 时使用 Voyage Embedding 端点和 API Key；未配置时继续使用模拟检索器
 - 两套流程需要查询业务数据时，需安装 Microsoft ODBC Driver 17 或 18 for SQL Server
 
 安装项目依赖：
@@ -101,10 +102,11 @@ D:\python\python.exe -m pip install -e ".[dev,ui]"
 
 随后直接双击 `start.cmd`。客户端会先搜索并运行真实 `claude.exe --version`：如果 Claude Code、
 API 地址、模型名或 API Key 任一项未就绪，会先显示“系统配置”。同一个窗口包含“模型与
-Claude Code”“SQL Server”“项目路径”“MD 能力配置”四个页签：模型页支持自动检测和手动选择
-`claude.exe`；数据库页可以测试、保存和随时更换两套流程共用的只读连接；项目路径页保存两套
+Claude Code”“Embedding”“SQL Server”“项目路径”“MD 能力配置”五个页签：模型页支持自动检测
+和手动选择 `claude.exe`；Embedding 页配置、测试并保存 Voyage；数据库页可以测试、保存和随时
+更换两套流程共用的只读连接；项目路径页保存两套
 流程创建新任务时使用的代码根目录；MD 页按流程和二级路径管理可编辑知识，点击添加会创建路径
-及其同名 Markdown。API Key 与数据库密码都不会回填显示。
+及其同名 Markdown。生成模型 Key、Embedding Key 与数据库密码都不会回填显示。
 
 当前默认值适用于 DeepSeek Anthropic 兼容接口：
 
@@ -113,7 +115,7 @@ ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic
 AUTO_CODING_CLAUDE_MODEL=deepseek-v4-pro
 ```
 
-主界面左侧的“系统配置”可随时更换端点、模型、密钥、项目路径、SQL Server 连接或 MD 能力配置。`.env.example` 和旧的 PowerShell
+主界面左侧的“系统配置”可随时更换生成模型、Embedding、密钥、项目路径、SQL Server 连接或 MD 能力配置。`.env.example` 和旧的 PowerShell
 配置脚本仍保留给自动化或高级部署使用，不再是桌面客户端的必需步骤：
 
 ```powershell

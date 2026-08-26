@@ -3,12 +3,63 @@ from __future__ import annotations
 from pathlib import Path
 
 from autocoding_agent.config import Settings
+from autocoding_agent.embedding_setup import (
+    EmbeddingConfigStore,
+    EmbeddingConnectionConfig,
+    EmbeddingSetupService,
+)
 from autocoding_agent.knowledge_rag.chunker import MarkdownChunker
 from autocoding_agent.knowledge_rag.models import (
     KnowledgeDomain,
     KnowledgeIndexStatus,
 )
-from autocoding_agent.knowledge_rag.service import build_fake_rag_service
+from autocoding_agent.knowledge_rag.service import (
+    build_configured_rag_service,
+    build_fake_rag_service,
+)
+
+
+class FakeSecretStore:
+    def __init__(self) -> None:
+        self.secret: str | None = None
+
+    def get(self) -> str | None:
+        return self.secret
+
+    def set(self, secret: str) -> None:
+        self.secret = secret
+
+    def delete(self) -> None:
+        self.secret = None
+
+
+class StubVoyageProvider:
+    simulated = False
+
+    def __init__(self, *, config: EmbeddingConnectionConfig, api_key: str) -> None:
+        self.config = config
+        self.api_key = api_key
+        self.query_calls = 0
+
+    @property
+    def model_id(self) -> str:
+        return self.config.model_id
+
+    @property
+    def dimension(self) -> int:
+        return self.config.output_dimension
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return [self._vector(text) for text in texts]
+
+    def embed_query(self, query: str) -> list[float]:
+        self.query_calls += 1
+        return self._vector(query)
+
+    def _vector(self, text: str) -> list[float]:
+        vector = [0.0] * self.dimension
+        vector[sum(text.encode("utf-8")) % self.dimension] = 1.0
+        return vector
 
 
 def _project(tmp_path: Path) -> Path:
@@ -188,3 +239,56 @@ def test_capability_documents_are_discovered_as_pending(tmp_path: Path) -> None:
     assert found.project == "生物"
     assert found.workspace_id == "workspace-1"
     assert found.status == KnowledgeIndexStatus.PENDING
+
+
+def test_configured_voyage_service_uses_isolated_manual_index(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    settings = Settings(data_dir=tmp_path / "data")
+    setup = EmbeddingSetupService(
+        settings,
+        EmbeddingConfigStore(settings.data_dir, FakeSecretStore()),
+        provider_factory=StubVoyageProvider,
+    )
+    first_config = EmbeddingConnectionConfig(
+        model="voyage-code-4",
+        output_dimension=4,
+    )
+    first_state = setup.save(first_config, "voyage-secret")
+    first = build_configured_rag_service(
+        settings,
+        embedding_setup=setup,
+        project_root=project,
+    )
+    document = next(item for item in first.refresh_documents() if item.project == "生物")
+    empty = first.retrieve(
+        "Menu.URL",
+        domain=KnowledgeDomain.DEVELOPMENT,
+        project="生物",
+    )
+
+    first.index_document(document.id)
+
+    assert first_state.configured is True
+    assert empty.hits == []
+    assert first.embeddings.query_calls == 0
+    assert first.simulated is False
+    assert first.model_id == first_config.model_id
+    assert first.repository.database_path.name == (
+        f"knowledge-voyage-{first_config.index_id}.db"
+    )
+    assert first.repository.get_document(document.id).status == KnowledgeIndexStatus.INDEXED
+
+    second_config = first_config.model_copy(update={"model": "voyage-4"})
+    setup.save(second_config, "")
+    second = build_configured_rag_service(
+        settings,
+        embedding_setup=setup,
+        project_root=project,
+    )
+    second_document = next(
+        item for item in second.refresh_documents() if item.project == "生物"
+    )
+
+    assert second.repository.database_path != first.repository.database_path
+    assert second_document.status == KnowledgeIndexStatus.PENDING
+    assert Path(document.source_path).is_file()

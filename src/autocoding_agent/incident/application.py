@@ -18,7 +18,7 @@ from autocoding_agent.incident.engine import IncidentEngine
 from autocoding_agent.incident.models import IncidentOutcome, IncidentSession
 from autocoding_agent.incident.recovery import IncidentRecoveryManager
 from autocoding_agent.knowledge_rag.ports import KnowledgeRetriever
-from autocoding_agent.knowledge_rag.service import build_fake_rag_service
+from autocoding_agent.knowledge_rag.service import build_configured_rag_service
 from autocoding_agent.observability import configure_file_logging
 from autocoding_agent.ports.database import DatabaseReader
 from autocoding_agent.ports.structured_runtime import StructuredRuntime
@@ -139,7 +139,7 @@ def build_incident_application(
         knowledge_retriever=(
             knowledge_retriever
             if knowledge_retriever is not None
-            else build_fake_rag_service(configured)
+            else build_configured_rag_service(configured)
         ),
     )
     return IncidentApplication(engine, log_path, recovery_scan)

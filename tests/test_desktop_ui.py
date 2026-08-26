@@ -23,6 +23,10 @@ from autocoding_agent.core.models import (
 )
 from autocoding_agent.core.recovery.models import RecoveryAction
 from autocoding_agent.core.state_machine.models import TaskState
+from autocoding_agent.embedding_setup import (
+    EmbeddingConnectionConfig,
+    EmbeddingSetupState,
+)
 from autocoding_agent.incident.models import (
     IncidentOutcome,
     IncidentSession,
@@ -584,6 +588,14 @@ def test_system_settings_combines_model_and_shared_database_without_revealing_se
         ),
         has_password=True,
     )
+    embedding_state = EmbeddingSetupState(
+        config=EmbeddingConnectionConfig(
+            endpoint="https://api.voyageai.com/v1/embeddings",
+            model="voyage-code-4",
+            output_dimension=1024,
+        ),
+        has_api_key=True,
+    )
 
     class FakeModelService:
         def inspect(self, _command: str | None = None) -> ModelSetupState:
@@ -596,6 +608,39 @@ def test_system_settings_combines_model_and_shared_database_without_revealing_se
         def drivers(self) -> list[str]:
             return ["ODBC Driver 17 for SQL Server"]
 
+    class FakeEmbeddingService:
+        def __init__(self) -> None:
+            self.saved: list[tuple[EmbeddingConnectionConfig, str]] = []
+
+        def inspect(self) -> EmbeddingSetupState:
+            return embedding_state
+
+        def defaults(self) -> EmbeddingConnectionConfig:
+            return EmbeddingConnectionConfig()
+
+        def build_config(
+            self,
+            *,
+            endpoint: str,
+            model: str,
+            output_dimension: int | str,
+        ) -> EmbeddingConnectionConfig:
+            return EmbeddingConnectionConfig(
+                endpoint=endpoint,
+                model=model,
+                output_dimension=int(output_dimension),
+            )
+
+        def save(
+            self,
+            config: EmbeddingConnectionConfig,
+            api_key: str = "",
+        ) -> EmbeddingSetupState:
+            self.saved.append((config, api_key))
+            return embedding_state
+
+    embedding_service = FakeEmbeddingService()
+
     knowledge_service = MarkdownKnowledgeService(tmp_path / "state")
     knowledge_service.create_branch(KnowledgeDomain.DEVELOPMENT, "生物")
     workspace_service = FakeWorkspaceService(tmp_path)
@@ -603,12 +648,14 @@ def test_system_settings_combines_model_and_shared_database_without_revealing_se
         root,
         FakeModelService(),  # type: ignore[arg-type]
         FakeDatabaseService(),  # type: ignore[arg-type]
+        embedding_service=embedding_service,  # type: ignore[arg-type]
         knowledge_service=knowledge_service,
         workspace_service=workspace_service,  # type: ignore[arg-type]
     )
 
     assert [dialog.notebook.tab(tab, "text") for tab in dialog.notebook.tabs()] == [
         "模型与 Claude Code",
+        "Embedding",
         "SQL Server",
         "项目路径",
         "MD 能力配置",
@@ -618,6 +665,12 @@ def test_system_settings_combines_model_and_shared_database_without_revealing_se
     assert dialog.model_key_var.get() == ""
     assert dialog.model_key_entry.cget("show") != ""
     assert "留空保持不变" in dialog.model_key_hint_var.get()
+    assert dialog.embedding_endpoint_var.get() == "https://api.voyageai.com/v1/embeddings"
+    assert dialog.embedding_model_var.get() == "voyage-code-4"
+    assert dialog.embedding_dimension_var.get() == "1024"
+    assert dialog.embedding_key_var.get() == ""
+    assert dialog.embedding_key_entry.cget("show") != ""
+    assert "留空保持不变" in dialog.embedding_key_hint_var.get()
     assert dialog.db_server_var.get() == "sql.internal"
     assert dialog.db_name_var.get() == "orders"
     assert dialog.db_password_var.get() == ""
@@ -630,6 +683,16 @@ def test_system_settings_combines_model_and_shared_database_without_revealing_se
     assert dialog.database_test_button.winfo_manager() == "pack"
     assert dialog.database_save_button.winfo_manager() == "pack"
     assert dialog.model_save_button.winfo_manager() == ""
+    dialog.notebook.select(dialog.embedding_tab)
+    dialog._sync_footer_actions()
+    root.update_idletasks()
+    assert dialog.embedding_test_button.winfo_manager() == "pack"
+    assert dialog.embedding_save_button.winfo_manager() == "pack"
+    dialog.embedding_key_var.set("new-voyage-key")
+    dialog._save_embedding()
+    assert embedding_service.saved[0][0].model == "voyage-code-4"
+    assert embedding_service.saved[0][1] == "new-voyage-key"
+    assert dialog.embedding_key_var.get() == ""
     dialog.notebook.select(dialog.workspace_tab)
     dialog._sync_footer_actions()
     root.update_idletasks()

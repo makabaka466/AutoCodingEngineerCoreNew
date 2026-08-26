@@ -24,6 +24,7 @@ from autocoding_agent.knowledge_rag.models import (
 )
 from autocoding_agent.knowledge_rag.ports import EmbeddingProvider, VectorStore
 from autocoding_agent.knowledge_rag.repository import SQLiteKnowledgeRepository
+from autocoding_agent.knowledge_rag.vector_store import SQLiteVectorStore
 from autocoding_agent.workspace_knowledge import PROJECT_ROOT
 
 
@@ -132,6 +133,16 @@ class KnowledgeRAGService:
         if not clean_query:
             return KnowledgeRetrievalResult(
                 query=query,
+                embedding_model=self.embeddings.model_id,
+                simulated=self.embeddings.simulated,
+            )
+        if not self.repository.has_indexed_documents(
+            domain=domain.value,
+            project=project,
+            workspace_id=workspace_id,
+        ):
+            return KnowledgeRetrievalResult(
+                query=clean_query,
                 embedding_model=self.embeddings.model_id,
                 simulated=self.embeddings.simulated,
             )
@@ -316,6 +327,46 @@ def build_fake_rag_service(
         embeddings,
         SQLiteFakeVectorStore(database, embeddings.model_id),
         data_dir=configured.data_dir,
+        project_root=project_root,
+    )
+
+
+def build_voyage_rag_service(
+    embeddings: EmbeddingProvider,
+    settings: Settings | None = None,
+    *,
+    index_id: str,
+    project_root: str | Path = PROJECT_ROOT,
+) -> KnowledgeRAGService:
+    configured = settings or get_settings()
+    database = configured.data_dir / "rag" / f"knowledge-voyage-{index_id}.db"
+    return KnowledgeRAGService(
+        SQLiteKnowledgeRepository(database),
+        embeddings,
+        SQLiteVectorStore(database, embeddings.model_id),
+        data_dir=configured.data_dir,
+        project_root=project_root,
+    )
+
+
+def build_configured_rag_service(
+    settings: Settings | None = None,
+    *,
+    embedding_setup=None,
+    project_root: str | Path = PROJECT_ROOT,
+) -> KnowledgeRAGService:
+    configured = settings or get_settings()
+    if embedding_setup is None:
+        from autocoding_agent.embedding_setup import EmbeddingSetupService
+
+        embedding_setup = EmbeddingSetupService(configured)
+    provider = embedding_setup.provider()
+    if provider is None:
+        return build_fake_rag_service(configured, project_root=project_root)
+    return build_voyage_rag_service(
+        provider,
+        configured,
+        index_id=provider.config.index_id,
         project_root=project_root,
     )
 

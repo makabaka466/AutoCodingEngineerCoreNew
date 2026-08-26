@@ -90,10 +90,17 @@ class KnowledgeManagementDialog:
             header,
             text=(
                 "手动选择 Markdown 加入索引；源文件不会被移动或删除。"
+                + (
+                    ""
+                    if self.service.simulated
+                    else " 正式模式会把所选 Chunk 和检索文本发送到配置的 Embedding API。"
+                )
             ),
             font=("Microsoft YaHei UI", 9),
             fg=MUTED,
             bg=WINDOW,
+            justify="left",
+            wraplength=620,
         ).grid(row=1, column=0, sticky="w", pady=(4, 0))
         mode_text = (
             f"模拟模式 · {self.service.model_id} · 后续需用 Qwen3 全量重建"

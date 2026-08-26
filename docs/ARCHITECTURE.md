@@ -1,6 +1,6 @@
 # AutoCoding Engineer 架构说明
 
-本文描述当前 `0.6.0` 代码已经实现的架构。数据字段、公共方法和命令行参数见
+本文描述当前 `0.6.1` 代码已经实现的架构。数据字段、公共方法和命令行参数见
 [接口与数据契约](INTERFACES.md)。
 
 ## 1. 项目目标
@@ -66,7 +66,7 @@ flowchart TD
     TASK_STORE --> DATA["~/.autocoding-agent/runtime/agent-runtime.db"]
     ARTIFACT_STORE --> ARTIFACT_DATA["~/.autocoding-agent/tasks/id/artifacts"]
     INCIDENT_SQLITE --> DATA
-    RAG --> RAG_DB["~/.autocoding-agent/rag/knowledge-fake.db"]
+    RAG --> RAG_DB["~/.autocoding-agent/rag/knowledge-*.db"]
     RAG --> KNOWLEDGE_FILES["Project Knowledge / Capability / Engineering Experience MD"]
     INCIDENT_DATA["~/.autocoding-agent/incidents"] --> INCIDENT_SQLITE
     MEMORY --> DEV_MEMORY["workspaces/id/development"]
@@ -76,7 +76,7 @@ flowchart TD
 | 层 | 目录或模块 | 当前职责 |
 | --- | --- | --- |
 | 交付接口 | `interfaces/` | 把桌面客户端、CLI、Streamlit 操作转换成统一应用调用 |
-| 系统配置 | `model_setup.py`、`sqlserver_service.py`、`workspace_config.py`、`workspace_knowledge.py` | 统一管理 Claude Code、模型服务、项目路径、共用 SQL Server 与分流程 Markdown 知识 |
+| 系统配置 | `model_setup.py`、`embedding_setup.py`、`sqlserver_service.py`、`workspace_config.py`、`workspace_knowledge.py` | 统一管理 Claude Code、生成模型、Voyage Embedding、项目路径、共用 SQL Server 与分流程 Markdown 知识 |
 | 应用门面 | `application.py` | 组装依赖并暴露稳定的任务 API |
 | 异常领域 | `incident/` | 页面定位、只读查询计划、数据诊断及独立会话状态机 |
 | RAG | `knowledge_rag/` | 发现 Markdown、分块、建立可重建双索引、混合检索并按领域/项目/工作区过滤 |
@@ -373,16 +373,18 @@ Windows 子进程同时设置 `CREATE_NO_WINDOW` 和隐藏 `STARTUPINFO`，因�
 结束、会话 ID、模式、耗时、usage、超时或脱敏错误；不会把命令数组、用户消息、系统提示词
 或结构化业务结果写入日志。
 
-桌面入口在创建应用组合根之前显示统一的 `SystemSettingsDialog`，其中模型页调用
+桌面入口在创建应用组合根之前显示统一的 `SystemSettingsDialog`，其中生成模型页调用
 `ClaudeModelSetupService`。服务只接受真实可执行文件，
 用同样的隐藏窗口参数执行 `claude.exe --version`，并把检测结果转换成不包含密钥的
 `ModelSetupState`。只有 Claude Code、API 地址、模型名和密钥全部就绪后，客户端才创建
 `AgentApplication` 与 `IncidentApplication`。配置保存会清除进程内 Settings 缓存并重建两套
-应用门面，因此无需重启客户端；JSON 会话仍位于相同数据目录，不会丢失。
+应用门面，因此无需重启客户端；JSON 会话仍位于相同数据目录，不会丢失。Embedding 页通过
+`EmbeddingSetupService` 保存和测试 Voyage；配置变化为新索引和新任务构造新的 RAG 服务，
+活动任务继续使用启动时的 Retriever。
 
-Windows 上的 API Key 只持久化到当前用户的 `HKCU\Environment` 与当前进程环境，不写
-`.env`、会话或日志。SQL Server 非密钥字段写入本机数据目录，密码写入 Windows Credential
-Manager。配置页只获取两个 `has_*` 布尔值，已有密钥和密码都不会回填到 Tk 输入控件。
+Windows 上的生成模型 API Key 只持久化到当前用户的 `HKCU\Environment` 与当前进程环境，不写
+`.env`、会话或日志。Voyage API Key 与 SQL Server 密码写入 Windows Credential Manager，非密钥
+字段写入本机数据目录。配置页只获取 `has_*` 布尔状态，已有密钥和密码都不会回填到 Tk 输入控件。
 
 桌面端粘贴的异常截图由 `IncidentAttachmentStore` 读取，统一解码并转存为 PNG；每张图片使用
 独立 UUID 目录，位于 `<data_dir>/attachments/incident/`，不写目标仓库。主机限制单条消息最多
@@ -492,10 +494,15 @@ RAG 是 Project Knowledge、Capability 和 Engineering Experience Markdown 之�
 命中的内容以来源明确的“不可信、可能过期参考”加入只读调查 Prompt；模型仍必须用当前代码和
 已授权数据库证据复核。检索成功、空结果和失败分别形成可审计事件；检索故障不改变主任务状态。
 
-当前 `EmbeddingProvider` 是明确标识的 `fake-hash-embedding-v1`，`VectorStore` 是 SQLite 中的
-模拟向量表，二者与 Chunk/FTS5 共用 `knowledge-fake.db`。该实现只验证接口、持久化、过滤和
-工作流，不提供真实语义质量。未来 Ollama `Qwen3-Embedding-0.6B` 和向量数据库 Adapter 必须
-使用新的模型与索引标识，并对人工选择的文档全量重建；禁止把当前模拟向量迁移为正式索引。
+未配置 Voyage 时，`EmbeddingProvider` 使用明确标识的 `fake-hash-embedding-v1`；配置完成后，
+`VoyageEmbeddingProvider` 通过 Bearer 认证调用可编辑的 `/v1/embeddings` 端点，文档/查询分别
+发送 `input_type=document/query`，并校验数量、顺序、有限浮点数和输出维度。API 请求按最多
+128 个 Chunk 分批，失败错误不会包含 API Key。
+
+向量当前由 `SQLiteVectorStore` 本地持久化并线性计算点积，Chunk/FTS5 与向量使用同一个按
+provider/endpoint/model/dimension 指纹隔离的 `knowledge-voyage-<index-id>.db`。切换配置后新的
+数据库从 pending 状态开始，必须由用户手动全量重建；旧模拟/旧模型索引不迁移、不删除。外部
+向量数据库和大规模 ANN 检索仍是后续独立能力。
 
 ## 9. 持久化和路径边界
 

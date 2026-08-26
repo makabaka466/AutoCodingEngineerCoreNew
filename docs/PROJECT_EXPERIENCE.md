@@ -1,6 +1,6 @@
 # AutoCodingEngineerCoreNew 项目开发与工程经验
 
-> 文档基线：2026-08-26，项目版本 `0.6.0`。本文以当前代码为准，并明确区分“已实现”、
+> 文档基线：2026-08-26，项目版本 `0.6.1`。本文以当前代码为准，并明确区分“已实现”、
 > “当前限制”和“后续规划”。当前 Agent 已具备状态机、追加事件、运行记录、决策审计、
 > 任务产物、保守恢复，以及按会话持续沉淀开发/异常能力知识的 Runtime 内核。
 
@@ -86,10 +86,10 @@ AutoCodingEngineerCoreNew 的硬编码业务。MES 的目录结构、页面定�
 - 暂停、取消、启动扫描、保守恢复与有上限的验证失败重规划；
 - 结构化模型输出和宿主二次校验；
 - 开发、异常各自独立的 Capability 文档；
-- 人工选择的 Markdown 分块、FTS5 + 模拟向量混合检索、分领域 Agent 注入与检索审计；
+- 人工选择的 Markdown 分块、FTS5 + Voyage/模拟向量混合检索、分领域 Agent 注入与检索审计；
 - 本地脱敏日志、确定性测试和版本回退规则。
 
-尚未接入真实语义 Embedding/向量数据库、跨工作区工程经验治理、自动异常修复、钉钉接入、流式 Token 展示和
+尚未接入外部向量数据库、跨工作区工程经验治理、自动异常修复、钉钉接入、流式 Token 展示和
 多 Agent 编排。开发 Runtime 已支持进程级 interrupt，但还没有 Windows Job Object 级进程树治理。
 
 ---
@@ -1130,7 +1130,8 @@ powershell -ExecutionPolicy Bypass -File .\start.ps1 -Wait
 8. Capability 是“每完成任务一份文档”；RAG 能发现内容变化，但尚未做语义去重、合并和知识审批；
 9. 开发与异常已经共享 Event/Run/Recovery 基础设施，但两个 SQLite store 仍有部分事务代码重复，
    后续可提取通用持久化基类；
-10. 当前 Dense 排名来自 `fake-hash-embedding-v1`，只能验证检索管线，不能代表真实语义质量；
+10. Voyage 未配置时 Dense 排名仍来自 `fake-hash-embedding-v1`；正式 Voyage 已可用，但当前
+    SQLite VectorStore 是线性扫描，不适合大规模向量；
 11. Project Knowledge 依赖人工维护，当前没有冲突检测和版本审批；
 12. Tkinter 的 Markdown、富文本和可访问性能力有限；
 13. 异常流程只输出建议，尚未形成人工确认后的受控处置状态机；
@@ -1197,8 +1198,8 @@ verified Engineering Knowledge 才是可长期复用的正式经验。
 
 ### 14.4 检索方案
 
-`v0.6.0` 已先用 SQLite 保存 Chunk/FTS5，并以可替换的伪 Embedding 打通混合召回。真实
-Embedding 服务就绪后沿用同一结构升级为：
+`v0.6.0` 先用 SQLite 保存 Chunk/FTS5，并以可替换的伪 Embedding 打通混合召回；`v0.6.1`
+已接入可配置 Voyage。后续沿用同一结构升级外部向量数据库和评估层：
 
 ```text
 FTS 精确词检索 ─┐
@@ -1226,8 +1227,9 @@ FTS 精确词检索 ─┐
 
 ### 14.6 实施状态与建议路线
 
-- `v0.6.0（当前）`：人工管理、Markdown Chunk、FTS5 + 模拟向量 + RRF、开发/异常注入和引用事件；
-- 下一迭代：Ollama `Qwen3-Embedding-0.6B`、正式 VectorStore、健康检查、索引身份和全量重建；
+- `v0.6.0`：人工管理、Markdown Chunk、FTS5 + 模拟向量 + RRF、开发/异常注入和引用事件；
+- `v0.6.1（当前）`：Voyage 配置/测试、正式 REST Adapter、OS 密钥、索引隔离和手动重建；
+- 下一检索迭代：外部 VectorStore、健康检查、批量迁移和真实检索评测集；
 - 治理迭代：统一 Engineering Knowledge/Candidate 模型，把 Capability、异常与失败日志转为候选；
 - 质量迭代：脱敏、去重、冲突检测、陈旧标记、人工审核与基于证据的晋级；
 - 评估迭代：真实 reranker、检索评测集、引用准确率和任务效果反馈闭环。
@@ -1887,7 +1889,7 @@ Incident 消息/事件持久化、图片路径进入模型消息，以及桌面�
 粘贴和删除旧路径/页面栏。最终验证与发布记录见
 `docs/tasks/ACE-UI-008-configured-workspace-image-paste.md`。
 
-## 26. 手动混合 RAG 与可替换 Embedding 接口
+## 26. 手动混合 RAG 与可替换 Embedding 接口（v0.6.0 基线）
 
 ### 26.1 背景与业务理解
 
@@ -1901,7 +1903,7 @@ Engineering Experience 解决“过去有哪些可复用工程经验”。文档
 用户选择后才建立索引。原 Markdown 始终是知识原文，Chunk、FTS 和向量只是可以删除、重建的
 派生视图。
 
-本轮实施时 Ollama 与 `Qwen3-Embedding-0.6B` 尚在部署。为了不阻塞 UI、数据模型、分块、过滤、
+`v0.6.0` 实施时原计划部署 Ollama 与 `Qwen3-Embedding-0.6B`。为了不阻塞 UI、数据模型、分块、过滤、
 Agent 接入和审计验证，系统先实现一个确定性的伪接口；它必须在 UI、模型 ID、数据库文件名和
 返回元数据中显式标为 simulated，不能假装已经具备 Qwen3 的语义能力。
 
@@ -1971,20 +1973,105 @@ Ollama 或某个向量数据库 SDK。这样未来接入真实服务时只替换
 - ADR-054：检索按 domain/project/workspace 过滤，并限制每文档命中数量；
 - ADR-055：RAG 内容是带来源的不可信参考，当前代码和授权数据仍是事实依据；
 - ADR-056：检索失败采用可审计降级，不改变主任务完成/失败判断；
-- ADR-057：部署期使用独立的 `fake-hash-embedding-v1` 伪适配器，未来 Qwen3 索引必须全量重建，
-  不得重命名或复用模拟向量。
+- ADR-057：部署期使用独立的 `fake-hash-embedding-v1` 伪适配器，正式索引必须全量重建，不得
+  重命名或复用模拟向量；其中“正式 Provider 使用 Qwen3”的选择已由 ADR-065 取代。
 
 ### 26.6 当前边界、迁移与验证
 
-当前没有调用 Ollama、没有连接 Qdrant/pgvector 等正式向量数据库，也没有真实语义 reranker、
-自动知识审核、去重合并、敏感内容扫描和索引版本迁移工具。`Failure Knowledge` 已进入统一枚举，
-但发现器尚未接入独立来源。管理 UI 当前只在原生桌面客户端开放。
-
-Ollama 部署完成后的正确迁移顺序是：实现正式 `EmbeddingProvider`，验证模型名、维度、最大输入和
-归一化方式；实现正式 `VectorStore` 和健康检查；使用新的索引身份；让管理页显示真实服务状态；
-最后由用户对已选文档执行全量重建。切换前后都不修改源 Markdown。
+本节记录 `v0.6.0` 的模拟基线。`v0.6.1` 已用 Voyage 取代原定 Ollama/Qwen3 Provider，但仍没有
+连接 Qdrant/pgvector 等外部向量数据库，也没有真实 reranker、自动知识审核、去重合并、敏感内容
+扫描和批量索引迁移工具。`Failure Knowledge` 已进入统一枚举，但发现器尚未接入独立来源。
 
 确定性测试覆盖无自动索引、标题感知分块、手动建立双索引、精确词法命中、内容变更陈旧标记、
 移除索引保留源文件、Capability 领域元数据、开发/异常 Prompt 注入、检索事件、失败降级，以及
 知识管理页面默认待加入状态。完整发布证据见
 `docs/tasks/ACE-RAG-009-manual-hybrid-knowledge.md`。
+
+## 27. Voyage Embedding 配置与正式检索接入
+
+### 27.1 需求变化与业务判断
+
+用户将 Embedding 技术路线从本地 Ollama/Qwen3 调整为 Voyage，并要求像 DeepSeek 生成模型一样
+提供可编辑配置页面。这个变化验证了上一迭代“Provider 与 VectorStore 必须通过端口隔离”的价值：
+Chunk、文档状态、RRF、Agent 注入和管理页面无需重写，变化集中在配置、凭据、Embedding Adapter
+和组合根。
+
+Voyage 是外部 API。与本地模型不同，用户手动建立索引时，所选 Markdown Chunk 会发送到配置的
+Embedding 端点；Agent 检索时，当前查询文本也会发送。UI 必须把这个外部数据边界说清楚，不能
+只显示“正式模式”而隐藏数据离开本机的事实。源 Markdown 和索引选择仍由用户控制，任务完成不
+自动上传。
+
+### 27.2 配置与密钥设计
+
+`EmbeddingConnectionConfig` 只保存 provider、endpoint、model、output dimension 和 1–60 秒请求
+超时。默认采用 Voyage 官方端点、面向代码检索的 `voyage-code-4` 与 1024 维。endpoint 禁止携带
+用户名、密码、query 或 fragment，避免把秘密混入 URL、文件名或日志。
+
+非密钥配置原子写入 `<data_dir>/embedding/voyage.json`；API Key 通过 keyring 保存到 Windows
+Credential Manager。`EmbeddingSetupState` 只返回 `has_api_key`，页面密码框永远不回填；已有
+密钥时留空保存表示保留。连接测试可使用输入框中的临时 Key，但不会先保存它，也不会把它放入
+测试结果、异常文案或任务记录。
+
+系统配置新增第五个 “Embedding” 页签，包含 API 地址、模型、输出维度、API Key、“测试连接”和
+“保存 Embedding 配置”。网络测试在后台线程执行，Tk 主线程只轮询结果；测试期间禁用相关控件和
+关闭动作，避免同时保存两组状态。
+
+### 27.3 Voyage REST Adapter
+
+系统直接用 Python 标准库调用 REST，不增加 Voyage SDK 依赖。请求使用 Bearer 认证，文档批次
+设置 `input_type=document`，查询设置 `input_type=query`，同时发送 `truncation=true`、配置维度和
+`output_dtype=float`。文档按最多 128 条分批，既低于 API 的列表上限，也便于控制单次失败范围。
+
+响应校验包括：必须有 `data` 数组、条数与输入一致、index 从 0 连续、每个值可转成有限 float、
+每条向量维度与配置一致。任何 HTTP、网络、JSON 或契约错误都转换为安全的
+`VoyageEmbeddingError`；Authorization 不进入错误，服务端错误文本中即使意外回显密钥也会替换。
+
+### 27.4 索引身份与任务稳定性
+
+Embedding 空间不仅由模型名决定，也受 endpoint 和 output dimension 影响。系统对
+`provider + normalized endpoint + model + dimension` 计算 `index_id`，正式数据库使用
+`knowledge-voyage-<index-id>.db`，模型元数据使用带指纹的 `model_id`。因此：
+
+- 模拟向量不能被重命名为 Voyage；
+- 更换模型、代理端点或维度后，新服务看到源文档为 pending；
+- 用户必须在管理页明确执行全量重建；
+- 旧索引不会自动删除，可以通过原配置重新访问或按后续治理策略清理；
+- 源 Markdown 从未迁移或删除。
+
+Embedding 保存后，如果当前流程没有活动 Session，桌面立即重建两套应用门面；存在活动任务时，
+它继续使用原 Retriever，新配置从新任务生效。这与项目路径和 SQL Server 的 Session 快照原则
+一致，避免一轮对话中途切换向量空间。
+
+### 27.5 VectorStore 边界
+
+正式 Voyage 向量当前保存到 `SQLiteVectorStore`，按模型身份与文档替换，使用 float32 BLOB 和
+点积线性搜索。Voyage 向量已归一化时点积等价于余弦排序；宿主仍把 Dense 排名与 FTS5/BM25
+排名通过 RRF 融合。
+
+SQLite 方案适合当前人工选择、小规模知识库和架构验证，但它不是大规模 ANN 向量数据库。后续
+接入 Qdrant、pgvector 或其他 VectorStore 时应保持相同端口、metadata 过滤和 index identity，
+并单独实现健康检查、批量重建、删除一致性、备份和容量评估。
+
+### 27.6 技术选型与决策记录
+
+- ADR-058：正式 Embedding Provider 改用可配置 Voyage REST，保留 Fake 作为未配置降级；
+- ADR-059：默认 `voyage-code-4` / 1024 维，同时允许用户编辑模型和维度；
+- ADR-060：不引入 Voyage SDK，使用标准库实现最小 REST Adapter，减少依赖与升级耦合；
+- ADR-061：文档和查询分别使用 `input_type=document/query`，不混用检索角色；
+- ADR-062：Voyage API Key 保存到 OS 凭据，非密钥配置保存到用户数据目录；
+- ADR-063：连接测试可使用未保存 Key，但不得持久化、回填或记录；
+- ADR-064：endpoint/model/dimension 共同决定索引身份，配置变化必须人工全量重建；
+- ADR-065：原 Qwen3 Provider 计划由 Voyage 取代，Provider 端口继续保留未来替换能力；
+- ADR-066：配置变化不切换活动 Session 的 Retriever，只作用于新任务和新建索引；
+- ADR-067：当前正式向量先用本地 SQLite，外部向量数据库留作独立扩展。
+
+### 27.7 当前限制与验证策略
+
+当前没有 Voyage rerank、批处理 API、token 预估、速率限制退避、重试、请求费用统计或远程数据
+删除能力；连接测试与手动索引会产生真实 API 调用和可能的费用。系统不会自动上传完成文档，
+但用户选择正式索引后，Chunk 已经发送到所配置的外部端点，这必须纳入企业数据合规判断。
+
+确定性测试使用注入 Transport，不访问 Voyage 网络，覆盖 Authorization、document/query 角色、
+批次、顺序、维度、错误脱敏、配置原子保存、密钥保留、连接测试不落盘、索引身份隔离、切换后
+pending、系统设置五页签和密码框不回填。真实账号连通性由用户在配置页点击“测试连接”验证。
+完整发布证据见 `docs/tasks/ACE-RAG-010-voyage-embedding-config.md`。

@@ -263,6 +263,32 @@ class SQLiteKnowledgeRepository:
             ).fetchall()
         return {str(row["id"]) for row in rows}
 
+    def has_indexed_documents(
+        self,
+        *,
+        domain: str,
+        project: str | None,
+        workspace_id: str | None,
+    ) -> bool:
+        clauses = ["status = ?", "domain IN (?, ?)"]
+        parameters: list[object] = [
+            KnowledgeIndexStatus.INDEXED.value,
+            domain,
+            "general",
+        ]
+        if project:
+            clauses.append("(project IS NULL OR project = ?)")
+            parameters.append(project)
+        else:
+            clauses.append("project IS NULL")
+        if workspace_id:
+            clauses.append("(workspace_id IS NULL OR workspace_id = ?)")
+            parameters.append(workspace_id)
+        query = "SELECT 1 FROM knowledge_documents WHERE " + " AND ".join(clauses)
+        with self._connect() as connection:
+            row = connection.execute(f"{query} LIMIT 1", parameters).fetchone()
+        return row is not None
+
     def keyword_search(self, query: str, limit: int = 20) -> list[str]:
         terms = list(dict.fromkeys(_SEARCH_TOKEN.findall(query.casefold())))
         if not terms:

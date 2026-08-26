@@ -22,7 +22,7 @@ from autocoding_agent.core.recovery.models import RecoveryAction, RecoveryScanRe
 from autocoding_agent.core.runtime.models import RuntimeRunRecord
 from autocoding_agent.core.state_machine.machine import AgentStateMachine
 from autocoding_agent.knowledge_rag.ports import KnowledgeRetriever
-from autocoding_agent.knowledge_rag.service import build_fake_rag_service
+from autocoding_agent.knowledge_rag.service import build_configured_rag_service
 from autocoding_agent.observability import configure_file_logging
 from autocoding_agent.ports.database import DatabaseReader
 from autocoding_agent.ports.runtime import AgentRuntime
@@ -150,7 +150,7 @@ def build_application(
         knowledge_retriever=(
             knowledge_retriever
             if knowledge_retriever is not None
-            else build_fake_rag_service(configured)
+            else build_configured_rag_service(configured)
         ),
     )
     return AgentApplication(engine, log_path, recovery_scan)

@@ -1,6 +1,6 @@
 # AutoCoding Engineer 接口与数据契约
 
-本文记录当前 `0.6.0` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
+本文记录当前 `0.6.1` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
 Runtime、持久化和状态契约。
 设计动机和运行流程见[架构说明](ARCHITECTURE.md)。
 
@@ -741,10 +741,16 @@ autocoding-agent-client
 已经发生的副作用。Windows 下还会使用当前登录
 会话内的命名互斥量保持单实例，避免两个桌面窗口并发写同一会话存储。
 
-系统配置是一个窗口、四个页签。模型页字段为 Claude Code 路径、API 地址、模型名称和 API
+系统配置是一个窗口、五个页签。模型页字段为 Claude Code 路径、API 地址、模型名称和 API
 Key。Claude 路径会通过
 `--version` 验证；Key 控件始终为空并以密码形式输入，`has_api_key=true` 时留空保存表示保留
 原密钥。保存成功后当前进程立即生效，并重建两套 Runtime，但不删除已有会话。
+
+Embedding 页字段为 API 地址、模型名称、输出维度和 API Key，默认分别为
+`https://api.voyageai.com/v1/embeddings`、`voyage-code-4` 和 1024。API Key 不回填，留空保存
+表示保留系统凭据；“测试连接”在后台发送一条 query embedding 并校验返回维度。保存后的配置
+用于知识库管理和两套流程的新任务，活动任务保持原 Retriever。端点、模型或维度变化会产生新的
+索引 ID，不自动复用或删除旧索引。
 
 SQL Server 页包含服务器、端口、数据库、已安装 ODBC 驱动、Windows/SQL Server 认证、
 用户名、密码、加密和信任证书选项，并提供后台“测试连接”。非密钥字段保存在
@@ -944,12 +950,49 @@ class KnowledgeRetriever(Protocol):
     def retrieve(self, query: str, *, domain, project=None, workspace_id=None, limit=6): ...
 ```
 
-当前 `FakeEmbeddingProvider` 的 `model_id` 固定为 `fake-hash-embedding-v1`、维度为 96、
-`simulated=True`；同样的文本总是得到相同向量，但不承诺真实语义相似度。
-`SQLiteFakeVectorStore` 只保存这个模型的模拟向量。后续 Ollama/向量数据库实现必须遵守相同
-端口并使用不同索引身份。
+`FakeEmbeddingProvider` 的 `model_id` 固定为 `fake-hash-embedding-v1`、维度为 96、
+`simulated=True`，只在 Voyage 未配置时使用；同样文本得到相同向量，但不承诺语义相似度。
+`VoyageEmbeddingProvider` 的 `model_id` 由 provider、模型、维度和 endpoint 指纹组成，
+`simulated=False`。两者遵守相同端口但使用不同数据库和索引身份。
 
-### 12.2 文档与 Chunk 契约
+### 12.2 Voyage 配置与 REST 契约
+
+`EmbeddingConnectionConfig` 是不含密钥的 Pydantic 模型：
+
+```text
+provider = "voyage"
+endpoint
+model
+output_dimension
+request_timeout_seconds (1..60)
+index_id / model_id（派生，只用于索引隔离）
+```
+
+`EmbeddingConfigStore` 把配置原子写入 `<data_dir>/embedding/voyage.json`，API Key 使用 keyring
+保存到 OS 凭据管理器。`EmbeddingSetupState` 只返回 `config` 和 `has_api_key`，不提供密钥字段。
+`EmbeddingSetupService` 提供 `inspect/defaults/build_config/save/test/provider`。
+
+Voyage Adapter 发送：
+
+```http
+POST <configured endpoint>
+Authorization: Bearer <secret>
+Content-Type: application/json
+
+{
+  "input": ["..."],
+  "model": "voyage-code-4",
+  "input_type": "document | query",
+  "truncation": true,
+  "output_dimension": 1024,
+  "output_dtype": "float"
+}
+```
+
+文档最多按 128 条分批；响应 `data` 必须数量一致、index 连续且每个向量包含配置维度的有限数字。
+HTTP、网络和契约错误转换成不含 Authorization/API Key 的 `VoyageEmbeddingError`。
+
+### 12.3 文档与 Chunk 契约
 
 `KnowledgeDocument` 保存源路径、展示路径、标题、来源类型、领域、项目、工作区、当前/已索引
 Hash、索引状态、Chunk 数量、Embedding 模型和时间。状态为：
@@ -961,20 +1004,22 @@ Failure Knowledge 只预留模型值。
 内容 Hash、近似 token 数、领域/项目/工作区/来源和源路径。Embedding text 在正文前增加文档、
 来源、领域、项目和标题元数据，但 FTS 与返回 Prompt 使用可读 Chunk 正文。
 
-### 12.3 `KnowledgeRAGService`
+### 12.4 `KnowledgeRAGService`
 
 | 方法 | 行为 |
 | --- | --- |
 | `refresh_documents()` | 发现 Project Knowledge、工程经验和开发/异常 Capability；同步状态但不自动索引 |
 | `preview_chunks(document_id)` | 只做 Markdown 分块预览，不写索引 |
-| `index_document(document_id)` | 重建该文档的模拟向量、Chunk 和 FTS5，并返回 `KnowledgeIndexReceipt` |
+| `index_document(document_id)` | 使用当前 Embedding 重建该文档的向量、Chunk 和 FTS5，并返回 `KnowledgeIndexReceipt` |
 | `remove_document(document_id)` | 删除该文档的 Chunk/FTS/向量记录，保留源 Markdown |
 | `retrieve(query, domain, project=None, workspace_id=None, limit=6)` | Dense + BM25 + RRF 混合检索，返回带来源的 `KnowledgeRetrievalResult` |
 
 `build_fake_rag_service(settings, project_root=...)` 使用
-`<data_dir>/rag/knowledge-fake.db`。索引是派生数据，可从源 Markdown 全量重建。
+`<data_dir>/rag/knowledge-fake.db`。`build_voyage_rag_service(...)` 使用
+`<data_dir>/rag/knowledge-voyage-<index-id>.db`；`build_configured_rag_service(...)` 在 Voyage 已配置
+时选择正式服务，否则选择 Fake。所有索引都是派生数据，可从源 Markdown 全量重建。
 
-### 12.4 Agent 注入与事件
+### 12.5 Agent 注入与事件
 
 开发 Engine 只在 `inspect` 模式调用 `KnowledgeRetriever`；异常 Engine 在每个用户调查 cycle 开始
 检索一次，并把同一上下文沿数据库查询循环继续传给模型。命中内容置于
@@ -984,5 +1029,5 @@ Failure Knowledge 只预留模型值。
 - `knowledge_retrieval_failed`：记录脱敏截断后的错误，主任务继续执行；
 - 当前不把向量、完整 Chunk 正文或用户查询复制进 Event Store。
 
-桌面“知识库管理”提供刷新、分块预览、多选加入/重建、移除和测试检索。当前模式徽标会明确
-显示“模拟模式”，任务完成生成的新 MD 只成为待加入文档。
+桌面“知识库管理”提供刷新、分块预览、多选加入/重建、移除和测试检索。模式徽标会明确显示
+“模拟模式”或当前正式 Voyage 模型 ID；任务完成生成的新 MD 只成为待加入文档。

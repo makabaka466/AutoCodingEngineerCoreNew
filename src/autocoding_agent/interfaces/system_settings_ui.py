@@ -9,6 +9,13 @@ from collections.abc import Callable
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
+from autocoding_agent.embedding_setup import (
+    SUPPORTED_EMBEDDING_DIMENSIONS,
+    EmbeddingConnectionConfig,
+    EmbeddingSetupError,
+    EmbeddingSetupService,
+    EmbeddingSetupState,
+)
 from autocoding_agent.model_setup import (
     ClaudeModelSetupService,
     ModelSetupError,
@@ -54,10 +61,12 @@ class SystemSettingsDialog:
         database_service: SQLServerConnectionService,
         *,
         initial_section: str = "model",
+        embedding_service: EmbeddingSetupService | None = None,
         knowledge_service: MarkdownKnowledgeService | None = None,
         workspace_service: WorkspaceConfigService | None = None,
         required_model_setup: bool = False,
         on_model_saved: Callable[[ModelSetupState], None] | None = None,
+        on_embedding_saved: Callable[[EmbeddingSetupState], None] | None = None,
         on_database_saved: Callable[[SQLServerConfigState], None] | None = None,
         on_knowledge_changed: Callable[[], None] | None = None,
         on_workspace_saved: Callable[[WorkspaceConfigState], None] | None = None,
@@ -65,18 +74,23 @@ class SystemSettingsDialog:
         self.parent = parent
         self.model_service = model_service
         self.database_service = database_service
+        self.embedding_service = embedding_service or EmbeddingSetupService()
         self.knowledge_service = knowledge_service or MarkdownKnowledgeService()
         self.workspace_service = workspace_service or WorkspaceConfigService()
         self.on_model_saved = on_model_saved
+        self.on_embedding_saved = on_embedding_saved
         self.on_database_saved = on_database_saved
         self.on_knowledge_changed = on_knowledge_changed
         self.on_workspace_saved = on_workspace_saved
         self.required_model_setup = required_model_setup
         self.model_state = model_service.inspect()
+        self.embedding_state = self.embedding_service.inspect()
         self.database_state = database_service.inspect()
         self.workspace_state = self.workspace_service.inspect()
         self._test_results: queue.Queue[tuple[str, object]] = queue.Queue()
+        self._embedding_test_results: queue.Queue[tuple[str, object]] = queue.Queue()
         self._testing_database = False
+        self._testing_embedding = False
 
         self.window = tk.Toplevel(parent)
         self.window.title("系统配置 · AutoCoding Engineer")
@@ -90,10 +104,12 @@ class SystemSettingsDialog:
 
         self._build()
         self._load_model_state(self.model_state)
+        self._load_embedding_state(self.embedding_state)
         self._load_database_state(self.database_state)
         self._load_workspace_state(self.workspace_state)
         selected_tab = {
             "database": self.database_tab,
+            "embedding": self.embedding_tab,
             "workspace": self.workspace_tab,
             "knowledge": self.knowledge_tab,
         }.get(initial_section, self.model_tab)
@@ -125,7 +141,7 @@ class SystemSettingsDialog:
         ).pack(anchor="w")
         tk.Label(
             header,
-            text="模型、数据库、项目路径和工作区 Markdown 知识在这里统一管理。",
+            text="生成模型、Embedding、数据库、项目路径和 Markdown 知识在这里统一管理。",
             font=("Microsoft YaHei UI", 9),
             fg=MUTED,
             bg=WINDOW,
@@ -149,14 +165,17 @@ class SystemSettingsDialog:
         )
         self.notebook.grid(row=1, column=0, sticky="nsew", padx=30, pady=(0, 12))
         self.model_tab = tk.Frame(self.notebook, bg=CARD)
+        self.embedding_tab = tk.Frame(self.notebook, bg=CARD)
         self.database_tab = tk.Frame(self.notebook, bg=CARD)
         self.workspace_tab = tk.Frame(self.notebook, bg=CARD)
         self.knowledge_tab = tk.Frame(self.notebook, bg=CARD)
         self.notebook.add(self.model_tab, text="模型与 Claude Code")
+        self.notebook.add(self.embedding_tab, text="Embedding")
         self.notebook.add(self.database_tab, text="SQL Server")
         self.notebook.add(self.workspace_tab, text="项目路径")
         self.notebook.add(self.knowledge_tab, text="MD 能力配置")
         self._build_model_tab()
+        self._build_embedding_tab()
         self._build_database_tab()
         self._build_workspace_tab()
         self._build_knowledge_tab()
@@ -166,6 +185,12 @@ class SystemSettingsDialog:
         self.close_button = self._button(footer, "关闭", self._close, PANEL, TEXT)
         self.model_save_button = self._button(
             footer, "保存模型配置", self._save_model, ACCENT, "#FFFFFF"
+        )
+        self.embedding_test_button = self._button(
+            footer, "测试连接", self._test_embedding, PANEL, TEXT
+        )
+        self.embedding_save_button = self._button(
+            footer, "保存 Embedding 配置", self._save_embedding, ACCENT, "#FFFFFF"
         )
         self.database_test_button = self._button(
             footer, "测试连接", self._test_database, PANEL, TEXT
@@ -232,6 +257,62 @@ class SystemSettingsDialog:
             fg=MUTED,
             bg=CARD,
             anchor="w",
+        ).grid(row=10, column=0, sticky="ew", padx=26, pady=(0, 12))
+
+    def _build_embedding_tab(self) -> None:
+        tab = self.embedding_tab
+        tab.grid_columnconfigure(0, weight=1)
+        self.embedding_endpoint_var = tk.StringVar()
+        self.embedding_model_var = tk.StringVar()
+        self.embedding_dimension_var = tk.StringVar()
+        self.embedding_key_var = tk.StringVar()
+        self.embedding_status_var = tk.StringVar()
+        self.embedding_key_hint_var = tk.StringVar()
+
+        self.embedding_status_label = self._status(tab, self.embedding_status_var, 0)
+        self._field_label(tab, "API 地址", 1)
+        self.embedding_endpoint_entry = self._entry(tab, self.embedding_endpoint_var)
+        self.embedding_endpoint_entry.grid(
+            row=2, column=0, sticky="ew", padx=26, ipady=5
+        )
+        self._field_label(tab, "Embedding 模型", 3)
+        self.embedding_model_entry = self._entry(tab, self.embedding_model_var)
+        self.embedding_model_entry.grid(row=4, column=0, sticky="ew", padx=26, ipady=5)
+        self._field_label(tab, "输出维度", 5)
+        self.embedding_dimension_combo = ttk.Combobox(
+            tab,
+            textvariable=self.embedding_dimension_var,
+            values=[str(value) for value in SUPPORTED_EMBEDDING_DIMENSIONS],
+            state="normal",
+            font=("Microsoft YaHei UI", 9),
+        )
+        self.embedding_dimension_combo.grid(
+            row=6, column=0, sticky="ew", padx=26, ipady=4
+        )
+        self._field_label(tab, "API Key", 7)
+        self.embedding_key_entry = self._entry(tab, self.embedding_key_var, show="●")
+        self.embedding_key_entry.grid(row=8, column=0, sticky="ew", padx=26, ipady=5)
+        tk.Label(
+            tab,
+            textvariable=self.embedding_key_hint_var,
+            font=("Microsoft YaHei UI", 8),
+            fg=MUTED,
+            bg=CARD,
+            anchor="w",
+        ).grid(row=9, column=0, sticky="ew", padx=26, pady=(4, 6))
+        tk.Label(
+            tab,
+            text=(
+                "默认使用 voyage-code-4。API Key 保存到 Windows 凭据管理器，不写入项目或日志。\n"
+                "更换 API 地址、模型或维度会创建独立索引；已有 Markdown 需要在知识库管理页"
+                "手动重建。建立索引会把所选 Chunk、检索会把查询文本发送到该 API。"
+            ),
+            justify="left",
+            font=("Microsoft YaHei UI", 8),
+            fg=MUTED,
+            bg=CARD,
+            anchor="w",
+            wraplength=850,
         ).grid(row=10, column=0, sticky="ew", padx=26, pady=(0, 12))
 
     def _build_database_tab(self) -> None:
@@ -479,6 +560,8 @@ class SystemSettingsDialog:
         for button in (
             self.close_button,
             self.model_save_button,
+            self.embedding_test_button,
+            self.embedding_save_button,
             self.database_test_button,
             self.database_save_button,
             self.workspace_save_button,
@@ -489,6 +572,9 @@ class SystemSettingsDialog:
         if self.notebook.select() == str(self.database_tab):
             self.database_save_button.pack(side="right", padx=(0, 8))
             self.database_test_button.pack(side="right", padx=(0, 8))
+        elif self.notebook.select() == str(self.embedding_tab):
+            self.embedding_save_button.pack(side="right", padx=(0, 8))
+            self.embedding_test_button.pack(side="right", padx=(0, 8))
         elif self.notebook.select() == str(self.workspace_tab):
             self.workspace_save_button.pack(side="right", padx=(0, 8))
         elif self.notebook.select() == str(self.knowledge_tab):
@@ -512,6 +598,27 @@ class SystemSettingsDialog:
         self.model_key_hint_var.set(
             "已配置密钥；留空保持不变。" if state.has_api_key else "请输入 API Key。"
         )
+
+    def _load_embedding_state(self, state: EmbeddingSetupState) -> None:
+        self.embedding_state = state
+        config = state.config or self.embedding_service.defaults()
+        self.embedding_endpoint_var.set(config.endpoint)
+        self.embedding_model_var.set(config.model)
+        self.embedding_dimension_var.set(str(config.output_dimension))
+        self.embedding_key_var.set("")
+        self.embedding_key_hint_var.set(
+            "已配置密钥；留空保持不变。" if state.has_api_key else "请输入 API Key。"
+        )
+        if state.configured:
+            self._set_embedding_status(
+                f"已配置 Voyage · {config.model} · {config.output_dimension} 维",
+                SUCCESS,
+            )
+        else:
+            self._set_embedding_status(
+                "尚未配置 Voyage；知识库继续使用明确标识的模拟 Embedding。",
+                MUTED,
+            )
 
     def _load_database_state(self, state: SQLServerConfigState) -> None:
         self.database_state = state
@@ -574,6 +681,72 @@ class SystemSettingsDialog:
         if self.required_model_setup:
             self.window.grab_release()
             self.window.destroy()
+
+    def _collect_embedding_config(self) -> EmbeddingConnectionConfig:
+        return self.embedding_service.build_config(
+            endpoint=self.embedding_endpoint_var.get(),
+            model=self.embedding_model_var.get(),
+            output_dimension=self.embedding_dimension_var.get(),
+        )
+
+    def _test_embedding(self) -> None:
+        if self._testing_embedding:
+            return
+        try:
+            config = self._collect_embedding_config()
+        except Exception as exc:
+            messagebox.showerror("Embedding 配置不完整", str(exc), parent=self.window)
+            return
+        api_key = self.embedding_key_var.get()
+        self._set_embedding_busy(True)
+        self._set_embedding_status("正在测试 Voyage Embedding 连接…", ACCENT)
+
+        def work() -> None:
+            try:
+                self._embedding_test_results.put(
+                    ("success", self.embedding_service.test(config, api_key))
+                )
+            except Exception as exc:
+                self._embedding_test_results.put(("error", exc))
+
+        threading.Thread(target=work, daemon=True).start()
+        self.window.after(100, self._drain_embedding_test)
+
+    def _drain_embedding_test(self) -> None:
+        if not self.window.winfo_exists():
+            return
+        try:
+            kind, payload = self._embedding_test_results.get_nowait()
+        except queue.Empty:
+            self.window.after(100, self._drain_embedding_test)
+            return
+        self._set_embedding_busy(False)
+        if kind == "success":
+            self._set_embedding_status(str(payload), SUCCESS)
+        else:
+            self._set_embedding_status(f"连接失败 · {payload}", DANGER)
+
+    def _save_embedding(self) -> None:
+        if self._testing_embedding:
+            return
+        try:
+            state = self.embedding_service.save(
+                self._collect_embedding_config(),
+                self.embedding_key_var.get(),
+            )
+        except EmbeddingSetupError as exc:
+            messagebox.showerror("Embedding 配置未保存", str(exc), parent=self.window)
+            return
+        except Exception as exc:
+            messagebox.showerror("Embedding 配置失败", str(exc), parent=self.window)
+            return
+        self._load_embedding_state(state)
+        self._set_embedding_status(
+            "Embedding 配置已保存；新任务和新建索引将使用该配置。",
+            SUCCESS,
+        )
+        if self.on_embedding_saved:
+            self.on_embedding_saved(state)
 
     def _collect_database_config(self) -> SQLServerConnectionConfig:
         return build_connection_config(
@@ -822,9 +995,26 @@ class SystemSettingsDialog:
             control.configure(state=state)
         self._sync_database_auth()
 
+    def _set_embedding_busy(self, busy: bool) -> None:
+        self._testing_embedding = busy
+        state = "disabled" if busy else "normal"
+        for control in (
+            self.embedding_endpoint_entry,
+            self.embedding_model_entry,
+            self.embedding_key_entry,
+            self.embedding_test_button,
+            self.embedding_save_button,
+        ):
+            control.configure(state=state)
+        self.embedding_dimension_combo.configure(state="disabled" if busy else "normal")
+
     def _set_model_status(self, message: str, color: str) -> None:
         self.model_status_var.set(message)
         self.model_status_label.configure(fg=color)
+
+    def _set_embedding_status(self, message: str, color: str) -> None:
+        self.embedding_status_var.set(message)
+        self.embedding_status_label.configure(fg=color)
 
     def _set_database_status(self, message: str, color: str) -> None:
         self.database_status_var.set(message)
@@ -931,7 +1121,7 @@ class SystemSettingsDialog:
         )
 
     def _close(self) -> None:
-        if self._testing_database:
+        if self._testing_database or self._testing_embedding:
             return
         if not self._confirm_discard_knowledge():
             return

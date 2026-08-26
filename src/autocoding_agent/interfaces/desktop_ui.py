@@ -26,6 +26,7 @@ from autocoding_agent.core.models import (
 )
 from autocoding_agent.core.recovery.models import RecoveryAction
 from autocoding_agent.core.state_machine.models import TaskState
+from autocoding_agent.embedding_setup import EmbeddingSetupService, EmbeddingSetupState
 from autocoding_agent.incident.application import (
     IncidentApplication,
     build_incident_application,
@@ -43,7 +44,7 @@ from autocoding_agent.interfaces.knowledge_management_ui import KnowledgeManagem
 from autocoding_agent.interfaces.system_settings_ui import SystemSettingsDialog
 from autocoding_agent.knowledge_rag.service import (
     KnowledgeRAGService,
-    build_fake_rag_service,
+    build_configured_rag_service,
 )
 from autocoding_agent.model_setup import ClaudeModelSetupService, ModelSetupState
 from autocoding_agent.sqlserver_config import SQLServerConfigState
@@ -597,6 +598,7 @@ class DesktopClient:
         knowledge_service: MarkdownKnowledgeService | None = None,
         workspace_service: WorkspaceConfigService | None = None,
         attachment_store: IncidentAttachmentStore | None = None,
+        embedding_service: EmbeddingSetupService | None = None,
         rag_service: KnowledgeRAGService | None = None,
     ) -> None:
         self.root = root
@@ -605,9 +607,12 @@ class DesktopClient:
         self.knowledge_service = knowledge_service or MarkdownKnowledgeService()
         self.workspace_service = workspace_service or WorkspaceConfigService()
         self.attachment_store = attachment_store or IncidentAttachmentStore()
+        self.embedding_service = embedding_service or EmbeddingSetupService()
         self.rag_service = rag_service
         if self.rag_service is None and application is None:
-            self.rag_service = build_fake_rag_service()
+            self.rag_service = build_configured_rag_service(
+                embedding_setup=self.embedding_service
+            )
         workspace_state = self.workspace_service.inspect()
         self._applications_injected = application is not None or incident_application is not None
         self._settings_dialog: SystemSettingsDialog | None = None
@@ -1940,6 +1945,7 @@ class DesktopClient:
         if self._settings_dialog is not None and self._settings_dialog.window.winfo_exists():
             selected_tab = {
                 "database": self._settings_dialog.database_tab,
+                "embedding": self._settings_dialog.embedding_tab,
                 "workspace": self._settings_dialog.workspace_tab,
                 "knowledge": self._settings_dialog.knowledge_tab,
             }.get(section, self._settings_dialog.model_tab)
@@ -1952,8 +1958,10 @@ class DesktopClient:
             self.setup_service,
             self.sqlserver_service,
             initial_section=section,
+            embedding_service=self.embedding_service,
             workspace_service=self.workspace_service,
             on_model_saved=self._apply_model_configuration,
+            on_embedding_saved=self._apply_embedding_configuration,
             on_database_saved=self._apply_sqlserver_configuration,
             on_workspace_saved=self._apply_workspace_configuration,
             on_knowledge_changed=self._refresh_project_options,
@@ -1992,6 +2000,27 @@ class DesktopClient:
             "SQL Server 配置已保存；当前任务保持原连接，新任务使用新连接。"
             if active_development or active_incident
             else "SQL Server 配置已保存，两套流程立即共享。"
+        )
+        self._refresh_overview()
+        self._sync_controls()
+
+    def _apply_embedding_configuration(self, state: EmbeddingSetupState) -> None:
+        if not state.configured or state.config is None:
+            self.status_var.set("Embedding 配置尚未就绪。")
+            return
+        self.rag_service = build_configured_rag_service(
+            embedding_setup=self.embedding_service
+        )
+        active_development = self._flow_session_ids[FlowKind.DEVELOPMENT]
+        active_incident = self._flow_session_ids[FlowKind.INCIDENT]
+        if not self._applications_injected and not active_development:
+            self.application = self._build_current_development_application()
+        if not self._incident_application_injected and not active_incident:
+            self.incident_application = self._build_current_incident_application()
+        self.status_var.set(
+            "Embedding 配置已保存；当前任务保持原检索器，新任务与新索引使用 Voyage。"
+            if active_development or active_incident
+            else "Embedding 配置已保存；Voyage 已用于两套流程和知识库管理。"
         )
         self._refresh_overview()
         self._sync_controls()
@@ -2092,7 +2121,9 @@ class DesktopClient:
             self._knowledge_dialog.window.focus_force()
             return
         if self.rag_service is None:
-            self.rag_service = build_fake_rag_service()
+            self.rag_service = build_configured_rag_service(
+                embedding_setup=self.embedding_service
+            )
         self._knowledge_dialog = KnowledgeManagementDialog(
             self.root,
             self.rag_service,
@@ -2647,9 +2678,9 @@ def main() -> None:
     root = tk.Tk()
     root.withdraw()
     setup_service = ClaudeModelSetupService()
+    embedding_service = EmbeddingSetupService()
     sqlserver_service = SQLServerConnectionService()
     workspace_service = WorkspaceConfigService()
-    rag_service = build_fake_rag_service()
     client: DesktopClient | None = None
 
     def launch_client(_state: ModelSetupState | None = None) -> None:
@@ -2665,7 +2696,10 @@ def main() -> None:
             setup_service=setup_service,
             sqlserver_service=sqlserver_service,
             workspace_service=workspace_service,
-            rag_service=rag_service,
+            embedding_service=embedding_service,
+            rag_service=build_configured_rag_service(
+                embedding_setup=embedding_service
+            ),
         )
         if not workspace_service.inspect().configured:
             root.after(100, lambda: client and client._open_system_settings("workspace"))
@@ -2680,6 +2714,7 @@ def main() -> None:
                 setup_service,
                 sqlserver_service,
                 initial_section="model",
+                embedding_service=embedding_service,
                 workspace_service=workspace_service,
                 required_model_setup=True,
                 on_model_saved=launch_client,
