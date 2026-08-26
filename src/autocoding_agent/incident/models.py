@@ -77,6 +77,11 @@ class IncidentDecision(BaseModel):
         if self.status == IncidentStatus.COMPLETED:
             if self.page is None:
                 raise ValueError("page is required when incident investigation is completed")
+            if not self.page.source_paths:
+                raise ValueError(
+                    "at least one verified source path is required when incident investigation "
+                    "is completed"
+                )
             if self.diagnosis is None:
                 raise ValueError("diagnosis is required when incident investigation is completed")
         return self

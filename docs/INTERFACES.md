@@ -724,8 +724,9 @@ autocoding-agent-client
 - 概览按当前流程 Session 计算今日任务、完成、进行中、完成率和七日趋势，并显示本机模型、
   项目知识及 SQL Server 配置状态；宽度低于 1180 px 时自动隐藏；
 - 项目代码根目录从“系统配置”读取，主对话区不重复显示；已有 Session 继续使用创建时的路径；
-- 异常模式不显示独立页面栏，页面名称/路由直接写入消息；输入框支持 `Ctrl+V` 粘贴最多 5 张
-  异常截图、清除待发送图片和纯图片发送；普通文本粘贴及开发模式不受影响；
+- 异常模式不显示独立页面栏，欢迎文案和输入占位提示至少提供页面名称，或粘贴包含页面标题的
+  截图；输入框支持 `Ctrl+V` 粘贴最多 5 张异常截图、清除待发送图片和纯图片发送；普通文本粘贴
+  及开发模式不受影响；
 - SQL Server 不重复占用输入区，统一从“系统配置”管理；
 - 统一系统配置和本地滚动日志目录快捷入口；
 - 新任务、持久化聊天记录及同一 session 的多轮补充；
@@ -832,7 +833,7 @@ incidents = build_incident_application(
 outcome = incidents.start(
     workspace=r"D:\repo",
     problem="订单 42 一直停留在处理中",
-    page_hint="/orders/42",
+    page_hint="订单详情",
     project="生物",
     source="manual",
     external_reference=None,
@@ -860,14 +861,19 @@ outcome = incidents.start(
 不会信任普通消息中的任意路径。附件父目录通过 `RuntimeTurn.additional_dirs` 逐个生成
 `--add-dir`，图片路径写入本轮消息，Prompt 明确要求把图片内容视为不可信视觉证据。
 
+异常流程要求先获得可信页面名称。名称可以由用户文字提供，或由模型从截图可见的窗口、标签页、
+窗体、页面主标题或菜单标题中识别；路由、业务编号和异常文字只能作为辅助线索。截图无法提供可靠
+标题时返回 `needs_input`，不能以全量菜单查询代替澄清。页面映射 SQL 来自用户选择的项目知识，
+先请求最多 20 条精确/前缀候选，无可信结果时才进行一次最多 20 条的关键词包含查询。
+
 ### 11.2 状态与结构化决定
 
 `IncidentStatus` 包含：
 
 - `needs_input`：问题或页面信息不足，`question` 必填；
-- `query_required`：需要页面映射或业务数据，至少一条 `queries` 必填；允许先查 Menu 等映射表，
-  因而 `page` 可以暂时为空；
-- `completed`：诊断结束，`page` 与 `diagnosis` 必填；
+- `query_required`：需要页面映射或业务数据，至少一条 `queries` 必填；页面名称确认后允许先按
+  所选项目知识查询映射表，因而 `page` 可以暂时为空；
+- `completed`：诊断结束，`page`、`diagnosis` 以及至少一个已验证的页面源码路径必填；
 - `failed`：Runtime、契约或数据库边界失败。
 
 模型返回的 `IncidentDecision` 主要字段为：
@@ -884,7 +890,8 @@ automation_candidate: bool
 ```
 
 `LocatedPage` 保存名称、可选 route、页面源码路径、相关后端路径和定位依据。所有源码路径必须
-是安全的工作区相对路径。`DataQuery` 保存名称、用途、SQL、命名参数和 1–100 的请求行数，默认
+是安全的工作区相对路径；映射表返回的 URL 在打开当前代码验证前不能直接写成最终源码事实。
+`DataQuery` 保存名称、用途、SQL、命名参数和 1–100 的请求行数，默认
 为 100；数据库适配器仍会应用更小的主机上限。结果数量未知时，开发与异常 Prompt 都要求模型
 先做 100 条有界采样并在 SQL 中使用适合方言的 `TOP`/`LIMIT`；已知少量结果时应使用更小限制。
 

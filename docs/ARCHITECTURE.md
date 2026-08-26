@@ -296,8 +296,8 @@ Runtime run 的 owner、PID、heartbeat 和终态同样进入 SQLite，供启动
 ```mermaid
 stateDiagram-v2
     [*] --> Created
-    Created --> Inspecting: start(problem, optional page_hint / screenshots)
-    Inspecting --> WaitingInput: 页面或问题不清楚
+    Created --> Inspecting: start(problem, page name / screenshots)
+    Inspecting --> WaitingInput: 页面名称无法可靠确认
     WaitingInput --> Inspecting: send(additional context)
     Inspecting --> QueryingData: 需要页面映射或业务数据
     QueryingData --> Inspecting: 宿主自动执行 / 返回结果或脱敏错误
@@ -310,11 +310,27 @@ stateDiagram-v2
     Paused --> Cancelled: cancel
 ```
 
-模型可用的代码工具固定为 `Read`、`Glob`、`Grep`。它负责从消息里的页面线索或异常截图定位前端页面，并沿最小
-相关路径追踪请求、服务和数据访问代码；没有编辑、命令或数据库工具。需要页面映射或业务数据时，
-模型从已读代码与 schema 中提取/形成最多五条结构化、参数化 `DataQuery`，由 `IncidentEngine`
-直接交给 `DatabaseReader`，不能要求用户手工运行 SQL。页面名称需要数据库映射时允许在
-`LocatedPage` 尚未形成前查询 `Menu` 等映射表；返回的 URL 仍按不可信工作区相对线索复核。
+模型可用的代码工具固定为 `Read`、`Glob`、`Grep`。异常调查先建立可信页面名称：用户可以直接
+给出标题，也可以粘贴包含窗口、标签页、窗体或页面主标题的截图，由模型识别。只有异常文字、
+业务编号或看不到标题的局部截图时，模型返回 `needs_input` 询问标题，不能扫描全部页面映射。
+路由、模块和异常文字可以辅助识别，但不能代替页面名称。
+
+通用强制流程保存在应用包内的 `incident/prompts/incident_workflow.md`，由
+`load_incident_workflow_rules()` 每轮加载；它不包含 `Menu`、QTMES 等项目事实。项目表结构、页面
+映射 SQL 和代码架构由用户所选 `knowledge/incident/<项目>/<项目>.md` 提供。单次页面映射、数据
+摘要和诊断进入异常 Capability，只有人工确认后才进入 RAG，避免用按需检索承担必执行规则。
+
+获得页面名称后，模型按项目知识先请求最多 20 条的精确/前缀映射；没有可信结果时才从页面名称
+提取关键词执行一次最多 20 条的包含查询。候选由模型结合名称、相对 URL、当前仓库和截图特征
+判断，宿主不使用字符串相似度规则代替语义判断。URL 仍是不可信位置线索，必须打开源码验证标题、
+控件、事件或路由。截图中的红色文字是常见异常线索而不是硬规则，模型也会结合弹窗、空值、状态、
+表格行或布局判断异常区域。
+
+页面验证后，模型沿最小相关路径追踪请求、服务和数据访问代码；没有编辑、命令或数据库工具。
+文字异常先定位产生现象的代码分支，截图异常先定位可见异常区域，再进入相同调用链。需要业务
+数据时，模型从已读代码与 schema 中提取/形成最多五条结构化、参数化 `DataQuery`，由
+`IncidentEngine` 直接交给 `DatabaseReader`，不能要求用户手工运行 SQL。`completed` 契约除页面
+名称和诊断外，还强制至少一个已验证的工作区相对页面源文件。
 
 查询错误经过脱敏后自动返回同一模型会话修正，并计入查询轮次；达到上限才转为失败。成功查询
 只把限行、脱敏后的结果发回当前 Runtime。持久化审计保存查询名称、用途、SQL SHA-256 指纹、

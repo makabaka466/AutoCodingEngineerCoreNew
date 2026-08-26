@@ -119,6 +119,48 @@ def _page() -> LocatedPage:
     )
 
 
+def test_incident_prompt_requires_page_name_before_bounded_investigation(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace-page-first"
+    workspace.mkdir()
+    runtime = ScriptedStructuredRuntime(
+        [
+            IncidentDecision(
+                status=IncidentStatus.NEEDS_INPUT,
+                message="I need the page title before locating its code.",
+                question="What is the page title?",
+            )
+        ]
+    )
+    engine = IncidentEngine(runtime, JsonIncidentStore(tmp_path / "data-page-first"), None)
+
+    outcome = engine.start(workspace, "The screen shows an error.")
+
+    assert outcome.status == IncidentStatus.NEEDS_INPUT
+    prompt = runtime.turns[0].system_prompt
+    assert "A reliable page name is a mandatory precondition" in prompt
+    assert "focus first on the title-bearing parts of the open page" in prompt
+    assert "at most 20 candidates" in prompt
+    assert "Red\n  text is a common clue but not a rule" in prompt
+    assert "Menu.NAME" not in prompt
+    assert "QTMES" not in prompt
+
+
+def test_completed_incident_requires_a_verified_page_source_path() -> None:
+    with pytest.raises(ValueError, match="at least one verified source path"):
+        IncidentDecision(
+            status=IncidentStatus.COMPLETED,
+            message="Diagnosis complete.",
+            page=LocatedPage(
+                name="Order details",
+                route="/orders/:id",
+                explanation="Only a route candidate was found.",
+            ),
+            diagnosis="The route has not yet been verified against source code.",
+        )
+
+
 def test_pinned_workspace_guidance_stays_separate_by_flow(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -385,7 +427,7 @@ def test_agent_resolves_page_with_host_executed_sql_before_page_is_known(
     assert outcome.status == IncidentStatus.COMPLETED
     assert database.queries == [menu_query]
     assert len(runtime.turns) == 2
-    assert "Never\n   print SQL as an instruction to the user" in runtime.turns[0].system_prompt
+    assert "Never print SQL as an instruction to the user" in runtime.turns[0].system_prompt
     observation = outcome.query_observations[0]
     assert observation.sql_fingerprint is not None
     assert observation.parameter_names == ["page_name"]

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "auto-coding-engineer-core-new"
-version = "0.6.1"
+version = "0.6.2"
 description = "A platform-independent software-development agent powered by Claude Code."
 requires-python = ">=3.12"
 dependencies = [
@@ -43,4 +43,4 @@ where = ["src"]
 include = ["autocoding_agent*"]
 
 [tool.setuptools.package-data]
-autocoding_agent = ["skills/*/SKILL.md"]
+autocoding_agent = ["skills/*/SKILL.md", "incident/prompts/*.md"]
