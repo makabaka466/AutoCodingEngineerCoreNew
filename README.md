@@ -46,6 +46,23 @@
 能力文档仍按目标工作区和流程分开保存；每个 Session 对应一份自动能力 MD，后续完成内容以
 明确的工作轮次章节追加。新建任务会创建新 Session，因此会形成新的 MD。
 
+### 手动 RAG 知识库（当前为模拟接口）
+
+左侧“知识库管理”会发现 Project Knowledge、两套流程生成的 Capability，以及本项目的工程
+经验文档，但不会自动上传或索引。用户可以预览 Markdown 分块，手动选择“加入 / 重建索引”、
+移除索引或测试检索；移除只删除可重建索引，不删除源 Markdown。文档修改后会显示“内容已更新”，
+由用户决定何时重建。
+
+当前版本使用 `fake-hash-embedding-v1` 确定性伪 Embedding，并把模拟向量、Chunk 正文和 FTS5
+索引持久化到 `~/.autocoding-agent/rag/knowledge-fake.db`。它只用于打通管理、分块、过滤、混合
+检索、Agent 注入和审计流程，不代表 `Qwen3-Embedding-0.6B` 的语义效果。查询并行取得模拟
+Dense Top 20 与 BM25 Top 20，再通过 RRF 融合，默认向 Agent 返回最多 6 个 Chunk、每篇文档
+最多 2 个。开发与异常按领域、项目和工作区过滤；检索失败会留下事件并降级为无 RAG 继续执行。
+
+`EmbeddingProvider` 和 `VectorStore` 已抽象为稳定端口。Ollama 与真实向量数据库就绪后，应新增
+正式 Adapter、使用独立模型/Collection 标识并对已选择文档执行全量重建，禁止与当前伪向量混用。
+任务完成生成的 MD 仍只进入“待加入”列表，不会自动上传。
+
 ## 异常处理流程
 
 ```text
@@ -250,10 +267,11 @@ src/autocoding_agent/
 ├─ database_models.py      # 两套流程共用的只读查询与审计契约
 ├─ core/                   # 状态机、Handler、审计、Artifact、恢复和权限边界
 ├─ incident/               # 异常工单契约、页面定位/数据诊断状态机与应用门面
+├─ knowledge_rag/          # 文档发现、Markdown 分块、混合检索协议与当前伪适配器
 ├─ ports/                  # Runtime / Event / Decision / Artifact / Session 抽象
 ├─ adapters/               # Claude Code、SQLite 任务事件、Artifact、Git 观察、能力和只读数据源
 ├─ skills/                 # 显式注入模型的工作方法
-└─ interfaces/             # 原生桌面客户端、Typer CLI 与备用 Streamlit UI
+└─ interfaces/             # 原生桌面客户端、知识库管理、Typer CLI 与备用 Streamlit UI
 tests/                     # 不消耗模型额度的确定性测试；live 测试单独标记
 docs/                      # 架构与接口说明
 ```

@@ -1,6 +1,6 @@
 # AutoCodingEngineerCoreNew 项目开发与工程经验
 
-> 文档基线：2026-08-26，项目版本 `0.5.5`。本文以当前代码为准，并明确区分“已实现”、
+> 文档基线：2026-08-26，项目版本 `0.6.0`。本文以当前代码为准，并明确区分“已实现”、
 > “当前限制”和“后续规划”。当前 Agent 已具备状态机、追加事件、运行记录、决策审计、
 > 任务产物、保守恢复，以及按会话持续沉淀开发/异常能力知识的 Runtime 内核。
 
@@ -86,9 +86,10 @@ AutoCodingEngineerCoreNew 的硬编码业务。MES 的目录结构、页面定�
 - 暂停、取消、启动扫描、保守恢复与有上限的验证失败重规划；
 - 结构化模型输出和宿主二次校验；
 - 开发、异常各自独立的 Capability 文档；
+- 人工选择的 Markdown 分块、FTS5 + 模拟向量混合检索、分领域 Agent 注入与检索审计；
 - 本地脱敏日志、确定性测试和版本回退规则。
 
-尚未实现语义 RAG、跨工作区工程经验共享、自动异常修复、钉钉接入、流式 Token 展示和
+尚未接入真实语义 Embedding/向量数据库、跨工作区工程经验治理、自动异常修复、钉钉接入、流式 Token 展示和
 多 Agent 编排。开发 Runtime 已支持进程级 interrupt，但还没有 Windows Job Object 级进程树治理。
 
 ---
@@ -1126,10 +1127,10 @@ powershell -ExecutionPolicy Bypass -File .\start.ps1 -Wait
 5. Verify 只从已识别的真实 Bash ToolResult 形成宿主测试事实，复杂命令可能需扩展识别；
 6. SQL 只读检查是保守规则，可能拒绝合法复杂查询，也不能替代只读数据库账号；
 7. 数据 schema 每个只读轮次都会读取，较大数据库需要缓存和按需裁剪；
-8. Capability 是“每完成任务一份文档”，尚未去重、合并和自动标记过期；
+8. Capability 是“每完成任务一份文档”；RAG 能发现内容变化，但尚未做语义去重、合并和知识审批；
 9. 开发与异常已经共享 Event/Run/Recovery 基础设施，但两个 SQLite store 仍有部分事务代码重复，
    后续可提取通用持久化基类；
-10. `CAPABILITIES.md` 是 Markdown 索引，不是语义检索；
+10. 当前 Dense 排名来自 `fake-hash-embedding-v1`，只能验证检索管线，不能代表真实语义质量；
 11. Project Knowledge 依赖人工维护，当前没有冲突检测和版本审批；
 12. Tkinter 的 Markdown、富文本和可访问性能力有限；
 13. 异常流程只输出建议，尚未形成人工确认后的受控处置状态机；
@@ -1196,8 +1197,8 @@ verified Engineering Knowledge 才是可长期复用的正式经验。
 
 ### 14.4 检索方案
 
-建议先使用 SQLite 保存结构化知识，并使用 FTS5 建立关键词索引；知识规模扩大后增加 Embedding
-向量检索，最终采用混合召回和重排：
+`v0.6.0` 已先用 SQLite 保存 Chunk/FTS5，并以可替换的伪 Embedding 打通混合召回。真实
+Embedding 服务就绪后沿用同一结构升级为：
 
 ```text
 FTS 精确词检索 ─┐
@@ -1223,13 +1224,13 @@ FTS 精确词检索 ─┐
 检索结果必须携带知识 ID、状态、来源和最后验证时间，并继续作为不可信参考。最终方案最好说明
 使用了哪些经验，便于评估知识是否真正产生价值。
 
-### 14.6 建议版本路线
+### 14.6 实施状态与建议路线
 
-- `v0.4`：统一 Engineering Knowledge 模型、SQLite Store、人工管理页面；
-- `v0.5`：Capability/异常/失败日志转 Knowledge Candidate，审核、脱敏和去重；
-- `v0.6`：FTS5 + Embedding 混合检索和重排；
-- `v0.7`：接入开发和异常推理流程，记录引用和使用效果；
-- `v0.8`：自动候选、冲突检测、陈旧标记和基于证据的晋级。
+- `v0.6.0（当前）`：人工管理、Markdown Chunk、FTS5 + 模拟向量 + RRF、开发/异常注入和引用事件；
+- 下一迭代：Ollama `Qwen3-Embedding-0.6B`、正式 VectorStore、健康检查、索引身份和全量重建；
+- 治理迭代：统一 Engineering Knowledge/Candidate 模型，把 Capability、异常与失败日志转为候选；
+- 质量迭代：脱敏、去重、冲突检测、陈旧标记、人工审核与基于证据的晋级；
+- 评估迭代：真实 reranker、检索评测集、引用准确率和任务效果反馈闭环。
 
 ### 14.7 成功指标
 
@@ -1885,3 +1886,105 @@ Python `IncidentApplication` 已能接收显式附件。界面当前显示附件
 Incident 消息/事件持久化、图片路径进入模型消息，以及桌面纯图片发送、清除、开发模式不拦截文字
 粘贴和删除旧路径/页面栏。最终验证与发布记录见
 `docs/tasks/ACE-UI-008-configured-workspace-image-paste.md`。
+
+## 26. 手动混合 RAG 与可替换 Embedding 接口
+
+### 26.1 背景与业务理解
+
+Project Knowledge 解决“当前项目有什么稳定约束”，Capability 解决“这次任务实际完成了什么”，
+Engineering Experience 解决“过去有哪些可复用工程经验”。文档增多后，把所有 Markdown 全量
+塞进 Prompt 会增加 token、噪声和相互矛盾的概率；仅按文件名或关键词查找，又会漏掉表达不同但
+含义相近的经验。因此需要一个检索层，在任务调查前只选择少量相关片段。
+
+但“任务完成即自动上传”会把未经审核的总结、偶发结论和敏感内容直接放大到后续任务。用户已经
+明确采用人工上传：任务完成仍正常生成分流程 Capability MD；管理页面把它显示为待加入，只有
+用户选择后才建立索引。原 Markdown 始终是知识原文，Chunk、FTS 和向量只是可以删除、重建的
+派生视图。
+
+本轮实施时 Ollama 与 `Qwen3-Embedding-0.6B` 尚在部署。为了不阻塞 UI、数据模型、分块、过滤、
+Agent 接入和审计验证，系统先实现一个确定性的伪接口；它必须在 UI、模型 ID、数据库文件名和
+返回元数据中显式标为 simulated，不能假装已经具备 Qwen3 的语义能力。
+
+### 26.2 设计思路
+
+整体链路为：
+
+```text
+Markdown 原文
+  -> 发现并计算 current_hash（不自动索引）
+  -> 用户预览和选择
+  -> 标题感知分块
+  -> EmbeddingProvider + VectorStore
+  -> Chunk 正文/元数据 + FTS5 + 向量索引
+  -> Dense Top-K + BM25 Top-K
+  -> RRF 融合、领域/项目/工作区过滤和每文档配额
+  -> 带来源、标记为不可信参考的 Prompt Context
+  -> knowledge_retrieved / knowledge_retrieval_failed Event
+```
+
+`EmbeddingProvider` 和 `VectorStore` 是稳定端口，`KnowledgeRAGService` 只依赖端口，不依赖
+Ollama 或某个向量数据库 SDK。这样未来接入真实服务时只替换 Adapter，不改管理页面、Agent
+流程和检索结果契约。真实索引与模拟索引必须按模型 ID、维度、Collection/数据库身份隔离。
+
+### 26.3 核心技术实现
+
+- `models.py` 统一 Document、Chunk、Vector Point/Match、Hit、Receipt 和领域/来源/状态枚举；
+- `MarkdownChunker` 去除 frontmatter，保留标题层级、段落和 fenced code block，目标约 750
+  tokens、最大约 1200，同章节加入少量重叠；稳定 Chunk ID 同时包含文档、标题、序号和正文 Hash；
+- `SQLiteKnowledgeRepository` 保存文档状态与 Chunk，并用 FTS5/BM25 做词法召回；中文查询同时
+  建立单字 token，保证当前 SQLite 默认 tokenizer 下仍有基础召回；
+- `FakeEmbeddingProvider` 把 token 稳定散列到 96 维并归一化；`SQLiteFakeVectorStore` 持久化
+  float BLOB 并计算余弦相似度。它可重复、离线、适合测试，但不是语义模型；
+- 混合检索分别获取 Dense 与 Lexical Top 20，以 `1/(60+rank)` 做 RRF，默认返回 6 个 Chunk，
+  每篇文档最多 2 个，避免单个长文档挤占上下文；
+- `KnowledgeManagementDialog` 提供发现、状态展示、多选加入/重建、移除、分块预览和测试检索；
+  索引操作在后台线程执行，UI 线程只更新控件；
+- 开发 Engine 只在 inspect 阶段检索，异常 Engine 每个用户调查 cycle 检索一次并在 SQL 循环内
+  复用上下文。检索失败只形成事件并降级，不使代码任务或异常诊断失败。
+
+### 26.4 实现问题与解决方案
+
+**不能整篇直接 Embedding。** 长文档会把多个主题平均到一个向量中，命中后又把大量无关内容
+带进 Prompt。标题感知 Chunk 既缩小检索单元，也保留“这段内容属于哪个章节”的结构证据。
+
+**不能只做向量检索。** 文件名、类名、SQL 字段和错误码需要精确匹配，而真实语义向量也可能
+漏掉专有标识。FTS5 与 Dense 双路召回后按排名融合，既避免比较不可比的原始分数，又保留两类
+检索的互补性。当前 Dense 是模拟结果，因此精确词法召回尤其重要。
+
+**索引状态不能只看有没有向量。** 源文件修改后旧索引仍然存在。Document 同时保存
+`current_hash` 和 `indexed_hash`，刷新时显示 `outdated`，让用户明确重建；移除只删派生记录并
+保留源文件。
+
+**历史经验可能污染当前决策。** 每个命中保留来源路径、标题、类型和融合分数，Prompt 明确要求
+把内容视为不可信且可能过期的参考；领域、项目和工作区过滤先于返回，模型还必须读取当前代码、
+按授权查询数据库后才能下结论。
+
+**检索服务不应成为主流程单点。** Embedding、SQLite 或未来向量数据库不可用时，Engine 捕获
+异常、记录截断错误和 workflow 信息，继续原有无 RAG 调查。这样增强层失败不会篡改任务语义。
+
+### 26.5 技术选型与决策记录
+
+- ADR-050：Markdown 是知识原文，Chunk、FTS 与向量均为可重建派生数据；
+- ADR-051：任务完成文档不自动索引，必须由用户在管理页明确选择；
+- ADR-052：按 Markdown 标题/段落/代码块分块，不整篇 Embedding；
+- ADR-053：使用 Dense + BM25 + RRF，而不是只依赖向量或关键词；
+- ADR-054：检索按 domain/project/workspace 过滤，并限制每文档命中数量；
+- ADR-055：RAG 内容是带来源的不可信参考，当前代码和授权数据仍是事实依据；
+- ADR-056：检索失败采用可审计降级，不改变主任务完成/失败判断；
+- ADR-057：部署期使用独立的 `fake-hash-embedding-v1` 伪适配器，未来 Qwen3 索引必须全量重建，
+  不得重命名或复用模拟向量。
+
+### 26.6 当前边界、迁移与验证
+
+当前没有调用 Ollama、没有连接 Qdrant/pgvector 等正式向量数据库，也没有真实语义 reranker、
+自动知识审核、去重合并、敏感内容扫描和索引版本迁移工具。`Failure Knowledge` 已进入统一枚举，
+但发现器尚未接入独立来源。管理 UI 当前只在原生桌面客户端开放。
+
+Ollama 部署完成后的正确迁移顺序是：实现正式 `EmbeddingProvider`，验证模型名、维度、最大输入和
+归一化方式；实现正式 `VectorStore` 和健康检查；使用新的索引身份；让管理页显示真实服务状态；
+最后由用户对已选文档执行全量重建。切换前后都不修改源 Markdown。
+
+确定性测试覆盖无自动索引、标题感知分块、手动建立双索引、精确词法命中、内容变更陈旧标记、
+移除索引保留源文件、Capability 领域元数据、开发/异常 Prompt 注入、检索事件、失败降级，以及
+知识管理页面默认待加入状态。完整发布证据见
+`docs/tasks/ACE-RAG-009-manual-hybrid-knowledge.md`。

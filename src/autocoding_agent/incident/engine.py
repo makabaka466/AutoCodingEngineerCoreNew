@@ -37,6 +37,9 @@ from autocoding_agent.incident.models import (
     QueryObservation,
 )
 from autocoding_agent.incident.ports import IncidentSessionStore
+from autocoding_agent.knowledge_rag.models import KnowledgeDomain
+from autocoding_agent.knowledge_rag.ports import KnowledgeRetriever
+from autocoding_agent.knowledge_rag.service import workspace_id_for
 from autocoding_agent.ports.database import DatabaseReader
 from autocoding_agent.ports.structured_runtime import StructuredRuntime
 
@@ -57,6 +60,7 @@ class IncidentEngine:
         model: str = "unknown",
         state_machine: AgentStateMachine | None = None,
         owner_id: str | None = None,
+        knowledge_retriever: KnowledgeRetriever | None = None,
     ) -> None:
         if max_query_rounds < 1 or max_query_rounds > 5:
             raise ValueError("max_query_rounds must be between 1 and 5")
@@ -69,6 +73,7 @@ class IncidentEngine:
         self.model = model
         self.state_machine = state_machine or AgentStateMachine()
         self.owner_id = owner_id or str(uuid4())
+        self.knowledge_retriever = knowledge_retriever
 
     def start(
         self,
@@ -306,6 +311,7 @@ class IncidentEngine:
         )
         pending_message = self._message_with_attachments(user_message, attachments)
         attachment_dirs = list(dict.fromkeys(str(Path(item.path).parent) for item in attachments))
+        knowledge_context = self._retrieve_knowledge(session, user_message, command.id)
 
         while True:
             session.updated_at = utc_now()
@@ -317,6 +323,7 @@ class IncidentEngine:
                     session,
                     pending_message,
                     attachment_dirs,
+                    knowledge_context,
                 )
                 self._validate_decision(decision)
             except Exception as exc:
@@ -752,6 +759,7 @@ class IncidentEngine:
         session: IncidentSession,
         user_message: str,
         attachment_dirs: list[str] | None = None,
+        knowledge_context: str = "",
     ) -> tuple[IncidentDecision, AgentUsage]:
         schema = (
             self.database.describe_schema()
@@ -778,6 +786,7 @@ class IncidentEngine:
                 schema,
                 str(capability_dir) if capability_dir else None,
                 session.project,
+                knowledge_context,
             ),
             tools=list(_READ_TOOLS),
             allowed_tools=list(_READ_TOOLS),
@@ -787,6 +796,55 @@ class IncidentEngine:
         result = self.runtime.run_structured(turn, IncidentDecision)
         session.runtime_session_id = result.runtime_session_id
         return result.output, result.usage
+
+    def _retrieve_knowledge(
+        self,
+        session: IncidentSession,
+        query: str,
+        command_id: str,
+    ) -> str:
+        if self.knowledge_retriever is None:
+            return ""
+        try:
+            result = self.knowledge_retriever.retrieve(
+                query,
+                domain=KnowledgeDomain.INCIDENT,
+                project=session.project,
+                workspace_id=workspace_id_for(session.workspace),
+            )
+        except Exception as exc:
+            session.events.append(
+                AgentEvent(
+                    type=EventType.KNOWLEDGE_RETRIEVAL_FAILED,
+                    message=(
+                        "RAG knowledge retrieval failed; continuing without retrieved "
+                        "knowledge."
+                    ),
+                    actor="host",
+                    command_id=command_id,
+                    data={"error": " ".join(str(exc).split())[:800], "workflow": "incident"},
+                )
+            )
+            return ""
+        session.events.append(
+            AgentEvent(
+                type=EventType.KNOWLEDGE_RETRIEVED,
+                message=f"Retrieved {len(result.hits)} manually indexed knowledge chunks.",
+                actor="host",
+                command_id=command_id,
+                data={
+                    "count": len(result.hits),
+                    "embedding_model": result.embedding_model,
+                    "simulated": result.simulated,
+                    "workflow": "incident",
+                    "chunks": [
+                        {"chunk_id": item.chunk_id, "source": item.source_path}
+                        for item in result.hits
+                    ],
+                },
+            )
+        )
+        return result.prompt_context()
 
     @staticmethod
     def _validate_attachments(
@@ -926,6 +984,7 @@ def _system_prompt(
     database_schema: str,
     capability_dir: str | None,
     project: str | None = None,
+    knowledge_context: str = "",
 ) -> str:
     selected_project = (
         f"The user selected the knowledge project {project!r}. Use only its Markdown linked from "
@@ -940,6 +999,11 @@ def _system_prompt(
         "current code and authorized data always win."
         if capability_dir
         else "No prior incident capability memory is available."
+    )
+    retrieved_note = (
+        f"\n\n<retrieved_knowledge>\n{knowledge_context}\n</retrieved_knowledge>"
+        if knowledge_context
+        else ""
     )
     return f"""You are the incident investigation workflow of AutoCoding Engineer.
 
@@ -992,7 +1056,7 @@ Available database schema metadata:
 </database_schema>
 
 Return only the structured result required by the supplied JSON Schema. Keep the user-facing
-message concise Markdown.
+message concise Markdown.{retrieved_note}
 """
 
 

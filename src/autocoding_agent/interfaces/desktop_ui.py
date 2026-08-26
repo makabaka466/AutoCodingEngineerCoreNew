@@ -39,7 +39,12 @@ from autocoding_agent.incident_attachments import (
     IncidentAttachmentError,
     IncidentAttachmentStore,
 )
+from autocoding_agent.interfaces.knowledge_management_ui import KnowledgeManagementDialog
 from autocoding_agent.interfaces.system_settings_ui import SystemSettingsDialog
+from autocoding_agent.knowledge_rag.service import (
+    KnowledgeRAGService,
+    build_fake_rag_service,
+)
 from autocoding_agent.model_setup import ClaudeModelSetupService, ModelSetupState
 from autocoding_agent.sqlserver_config import SQLServerConfigState
 from autocoding_agent.sqlserver_service import SQLServerConnectionService
@@ -592,6 +597,7 @@ class DesktopClient:
         knowledge_service: MarkdownKnowledgeService | None = None,
         workspace_service: WorkspaceConfigService | None = None,
         attachment_store: IncidentAttachmentStore | None = None,
+        rag_service: KnowledgeRAGService | None = None,
     ) -> None:
         self.root = root
         self.setup_service = setup_service or ClaudeModelSetupService()
@@ -599,9 +605,13 @@ class DesktopClient:
         self.knowledge_service = knowledge_service or MarkdownKnowledgeService()
         self.workspace_service = workspace_service or WorkspaceConfigService()
         self.attachment_store = attachment_store or IncidentAttachmentStore()
+        self.rag_service = rag_service
+        if self.rag_service is None and application is None:
+            self.rag_service = build_fake_rag_service()
         workspace_state = self.workspace_service.inspect()
         self._applications_injected = application is not None or incident_application is not None
         self._settings_dialog: SystemSettingsDialog | None = None
+        self._knowledge_dialog: KnowledgeManagementDialog | None = None
         self._active_development_database_reference: str | None = None
         self.application = (
             application
@@ -788,6 +798,18 @@ class DesktopClient:
         )
         self.model_config_button.grid(row=4, column=0, sticky="ew", padx=8, pady=(2, 6))
 
+        self.knowledge_database_button = self._button(
+            sidebar,
+            "知识库管理",
+            self._open_knowledge_management,
+            background=COLORS["panel"],
+            active_background=COLORS["panel_hover"],
+            anchor="w",
+        )
+        self.knowledge_database_button.grid(
+            row=5, column=0, sticky="ew", padx=8, pady=(0, 6)
+        )
+
         self.log_button = self._button(
             sidebar,
             "本地日志",
@@ -796,7 +818,7 @@ class DesktopClient:
             active_background=COLORS["panel_hover"],
             anchor="w",
         )
-        self.log_button.grid(row=5, column=0, sticky="ew", padx=8, pady=(0, 8))
+        self.log_button.grid(row=6, column=0, sticky="ew", padx=8, pady=(0, 8))
 
         tk.Label(
             sidebar,
@@ -804,7 +826,7 @@ class DesktopClient:
             font=("Microsoft YaHei UI", 8),
             fg=COLORS["muted"],
             bg=COLORS["sidebar"],
-        ).grid(row=6, column=0, sticky="w", padx=10, pady=(7, 8))
+        ).grid(row=7, column=0, sticky="w", padx=10, pady=(7, 8))
 
     def _build_conversation_area(self) -> None:
         main = tk.Frame(self.root, bg=COLORS["window"])
@@ -2025,7 +2047,10 @@ class DesktopClient:
         ):
             return self.incident_application
         if reference and not reference.startswith("sqlserver://"):
-            self.incident_application = build_incident_application(sqlite_path=reference)
+            self.incident_application = build_incident_application(
+                sqlite_path=reference,
+                knowledge_retriever=self.rag_service,
+            )
             self._active_incident_database_reference = reference
             return self.incident_application
         state = self.sqlserver_service.inspect()
@@ -2043,6 +2068,7 @@ class DesktopClient:
         return build_incident_application(
             database=reader,
             database_reference=reference,
+            knowledge_retriever=self.rag_service,
         )
 
     def _build_current_development_application(self) -> AgentApplication:
@@ -2052,6 +2078,25 @@ class DesktopClient:
         return build_application(
             database=reader,
             database_reference=reference,
+            knowledge_retriever=self.rag_service,
+        )
+
+    def _open_knowledge_management(self) -> None:
+        if self._busy:
+            return
+        if (
+            self._knowledge_dialog is not None
+            and self._knowledge_dialog.window.winfo_exists()
+        ):
+            self._knowledge_dialog.window.lift()
+            self._knowledge_dialog.window.focus_force()
+            return
+        if self.rag_service is None:
+            self.rag_service = build_fake_rag_service()
+        self._knowledge_dialog = KnowledgeManagementDialog(
+            self.root,
+            self.rag_service,
+            on_changed=self._refresh_overview,
         )
 
     def _send_message(self) -> None:
@@ -2390,6 +2435,9 @@ class DesktopClient:
             self.recovery_replan_button.configure(state="disabled")
         self.sessions_list.configure(state="normal" if not self._busy else "disabled")
         self.model_config_button.configure(state="normal" if not self._busy else "disabled")
+        self.knowledge_database_button.configure(
+            state="normal" if not self._busy else "disabled"
+        )
         self.development_flow_button.set_enabled(not self._busy)
         self.incident_flow_button.set_enabled(
             not self._busy and self.incident_application is not None
@@ -2601,6 +2649,7 @@ def main() -> None:
     setup_service = ClaudeModelSetupService()
     sqlserver_service = SQLServerConnectionService()
     workspace_service = WorkspaceConfigService()
+    rag_service = build_fake_rag_service()
     client: DesktopClient | None = None
 
     def launch_client(_state: ModelSetupState | None = None) -> None:
@@ -2616,6 +2665,7 @@ def main() -> None:
             setup_service=setup_service,
             sqlserver_service=sqlserver_service,
             workspace_service=workspace_service,
+            rag_service=rag_service,
         )
         if not workspace_service.inspect().configured:
             root.after(100, lambda: client and client._open_system_settings("workspace"))

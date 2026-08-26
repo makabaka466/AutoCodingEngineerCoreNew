@@ -1,6 +1,6 @@
 # AutoCoding Engineer 接口与数据契约
 
-本文记录当前 `0.5.5` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
+本文记录当前 `0.6.0` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
 Runtime、持久化和状态契约。
 设计动机和运行流程见[架构说明](ARCHITECTURE.md)。
 
@@ -25,6 +25,7 @@ def build_application(
     runtime: AgentRuntime | None = None,
     database: DatabaseReader | None = None,
     database_reference: str | None = None,
+    knowledge_retriever: KnowledgeRetriever | None = None,
 ) -> AgentApplication
 ```
 
@@ -36,6 +37,7 @@ def build_application(
 - `runtime` 参数可用于测试或替换模型执行适配器。
 - `database` 与无凭据 `database_reference` 可把同一只读数据源注入开发流程；模型仅能在
   `inspect` 返回查询计划，不能直接获得数据库工具。
+- `knowledge_retriever` 可替换 RAG 检索实现；未传时使用当前明确标识的本地伪实现。
 
 ### 1.2 `AgentApplication`
 
@@ -918,3 +920,69 @@ schema 元数据。
 
 未传 `--database` 时使用 `AUTO_CODING_INCIDENT_SQLITE_PATH`。如果模型请求数据但未配置数据库，
 该会话会得到可持久化的 `failed` 结果，而不会把 SQL 交给用户或假装完成诊断。
+
+## 12. RAG 知识接口
+
+### 12.1 可替换端口
+
+`knowledge_rag/ports.py` 定义三个运行时无关协议：
+
+```python
+class EmbeddingProvider(Protocol):
+    model_id: str
+    dimension: int
+    simulated: bool
+    def embed_documents(self, texts: list[str]) -> list[list[float]]: ...
+    def embed_query(self, query: str) -> list[float]: ...
+
+class VectorStore(Protocol):
+    def replace_document(self, document_id: str, points: list[VectorPoint]) -> None: ...
+    def delete_document(self, document_id: str) -> None: ...
+    def search(self, vector: list[float], *, domain, project, workspace_id, limit): ...
+
+class KnowledgeRetriever(Protocol):
+    def retrieve(self, query: str, *, domain, project=None, workspace_id=None, limit=6): ...
+```
+
+当前 `FakeEmbeddingProvider` 的 `model_id` 固定为 `fake-hash-embedding-v1`、维度为 96、
+`simulated=True`；同样的文本总是得到相同向量，但不承诺真实语义相似度。
+`SQLiteFakeVectorStore` 只保存这个模型的模拟向量。后续 Ollama/向量数据库实现必须遵守相同
+端口并使用不同索引身份。
+
+### 12.2 文档与 Chunk 契约
+
+`KnowledgeDocument` 保存源路径、展示路径、标题、来源类型、领域、项目、工作区、当前/已索引
+Hash、索引状态、Chunk 数量、Embedding 模型和时间。状态为：
+`pending/indexing/indexed/outdated/failed/removed`。来源类型为：
+`project_knowledge/engineering_experience/capability/failure_knowledge`；当前发现器已接入前三类，
+Failure Knowledge 只预留模型值。
+
+`KnowledgeChunk` 保存稳定 ID、文档 ID、序号、标题与 heading path、正文、embedding text、
+内容 Hash、近似 token 数、领域/项目/工作区/来源和源路径。Embedding text 在正文前增加文档、
+来源、领域、项目和标题元数据，但 FTS 与返回 Prompt 使用可读 Chunk 正文。
+
+### 12.3 `KnowledgeRAGService`
+
+| 方法 | 行为 |
+| --- | --- |
+| `refresh_documents()` | 发现 Project Knowledge、工程经验和开发/异常 Capability；同步状态但不自动索引 |
+| `preview_chunks(document_id)` | 只做 Markdown 分块预览，不写索引 |
+| `index_document(document_id)` | 重建该文档的模拟向量、Chunk 和 FTS5，并返回 `KnowledgeIndexReceipt` |
+| `remove_document(document_id)` | 删除该文档的 Chunk/FTS/向量记录，保留源 Markdown |
+| `retrieve(query, domain, project=None, workspace_id=None, limit=6)` | Dense + BM25 + RRF 混合检索，返回带来源的 `KnowledgeRetrievalResult` |
+
+`build_fake_rag_service(settings, project_root=...)` 使用
+`<data_dir>/rag/knowledge-fake.db`。索引是派生数据，可从源 Markdown 全量重建。
+
+### 12.4 Agent 注入与事件
+
+开发 Engine 只在 `inspect` 模式调用 `KnowledgeRetriever`；异常 Engine 在每个用户调查 cycle 开始
+检索一次，并把同一上下文沿数据库查询循环继续传给模型。命中内容置于
+`<retrieved_knowledge>` 中，并明确声明为不可信、可能过期的参考。
+
+- `knowledge_retrieved`：记录命中数、模型 ID、是否模拟，以及 Chunk ID/源路径；空结果也记录；
+- `knowledge_retrieval_failed`：记录脱敏截断后的错误，主任务继续执行；
+- 当前不把向量、完整 Chunk 正文或用户查询复制进 Event Store。
+
+桌面“知识库管理”提供刷新、分块预览、多选加入/重建、移除和测试检索。当前模式徽标会明确
+显示“模拟模式”，任务完成生成的新 MD 只成为待加入文档。

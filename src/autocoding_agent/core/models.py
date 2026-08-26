@@ -89,6 +89,8 @@ class EventType(StrEnum):
     CAPABILITY_FAILED = "capability_failed"
     DATABASE_QUERIES_EXECUTED = "database_queries_executed"
     DATABASE_QUERY_FAILED = "database_query_failed"
+    KNOWLEDGE_RETRIEVED = "knowledge_retrieved"
+    KNOWLEDGE_RETRIEVAL_FAILED = "knowledge_retrieval_failed"
     TASK_REOPENED = "task_reopened"
 
 

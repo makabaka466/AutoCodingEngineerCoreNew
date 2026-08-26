@@ -48,6 +48,9 @@ from autocoding_agent.core.state_machine.models import (
     TaskState,
 )
 from autocoding_agent.database_models import QueryObservation, QueryResult, sql_fingerprint
+from autocoding_agent.knowledge_rag.models import KnowledgeDomain
+from autocoding_agent.knowledge_rag.ports import KnowledgeRetriever
+from autocoding_agent.knowledge_rag.service import workspace_id_for
 from autocoding_agent.ports.database import DatabaseReader
 from autocoding_agent.ports.runtime import AgentRuntime, RuntimeInterruptedError
 from autocoding_agent.ports.session_store import SessionStore
@@ -78,6 +81,7 @@ class AgentEngine:
         max_query_rounds: int = 2,
         max_replan_rounds: int = 2,
         owner_id: str | None = None,
+        knowledge_retriever: KnowledgeRetriever | None = None,
     ) -> None:
         if max_query_rounds < 1 or max_query_rounds > 5:
             raise ValueError("max_query_rounds must be between 1 and 5")
@@ -104,6 +108,7 @@ class AgentEngine:
         self.max_query_rounds = max_query_rounds
         self.max_replan_rounds = max_replan_rounds
         self.owner_id = owner_id or str(uuid4())
+        self.knowledge_retriever = knowledge_retriever
 
     def start(
         self,
@@ -407,6 +412,55 @@ class AgentEngine:
         self.sessions.save(session)
         return self._to_outcome(session)
 
+    def _retrieve_knowledge(
+        self,
+        session: AgentSession,
+        query: str,
+        mode: AgentMode,
+        command_id: str,
+    ) -> str:
+        if mode != AgentMode.INSPECT or self.knowledge_retriever is None:
+            return ""
+        try:
+            result = self.knowledge_retriever.retrieve(
+                query,
+                domain=KnowledgeDomain.DEVELOPMENT,
+                project=session.project,
+                workspace_id=workspace_id_for(session.workspace),
+            )
+        except Exception as exc:
+            session.events.append(
+                AgentEvent(
+                    type=EventType.KNOWLEDGE_RETRIEVAL_FAILED,
+                    message=(
+                        "RAG knowledge retrieval failed; continuing without retrieved "
+                        "knowledge."
+                    ),
+                    actor="host",
+                    command_id=command_id,
+                    data={"error": " ".join(str(exc).split())[:800]},
+                )
+            )
+            return ""
+        session.events.append(
+            AgentEvent(
+                type=EventType.KNOWLEDGE_RETRIEVED,
+                message=f"Retrieved {len(result.hits)} manually indexed knowledge chunks.",
+                actor="host",
+                command_id=command_id,
+                data={
+                    "count": len(result.hits),
+                    "embedding_model": result.embedding_model,
+                    "simulated": result.simulated,
+                    "chunks": [
+                        {"chunk_id": item.chunk_id, "source": item.source_path}
+                        for item in result.hits
+                    ],
+                },
+            )
+        )
+        return result.prompt_context()
+
     def _duplicate_command_outcome(
         self,
         session: AgentSession,
@@ -478,6 +532,7 @@ class AgentEngine:
         # write/command tool exists; resumed modes retain anything already read.
         readable_capability_dir = str(capability_dir) if mode == AgentMode.INSPECT else None
         pending_message = user_message
+        knowledge_context = self._retrieve_knowledge(session, user_message, mode, command.id)
 
         while True:
             existing_runtime_session_id = session.runtime_session_id
@@ -502,11 +557,15 @@ class AgentEngine:
                         workspace=session.workspace,
                         user_message=pending_message,
                         history=tuple(session.messages[:-1]),
-                        system_prompt=self.skills.build_system_prompt(
-                            mode,
-                            readable_capability_dir,
-                            database_schema,
-                            session.project,
+                        system_prompt=(
+                            self.skills.build_system_prompt(
+                                mode,
+                                readable_capability_dir,
+                                database_schema,
+                                session.project,
+                            )
+                            + (f"\n\n<retrieved_knowledge>\n{knowledge_context}\n"
+                               "</retrieved_knowledge>" if knowledge_context else "")
                         ),
                         capability_dir=readable_capability_dir,
                         run_id=run.id,

@@ -29,6 +29,12 @@ from autocoding_agent.incident.models import (
     LocatedPage,
     QueryResult,
 )
+from autocoding_agent.knowledge_rag.models import (
+    KnowledgeDomain,
+    KnowledgeHit,
+    KnowledgeRetrievalResult,
+    KnowledgeSourceType,
+)
 from autocoding_agent.ports.structured_runtime import StructuredRuntimeResult
 
 
@@ -65,6 +71,41 @@ class FakeDatabase:
             columns=["id", "status"],
             rows=[{"id": 42, "status": "stuck"}],
             returned_rows=1,
+        )
+
+
+class StubKnowledgeRetriever:
+    def retrieve(
+        self,
+        query: str,
+        *,
+        domain: KnowledgeDomain,
+        project: str | None = None,
+        workspace_id: str | None = None,
+        limit: int = 6,
+    ) -> KnowledgeRetrievalResult:
+        assert domain == KnowledgeDomain.INCIDENT
+        assert project == "生物"
+        assert workspace_id
+        assert limit == 6
+        return KnowledgeRetrievalResult(
+            query=query,
+            embedding_model="fake-hash-embedding-v1",
+            simulated=True,
+            hits=[
+                KnowledgeHit(
+                    chunk_id="chunk-incident-1",
+                    document_id="document-incident-1",
+                    title="Incident SQL safety",
+                    heading_path="Bounded query",
+                    content="Start unknown diagnostic queries with TOP 100.",
+                    source_path="knowledge/incident/生物/生物.md",
+                    source_type=KnowledgeSourceType.PROJECT,
+                    domain=KnowledgeDomain.INCIDENT,
+                    project="生物",
+                    score=0.029,
+                )
+            ],
         )
 
 
@@ -181,6 +222,44 @@ def test_incident_flow_locates_page_queries_data_and_diagnoses(tmp_path: Path) -
         TaskState.COMPLETED.value,
     ]
     assert any(event.type == EventType.DATABASE_QUERIES_EXECUTED for event in outcome.events)
+
+
+def test_incident_flow_injects_retrieved_knowledge_and_audits_it(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace-rag"
+    workspace.mkdir()
+    runtime = ScriptedStructuredRuntime(
+        [
+            IncidentDecision(
+                status=IncidentStatus.COMPLETED,
+                message="Diagnosis complete.",
+                page=_page(),
+                diagnosis="The request is bounded before the data check.",
+            )
+        ]
+    )
+    engine = IncidentEngine(
+        runtime,
+        JsonIncidentStore(tmp_path / "data-rag"),
+        None,
+        knowledge_retriever=StubKnowledgeRetriever(),
+    )
+
+    outcome = engine.start(
+        workspace,
+        "The order page is stale.",
+        "/orders/42",
+        project="生物",
+    )
+
+    prompt = runtime.turns[0].system_prompt
+    assert "<retrieved_knowledge>" in prompt
+    assert "Start unknown diagnostic queries with TOP 100." in prompt
+    event = next(event for event in outcome.events if event.type == EventType.KNOWLEDGE_RETRIEVED)
+    assert event.data["workflow"] == "incident"
+    assert event.data["simulated"] is True
+    assert event.data["chunks"][0]["chunk_id"] == "chunk-incident-1"
 
 
 def test_completed_incident_reopens_and_appends_to_one_capability_document(

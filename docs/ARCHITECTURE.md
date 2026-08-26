@@ -1,6 +1,6 @@
 # AutoCoding Engineer 架构说明
 
-本文描述当前 `0.5.5` 代码已经实现的架构。数据字段、公共方法和命令行参数见
+本文描述当前 `0.6.0` 代码已经实现的架构。数据字段、公共方法和命令行参数见
 [接口与数据契约](INTERFACES.md)。
 
 ## 1. 项目目标
@@ -40,8 +40,10 @@ flowchart TD
     ENGINE --> SKILLS["SkillRegistry"]
     ENGINE --> RUNTIME_PORT["AgentRuntime port"]
     ENGINE --> DB_PORT
+    ENGINE --> RAG["KnowledgeRAGService"]
     INCIDENT_ENGINE --> STRUCTURED_PORT["StructuredRuntime port"]
     INCIDENT_ENGINE --> DB_PORT["DatabaseReader port"]
+    INCIDENT_ENGINE --> RAG
     INCIDENT_ENGINE --> INCIDENT_STORE["IncidentSessionStore"]
     INCIDENT_ENGINE --> STATE
     ENGINE --> SESSION_PORT["SessionStore port"]
@@ -64,6 +66,8 @@ flowchart TD
     TASK_STORE --> DATA["~/.autocoding-agent/runtime/agent-runtime.db"]
     ARTIFACT_STORE --> ARTIFACT_DATA["~/.autocoding-agent/tasks/id/artifacts"]
     INCIDENT_SQLITE --> DATA
+    RAG --> RAG_DB["~/.autocoding-agent/rag/knowledge-fake.db"]
+    RAG --> KNOWLEDGE_FILES["Project Knowledge / Capability / Engineering Experience MD"]
     INCIDENT_DATA["~/.autocoding-agent/incidents"] --> INCIDENT_SQLITE
     MEMORY --> DEV_MEMORY["workspaces/id/development"]
     INCIDENT_MEMORY --> INCIDENT_MEMORY_DATA["workspaces/id/incident"]
@@ -75,6 +79,7 @@ flowchart TD
 | 系统配置 | `model_setup.py`、`sqlserver_service.py`、`workspace_config.py`、`workspace_knowledge.py` | 统一管理 Claude Code、模型服务、项目路径、共用 SQL Server 与分流程 Markdown 知识 |
 | 应用门面 | `application.py` | 组装依赖并暴露稳定的任务 API |
 | 异常领域 | `incident/` | 页面定位、只读查询计划、数据诊断及独立会话状态机 |
+| RAG | `knowledge_rag/` | 发现 Markdown、分块、建立可重建双索引、混合检索并按领域/项目/工作区过滤 |
 | 核心 | `core/` | 状态机、阶段 Handler、Decision、Artifact、Recovery、执行模式和权限校验 |
 | 端口 | `ports/` | 定义 Runtime、Session/Event/Decision/Artifact 存储所需的最小协议 |
 | 适配器 | `adapters/` | 调用 Claude Code、保存事务任务/事件/产物与能力文档、观察 Git、只读访问数据库 |
@@ -83,12 +88,13 @@ flowchart TD
 `build_application()` 是默认组合根。它创建 `ClaudeCodeRuntime`、`SQLiteTaskStore`、
 `TaskArtifactStore`、`GitWorkspaceObserver`、`AgentStateMachine`、`RecoveryManager`、
 `CapabilityStore`、`SkillRegistry`、`ExecutionPolicy` 和 `AgentEngine`，并可注入共用的
-`DatabaseReader`，然后返回
+`DatabaseReader` 和 `KnowledgeRetriever`，然后返回
 `AgentApplication`。接口层不直接依赖 Claude Code 的命令细节。
 
 `build_incident_application()` 是异常流程的组合根。它创建同一个 `ClaudeCodeRuntime`、
 `AgentStateMachine`、`SQLiteIncidentStore`、`IncidentRecoveryManager` 和能力存储，桌面端通过
-`SQLServerConnectionService` 注入 `SQLServerDatabaseReader`；原 SQLite 业务数据库路径继续用于
+`SQLServerConnectionService` 注入 `SQLServerDatabaseReader`；开发和异常组合根默认共享同一
+`KnowledgeRAGService`。原 SQLite 业务数据库路径继续用于
 CLI 兼容。开发与异常快照使用同一个 `agent-runtime.db` 的独立表，但共享生命周期事件模型、
 Runtime Run 和孤儿租约扫描。未来接入 MySQL/PostgreSQL 只需实现 `DatabaseReader`；钉钉入口只
 依赖 `IncidentApplication`。
@@ -469,7 +475,29 @@ v0.5.3 曾短暂产生的 `-cycle-NNN` 文件不会被删除；Store 在下次�
 合并、章节压缩、证据指纹、自动陈旧标记或跨工作区共享。`CAPABILITIES.md` 只是根据 task JSON
 重建的 Markdown 索引。第一项任务完成前也会存在一个明确写着暂无能力条目的空索引。
 
-## 8. 持久化和路径边界
+## 8. 手动 RAG 知识层
+
+RAG 是 Project Knowledge、Capability 和 Engineering Experience Markdown 之上的可重建
+检索视图，不是新的事实源。`KnowledgeRAGService.refresh_documents()` 只发现文档并同步
+`pending/indexed/outdated/failed/removed` 状态；任务完成不会自动建立索引。桌面知识库管理页允许
+用户预览分块并明确选择加入、重建或移除。移除索引不会删除源 Markdown。
+
+`MarkdownChunker` 先移除 frontmatter，再按标题路径、段落和 fenced code block 切分；目标约
+750 tokens、最大约 1200 tokens，同章节只保留小范围重叠。每个 Chunk 保存稳定 ID、正文 Hash、
+标题路径、来源类型、领域、项目、工作区和源路径，使向量数据库可以完全重建且结果可以引用。
+
+检索同时取 Dense Top 20 和 SQLite FTS5/BM25 Top 20，由宿主使用 RRF
+`1 / (60 + rank)` 融合，默认返回 6 个结果且每个文档最多 2 个 Chunk。开发只检索
+`development/general`，异常只检索 `incident/general`，并应用所选项目与 workspace ID 过滤。
+命中的内容以来源明确的“不可信、可能过期参考”加入只读调查 Prompt；模型仍必须用当前代码和
+已授权数据库证据复核。检索成功、空结果和失败分别形成可审计事件；检索故障不改变主任务状态。
+
+当前 `EmbeddingProvider` 是明确标识的 `fake-hash-embedding-v1`，`VectorStore` 是 SQLite 中的
+模拟向量表，二者与 Chunk/FTS5 共用 `knowledge-fake.db`。该实现只验证接口、持久化、过滤和
+工作流，不提供真实语义质量。未来 Ollama `Qwen3-Embedding-0.6B` 和向量数据库 Adapter 必须
+使用新的模型与索引标识，并对人工选择的文档全量重建；禁止把当前模拟向量迁移为正式索引。
+
+## 9. 持久化和路径边界
 
 开发任务 ID 和异常任务 ID 都必须是合法 UUID；这阻止调用方通过 session ID 构造任意路径。
 开发 Task snapshot、Event、Decision、Artifact metadata、Runtime Run 和 Command Receipt，以及
@@ -502,7 +530,7 @@ staged/unstaged diff 和未跟踪路径，但不会自动读取未跟踪文件�
 `<data_dir>/logs/autocoding-agent.log`。日志采用 2 MB `RotatingFileHandler`，默认保留 5 份；
 开发与异常流程共享同一日志文件，便于按 session ID 串联追溯。
 
-## 9. 接口独立性
+## 10. 接口独立性
 
 桌面客户端同时依赖开发 `AgentApplication` 和异常 `IncidentApplication`，通过显式流程
 选择器切换，并为每套流程维护独立的知识项目选项、当前 session 与历史列表；CLI 与 Web UI 继续使用各自

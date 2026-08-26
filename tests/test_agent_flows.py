@@ -30,6 +30,12 @@ from autocoding_agent.core.models import (
 )
 from autocoding_agent.core.state_machine.models import TaskState
 from autocoding_agent.database_models import DataQuery, QueryResult
+from autocoding_agent.knowledge_rag.models import (
+    KnowledgeDomain,
+    KnowledgeHit,
+    KnowledgeRetrievalResult,
+    KnowledgeSourceType,
+)
 
 
 class ScriptedRuntime:
@@ -64,6 +70,46 @@ class FakeDatabase:
             columns=["id", "status"],
             rows=[{"id": 42, "status": "stuck"}],
             returned_rows=1,
+        )
+
+
+class StubKnowledgeRetriever:
+    def __init__(self, *, fail: bool = False) -> None:
+        self.fail = fail
+
+    def retrieve(
+        self,
+        query: str,
+        *,
+        domain: KnowledgeDomain,
+        project: str | None = None,
+        workspace_id: str | None = None,
+        limit: int = 6,
+    ) -> KnowledgeRetrievalResult:
+        if self.fail:
+            raise RuntimeError("simulated retrieval outage")
+        assert domain == KnowledgeDomain.DEVELOPMENT
+        assert project == "生物"
+        assert workspace_id
+        assert limit == 6
+        return KnowledgeRetrievalResult(
+            query=query,
+            embedding_model="fake-hash-embedding-v1",
+            simulated=True,
+            hits=[
+                KnowledgeHit(
+                    chunk_id="chunk-development-1",
+                    document_id="document-development-1",
+                    title="MES page lookup",
+                    heading_path="Page location",
+                    content="Use the Menu URL as a relative source-location hint.",
+                    source_path="knowledge/development/生物/生物.md",
+                    source_type=KnowledgeSourceType.PROJECT,
+                    domain=KnowledgeDomain.DEVELOPMENT,
+                    project="生物",
+                    score=0.031,
+                )
+            ],
         )
 
 
@@ -241,6 +287,57 @@ def test_development_flow_can_use_shared_read_only_database(tmp_path: Path) -> N
     ] == ["inspecting", "querying_data", "inspecting", "completed"]
     assert outcome.capability_document is not None
     assert Path(outcome.capability_document).parent.parent.name == "development"
+
+
+def test_development_flow_injects_retrieved_knowledge_and_audits_it(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "repo-rag"
+    workspace.mkdir()
+    runtime = ScriptedRuntime(_completed())
+    app = build_application(
+        settings=_settings(tmp_path / "state-rag"),
+        runtime=runtime,
+        knowledge_retriever=StubKnowledgeRetriever(),
+    )
+
+    outcome = app.start(workspace, "Locate the yield upload page.", project="生物")
+
+    prompt = runtime.turns[0].system_prompt
+    assert "<retrieved_knowledge>" in prompt
+    assert "Use the Menu URL as a relative source-location hint." in prompt
+    assert "possibly stale reference material" in prompt
+    event = next(event for event in outcome.events if event.type == EventType.KNOWLEDGE_RETRIEVED)
+    assert event.data["simulated"] is True
+    assert event.data["embedding_model"] == "fake-hash-embedding-v1"
+    assert event.data["chunks"] == [
+        {
+            "chunk_id": "chunk-development-1",
+            "source": "knowledge/development/生物/生物.md",
+        }
+    ]
+
+
+def test_development_flow_continues_when_knowledge_retrieval_fails(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "repo-rag-failure"
+    workspace.mkdir()
+    runtime = ScriptedRuntime(_completed())
+    app = build_application(
+        settings=_settings(tmp_path / "state-rag-failure"),
+        runtime=runtime,
+        knowledge_retriever=StubKnowledgeRetriever(fail=True),
+    )
+
+    outcome = app.start(workspace, "Locate the yield upload page.", project="生物")
+
+    assert outcome.status == AgentStatus.COMPLETED
+    assert "<retrieved_knowledge>" not in runtime.turns[0].system_prompt
+    event = next(
+        event for event in outcome.events if event.type == EventType.KNOWLEDGE_RETRIEVAL_FAILED
+    )
+    assert event.data["error"] == "simulated retrieval outage"
 
 
 @pytest.mark.parametrize(

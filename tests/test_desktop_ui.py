@@ -8,6 +8,7 @@ from uuid import uuid4
 
 import pytest
 
+from autocoding_agent.config import Settings
 from autocoding_agent.core.models import (
     AgentOutcome,
     AgentSession,
@@ -35,7 +36,9 @@ from autocoding_agent.interfaces.desktop_ui import (
     format_approval_details,
     session_list_label,
 )
+from autocoding_agent.interfaces.knowledge_management_ui import KnowledgeManagementDialog
 from autocoding_agent.interfaces.system_settings_ui import SystemSettingsDialog
+from autocoding_agent.knowledge_rag.service import build_fake_rag_service
 from autocoding_agent.model_setup import ClaudeInstallation, ModelSetupState
 from autocoding_agent.sqlserver_config import (
     SQLServerAuthentication,
@@ -521,6 +524,38 @@ def test_busy_state_blocks_conflicting_controls(root: tk.Toplevel) -> None:
     assert client.new_task_button.cget("state") == "disabled"
     assert client.sessions_list.cget("state") == "disabled"
     assert client.model_config_button.cget("state") == "disabled"
+    assert client.knowledge_database_button.cget("state") == "disabled"
+
+
+def test_knowledge_management_lists_markdown_without_auto_indexing(
+    root: tk.Toplevel,
+    tmp_path: Path,
+) -> None:
+    project_root = tmp_path / "product"
+    document = project_root / "knowledge" / "development" / "生物" / "生物.md"
+    document.parent.mkdir(parents=True)
+    document.write_text("# 生物项目\n\n## 页面定位\n\n使用 Menu.URL 定位代码。\n", encoding="utf-8")
+    settings = Settings(
+        claude_command="claude-test.exe",
+        claude_model="test-model",
+        claude_timeout_seconds=30,
+        data_dir=tmp_path / "state",
+        max_budget_usd=None,
+    )
+    service = build_fake_rag_service(settings, project_root=project_root)
+    dialog = KnowledgeManagementDialog(root, service)
+
+    try:
+        assert dialog.service.simulated is True
+        assert dialog.service.model_id == "fake-hash-embedding-v1"
+        assert len(dialog.documents) == 1
+        indexed = next(iter(dialog.documents.values()))
+        assert indexed.status.value == "pending"
+        assert indexed.chunk_count == 0
+        assert dialog.tree.item(indexed.id, "values")[0] == "待加入"
+        assert "1 份待加入或重建" in dialog.status_var.get()
+    finally:
+        dialog.close()
 
 
 def test_system_settings_combines_model_and_shared_database_without_revealing_secrets(
