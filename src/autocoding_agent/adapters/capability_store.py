@@ -49,32 +49,100 @@ class CapabilityStore:
     ) -> CapabilityReceipt:
         directory = self.prepare(session.workspace, session.project)
         draft = decision.capability or self._fallback_draft(session, decision)
-        # The UUID-derived cycle key cannot leak a secret that the model placed in a title.
-        record_key = capability_cycle_key(session.id, session.cycle_number)
-        document = directory / "capabilities" / f"{record_key}.md"
-        task_record = directory / "tasks" / f"{record_key}.json"
+        # One stable UUID-derived file belongs to one conversation and cannot leak a model title.
+        document = directory / "capabilities" / f"{session.id}.md"
+        task_record = directory / "tasks" / f"{session.id}.json"
         index_file = directory / "CAPABILITIES.md"
+
+        workspace = str(Path(session.workspace).resolve())
+        safe = lambda value: sanitize_text(value, workspace)  # noqa: E731 - renderer helper
+        relative_document = document.relative_to(directory).as_posix()
+        cycle = self._cycle_record(session, decision, model, safe)
 
         if task_record.exists():
             stored = json.loads(task_record.read_text(encoding="utf-8"))
+            cycles = merge_cycle_entries(cycle_entries_from_record(stored))
+            recorded = {int(item["cycle_number"]) for item in cycles}
+            appendices: list[str] = []
+
+            # v0.5.3 briefly wrote one file per cycle. Preserve those files, but fold their
+            # content and metadata into the stable session document when it is next touched.
+            for legacy in legacy_cycle_records(directory, session.id):
+                for legacy_cycle in cycle_entries_from_record(legacy):
+                    number = int(legacy_cycle["cycle_number"])
+                    if number in recorded:
+                        continue
+                    cycles.append(legacy_cycle)
+                    recorded.add(number)
+                    appendices.append(render_legacy_cycle_appendix(directory, legacy, number))
+
+            if session.cycle_number not in recorded:
+                cycles.append(cycle)
+                recorded.add(session.cycle_number)
+                appendices.append(
+                    self._render_cycle_appendix(session, decision, draft, safe)
+                )
+
+            cycles = merge_cycle_entries(cycles)
+            if appendices:
+                created_at = str(
+                    stored.get("created_at")
+                    or stored.get("completed_at")
+                    or cycles[0].get("completed_at")
+                    or session.updated_at.isoformat()
+                )
+                body = markdown_body(
+                    document.read_text(encoding="utf-8")
+                    if document.is_file()
+                    else "# Recovered development capability\n"
+                )
+                header = capability_frontmatter(
+                    workflow="development",
+                    session_id=session.id,
+                    cycle_count=len(cycles),
+                    last_cycle_number=max(recorded),
+                    model=model,
+                    created_at=created_at,
+                    updated_at=session.updated_at.isoformat(),
+                )
+                markdown = header + body.rstrip() + "\n\n" + "\n\n".join(appendices) + "\n"
+                self._atomic_text(document, markdown)
+                stored.update(
+                    {
+                        "schema_version": 2,
+                        "cycle_number": session.cycle_number,
+                        "cycle_count": len(cycles),
+                        "last_cycle_number": max(recorded),
+                        "cycle_objective": cycle["cycle_objective"],
+                        "outcome": cycle["outcome"],
+                        "changed_files": cycle["changed_files"],
+                        "test_summary": cycle["test_summary"],
+                        "model": model,
+                        "completed_at": session.updated_at.isoformat(),
+                        "updated_at": session.updated_at.isoformat(),
+                        "created_at": created_at,
+                        "document": relative_document,
+                        "cycles": cycles,
+                    }
+                )
+                self._atomic_text(task_record, json.dumps(stored, ensure_ascii=False, indent=2))
+
             self._rebuild_index(directory, session.project)
             return CapabilityReceipt(
-                document_path=str(directory / stored["document"]),
+                document_path=str(document),
                 index_path=str(index_file),
                 created=False,
             )
 
-        workspace = str(Path(session.workspace).resolve())
-        safe = lambda value: sanitize_text(value, workspace)  # noqa: E731 - renderer helper
         markdown = self._render_markdown(session, decision, draft, model, safe)
         self._atomic_text(document, markdown)
-
-        relative_document = document.relative_to(directory).as_posix()
         record: dict[str, Any] = {
-            "schema_version": 1,
+            "schema_version": 2,
             "task_id": session.id,
             "session_id": session.id,
             "cycle_number": session.cycle_number,
+            "cycle_count": 1,
+            "last_cycle_number": session.cycle_number,
             "workspace_id": directory.parent.name,
             "project": session.project,
             "goal": safe(session.goal),
@@ -85,6 +153,9 @@ class CapabilityStore:
             "document": relative_document,
             "model": model,
             "completed_at": session.updated_at.isoformat(),
+            "created_at": session.updated_at.isoformat(),
+            "updated_at": session.updated_at.isoformat(),
+            "cycles": [cycle],
         }
         self._atomic_text(task_record, json.dumps(record, ensure_ascii=False, indent=2))
         self._rebuild_index(directory, session.project)
@@ -93,6 +164,23 @@ class CapabilityStore:
             index_path=str(index_file),
             created=True,
         )
+
+    @staticmethod
+    def _cycle_record(
+        session: AgentSession,
+        decision: AgentDecision,
+        model: str,
+        safe: Any,
+    ) -> dict[str, Any]:
+        return {
+            "cycle_number": session.cycle_number,
+            "cycle_objective": safe(session.cycle_objective or session.goal),
+            "outcome": safe(decision.message),
+            "changed_files": [safe(path) for path in decision.changed_files],
+            "test_summary": safe(decision.test_summary or ""),
+            "model": model,
+            "completed_at": session.updated_at.isoformat(),
+        }
 
     def _workspace_dir(self, workspace: str | Path) -> Path:
         canonical = str(Path(workspace).resolve()).casefold()
@@ -145,15 +233,15 @@ class CapabilityStore:
             f"{item.path}: {item.summary}" if item.path else item.summary
             for item in decision.evidence
         ]
-        return f"""---
-schema_version: 1
-session_id: {json.dumps(session.id)}
-cycle_number: {session.cycle_number}
-model: {json.dumps(model)}
-completed_at: {json.dumps(session.updated_at.isoformat())}
----
-
-# {safe(draft.title).replace(chr(10), " ")}
+        return capability_frontmatter(
+            workflow="development",
+            session_id=session.id,
+            cycle_count=1,
+            last_cycle_number=session.cycle_number,
+            model=model,
+            created_at=session.updated_at.isoformat(),
+            updated_at=session.updated_at.isoformat(),
+        ) + f"""# {safe(draft.title).replace(chr(10), " ")}
 
 {safe(draft.summary)}
 
@@ -186,27 +274,73 @@ completed_at: {json.dumps(session.updated_at.isoformat())}
 - 变更文件：{", ".join(safe(path) for path in decision.changed_files) or "无"}
 """
 
+    @staticmethod
+    def _render_cycle_appendix(
+        session: AgentSession,
+        decision: AgentDecision,
+        draft: CapabilityDraft,
+        safe: Any,
+    ) -> str:
+        def bullets(values: list[str], empty: str) -> str:
+            return "\n".join(f"- {safe(item)}" for item in values) or f"- {empty}"
+
+        evidence = [
+            f"{item.path}: {item.summary}" if item.path else item.summary
+            for item in decision.evidence
+        ]
+        return f"""---
+
+## 后续工作轮次 {session.cycle_number}：{safe(draft.title).replace(chr(10), " ")}
+
+- 本轮目标：{safe(session.cycle_objective or session.goal)}
+- 完成时间：{session.updated_at.isoformat()}
+- 本轮结果：{safe(decision.message)}
+- 变更文件：{", ".join(safe(path) for path in decision.changed_files) or "无"}
+
+### 总结
+
+{safe(draft.summary)}
+
+### 适用场景
+
+{bullets(draft.triggers, "仅在与本轮上下文相符时参考。")}
+
+### 方法
+
+{bullets(draft.method, "暂无额外步骤。")}
+
+### 验证
+
+{bullets(draft.validation, safe(decision.test_summary or "本轮未记录可执行验证。"))}
+
+### 风险与边界
+
+{bullets(draft.risks, "使用前以当前代码和用户要求重新核实。")}
+
+### 任务证据
+
+{bullets(evidence, "本轮未记录文件证据。")}"""
+
     def _rebuild_index(self, directory: Path, project: str | None = None) -> None:
         pinned = pinned_markdown_entries(directory, project)
         entries: list[str] = []
-        records = [
-            json.loads(record_file.read_text(encoding="utf-8"))
-            for record_file in (directory / "tasks").glob("*.json")
-        ]
+        records = session_index_records(directory)
         records.sort(
             key=lambda item: (
                 str(item.get("completed_at", "")),
                 str(item.get("session_id", "")),
-                int(item.get("cycle_number", 1)),
+                int(item.get("last_cycle_number", item.get("cycle_number", 1))),
             )
         )
         for record in records:
-            document = directory / record["document"]
+            document = capability_document_path(directory, record)
+            if document is None:
+                continue
             title = _markdown_title(document.read_text(encoding="utf-8"))
             summary = str(record.get("outcome", "")).replace("\n", " ").strip()
-            cycle = int(record.get("cycle_number", 1))
+            cycle_count = int(record.get("cycle_count", 1))
             entries.append(
-                f"- [第 {cycle} 轮 · {title}]({record['document']}) — {summary[:240]}"
+                f"- [共 {cycle_count} 轮 · {title}]({record['document']}) — {summary[:240]}"
             )
         content = (
             """# Development Capabilities
@@ -235,12 +369,168 @@ only entries relevant to the current task and verify them against current reposi
         temporary.replace(path)
 
 
-def capability_cycle_key(session_id: str, cycle_number: int) -> str:
-    """Keep legacy first-cycle names while assigning every later completion a new file."""
+def capability_frontmatter(
+    *,
+    workflow: str,
+    session_id: str,
+    cycle_count: int,
+    last_cycle_number: int,
+    model: str,
+    created_at: str,
+    updated_at: str,
+) -> str:
+    """Render the mutable summary header for one append-only conversation document."""
 
-    if cycle_number < 1:
-        raise ValueError("cycle_number must be at least 1")
-    return session_id if cycle_number == 1 else f"{session_id}-cycle-{cycle_number:03d}"
+    return f"""---
+schema_version: 2
+workflow: {json.dumps(workflow)}
+session_id: {json.dumps(session_id)}
+cycle_count: {cycle_count}
+last_cycle_number: {last_cycle_number}
+model: {json.dumps(model)}
+created_at: {json.dumps(created_at)}
+updated_at: {json.dumps(updated_at)}
+---
+
+"""
+
+
+def markdown_body(content: str) -> str:
+    """Remove existing YAML frontmatter while leaving the knowledge body unchanged."""
+
+    if not content.startswith("---"):
+        return content.lstrip()
+    match = re.match(r"\A---\r?\n.*?\r?\n---\r?\n", content, flags=re.DOTALL)
+    return content[match.end() :].lstrip() if match else content.lstrip()
+
+
+def cycle_entries_from_record(record: dict[str, Any]) -> list[dict[str, Any]]:
+    """Read v2 aggregate cycles or convert a v1 per-cycle task record."""
+
+    entries = record.get("cycles")
+    if isinstance(entries, list):
+        return [dict(item) for item in entries if isinstance(item, dict)]
+    return [
+        {
+            "cycle_number": int(record.get("cycle_number", 1)),
+            "cycle_objective": record.get("cycle_objective")
+            or record.get("goal")
+            or record.get("problem")
+            or "",
+            "outcome": record.get("outcome", ""),
+            "changed_files": record.get("changed_files", []),
+            "test_summary": record.get("test_summary", ""),
+            "model": record.get("model", ""),
+            "completed_at": record.get("completed_at", ""),
+        }
+    ]
+
+
+def merge_cycle_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Deduplicate cycle metadata by cycle number and return it in execution order."""
+
+    merged: dict[int, dict[str, Any]] = {}
+    for entry in entries:
+        number = int(entry.get("cycle_number", 1))
+        merged[number] = {**entry, "cycle_number": number}
+    return [merged[number] for number in sorted(merged)]
+
+
+def legacy_cycle_records(directory: Path, session_id: str) -> list[dict[str, Any]]:
+    """Load v0.5.3 per-cycle records without deleting their immutable source files."""
+
+    records: list[dict[str, Any]] = []
+    for path in sorted((directory / "tasks").glob(f"{session_id}-cycle-*.json")):
+        try:
+            records.append(json.loads(path.read_text(encoding="utf-8")))
+        except (OSError, json.JSONDecodeError):
+            continue
+    return records
+
+
+def render_legacy_cycle_appendix(
+    directory: Path,
+    record: dict[str, Any],
+    cycle_number: int,
+) -> str:
+    """Turn a preserved v0.5.3 cycle document into a section of the session document."""
+
+    document = capability_document_path(directory, record)
+    if document is None:
+        return f"""---
+
+## 后续工作轮次 {cycle_number}（历史记录）
+
+- 本轮目标：{record.get("cycle_objective", "未记录")}
+- 本轮结果：{record.get("outcome", "未记录")}
+- 原能力文档缺失，仅保留了任务元数据。"""
+    body = markdown_body(document.read_text(encoding="utf-8"))
+    lines = body.splitlines()
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    if lines and lines[0].startswith("# "):
+        lines.pop(0)
+    nested = "\n".join(
+        f"#{line}" if re.match(r"^#{2,5}\s", line) else line for line in lines
+    ).strip()
+    return f"""---
+
+## 后续工作轮次 {cycle_number}（历史记录迁移）
+
+{nested or f'- 本轮结果：{record.get("outcome", "未记录")}'}"""
+
+
+def capability_document_path(
+    directory: Path,
+    record: dict[str, Any],
+) -> Path | None:
+    """Resolve a task record document without allowing it to escape its workspace memory."""
+
+    relative = str(record.get("document", ""))
+    if not relative:
+        return None
+    document = (directory / relative).resolve()
+    return document if document.is_relative_to(directory.resolve()) and document.is_file() else None
+
+
+def session_index_records(directory: Path) -> list[dict[str, Any]]:
+    """Return one index record per Session, including preserved v0.5.3 cycle files."""
+
+    grouped: dict[str, list[tuple[Path, dict[str, Any]]]] = {}
+    for path in (directory / "tasks").glob("*.json"):
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        session_id = str(record.get("session_id") or record.get("task_id") or path.stem)
+        grouped.setdefault(session_id, []).append((path, record))
+
+    result: list[dict[str, Any]] = []
+    for session_id, candidates in grouped.items():
+        base = next(
+            (record for path, record in candidates if path.stem == session_id),
+            max(
+                (record for _, record in candidates),
+                key=lambda item: int(item.get("cycle_number", 1)),
+            ),
+        )
+        cycles = merge_cycle_entries(
+            [
+                cycle
+                for _, record in candidates
+                for cycle in cycle_entries_from_record(record)
+            ]
+        )
+        latest = cycles[-1] if cycles else {}
+        indexed = dict(base)
+        indexed["cycle_count"] = len(cycles) or 1
+        indexed["last_cycle_number"] = int(latest.get("cycle_number", 1))
+        indexed["outcome"] = latest.get("outcome", indexed.get("outcome", ""))
+        indexed["completed_at"] = latest.get(
+            "completed_at", indexed.get("completed_at", "")
+        )
+        result.append(indexed)
+    return result
 
 
 def _markdown_title(content: str) -> str:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections import deque
 from pathlib import Path
 
@@ -448,7 +449,7 @@ def test_session_can_resume_after_application_restart(tmp_path: Path) -> None:
     assert restarted_app.get_session(first.session_id).task_state == TaskState.COMPLETED
 
 
-def test_completed_development_session_reopens_as_independent_cycle(
+def test_completed_development_session_appends_to_one_capability_document(
     tmp_path: Path,
 ) -> None:
     workspace = tmp_path / "repo-follow-up"
@@ -463,6 +464,7 @@ def test_completed_development_session_reopens_as_independent_cycle(
 
     first = app.start(workspace, "Inspect the upload behavior.")
     first_document = Path(first.capability_document or "")
+    first_content = first_document.read_text(encoding="utf-8")
     persisted = SQLiteTaskStore(state)
     before_follow_up = persisted.load(first.session_id)
     before_follow_up.query_rounds = 2
@@ -492,10 +494,27 @@ def test_completed_development_session_reopens_as_independent_cycle(
     assert runtime.turns[1].runtime_session_id == "claude-follow-up-session"
     assert first_document.is_file()
     assert second_document.is_file()
-    assert first_document != second_document
-    assert second_document.name.endswith("-cycle-002.md")
-    assert "cycle_number: 1" in first_document.read_text(encoding="utf-8")
-    assert "cycle_number: 2" in second_document.read_text(encoding="utf-8")
+    assert first_document == second_document
+    assert second_document.name == f"{first.session_id}.md"
+    updated_content = second_document.read_text(encoding="utf-8")
+    assert first_content != updated_content
+    assert "First cycle complete." in updated_content
+    assert "cycle_count: 2" in updated_content
+    assert "last_cycle_number: 2" in updated_content
+    assert "## 后续工作轮次 2" in updated_content
+    assert "Continue: explain the retry behavior." in updated_content
+    capability_dir = second_document.parent
+    assert len(list(capability_dir.glob("*.md"))) == 1
+    task_record = json.loads(
+        (capability_dir.parent / "tasks" / f"{first.session_id}.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert task_record["cycle_count"] == 2
+    assert [item["cycle_number"] for item in task_record["cycles"]] == [1, 2]
+    index = (capability_dir.parent / "CAPABILITIES.md").read_text(encoding="utf-8")
+    assert index.count(f"capabilities/{first.session_id}.md") == 1
+    assert "共 2 轮" in index
     assert persisted.replay_task_state(first.session_id) == TaskState.COMPLETED
     event_types = [event.type for event in session.events]
     assert event_types.count(EventType.TASK_REOPENED) == 1
@@ -586,6 +605,65 @@ def test_completed_capability_is_idempotent_and_redacts_sensitive_data(tmp_path:
     assert str(workspace.resolve()) not in persisted_text
     assert "[REDACTED]" in persisted_text
     assert "<WORKSPACE>" in persisted_text
+
+
+def test_capability_store_folds_legacy_cycle_records_into_session_document(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "legacy-cycle-repo"
+    workspace.mkdir()
+    session = AgentSession(
+        workspace=str(workspace.resolve()),
+        goal="Inspect upload retries.",
+        cycle_objective="Inspect upload retries.",
+    )
+    store = CapabilityStore(tmp_path / "legacy-cycle-state")
+    first = store.record(session, _completed("Cycle one."), "test-model")
+    directory = Path(first.index_path).parent
+    legacy_key = f"{session.id}-cycle-002"
+    legacy_document = directory / "capabilities" / f"{legacy_key}.md"
+    legacy_document.write_text(
+        "---\nschema_version: 1\ncycle_number: 2\n---\n\n"
+        "# Legacy cycle\n\n## Result\n\nLegacy cycle two result.\n",
+        encoding="utf-8",
+    )
+    (directory / "tasks" / f"{legacy_key}.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "session_id": session.id,
+                "cycle_number": 2,
+                "cycle_objective": "Check backoff.",
+                "outcome": "Legacy cycle two result.",
+                "document": f"capabilities/{legacy_key}.md",
+                "model": "test-model",
+                "completed_at": session.updated_at.isoformat(),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    session.cycle_number = 3
+    session.cycle_objective = "Check retry observability."
+    third = store.record(session, _completed("Cycle three."), "test-model")
+    after_first_write = Path(third.document_path).read_text(encoding="utf-8")
+    duplicate = store.record(session, _completed("Cycle three."), "test-model")
+    after_duplicate = Path(duplicate.document_path).read_text(encoding="utf-8")
+    aggregate = json.loads(
+        (directory / "tasks" / f"{session.id}.json").read_text(encoding="utf-8")
+    )
+    index = (directory / "CAPABILITIES.md").read_text(encoding="utf-8")
+
+    assert third.document_path == first.document_path == duplicate.document_path
+    assert third.created is duplicate.created is False
+    assert after_duplicate == after_first_write
+    assert "## 后续工作轮次 2（历史记录迁移）" in after_duplicate
+    assert "Legacy cycle two result." in after_duplicate
+    assert "## 后续工作轮次 3" in after_duplicate
+    assert [item["cycle_number"] for item in aggregate["cycles"]] == [1, 2, 3]
+    assert aggregate["cycle_count"] == 3
+    assert index.count(f"capabilities/{session.id}.md") == 1
+    assert "共 3 轮" in index
 
 
 @pytest.mark.parametrize(

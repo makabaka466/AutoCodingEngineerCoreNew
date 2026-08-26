@@ -1,6 +1,6 @@
 # AutoCoding Engineer 接口与数据契约
 
-本文记录当前 `0.5.3` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
+本文记录当前 `0.5.4` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
 Runtime、持久化和状态契约。
 设计动机和运行流程见[架构说明](ARCHITECTURE.md)。
 
@@ -107,8 +107,8 @@ def build_application(
 | `failed` | Runtime、输出契约或策略检查失败 |
 
 `AgentStatus` 是模型本轮结构化决定/公开 Outcome 类型，不是任务生命周期。`completed` 会触发
-本轮独立能力文档保存；新的 `send` 会增加 cycle 并重新进入只读轮次。`failed` 当前也可以通过
-`send` 重新进入只读轮次。
+当前 Session 能力文档的创建或追加；新的 `send` 会增加 cycle 并重新进入只读轮次。`failed`
+当前也可以通过 `send` 重新进入只读轮次。
 
 ### 2.3 `AgentMode`
 
@@ -578,14 +578,15 @@ CapabilityReceipt
 
 ### 6.1 task JSON
 
-第 1 轮使用 `tasks/<session-id>.json`，后续使用
-`tasks/<session-id>-cycle-<NNN>.json`。共享字段和开发专有字段包括：
+一个 Session 始终使用 `tasks/<session-id>.json`。共享字段和开发专有字段包括：
 
 ```text
 schema_version
 task_id
 session_id
 cycle_number
+cycle_count
+last_cycle_number
 workspace_id
 goal
 cycle_objective
@@ -595,18 +596,22 @@ test_summary
 document
 model
 completed_at
+created_at
+updated_at
+cycles
 ```
 
 异常记录使用相同的 `session_id/cycle_number/cycle_objective/document/model/completed_at`，并以
 `problem` 代替开发记录的 `goal`；开发记录另外保存 changed files 和 test summary。
 
-`document` 是相对于当前工作区能力目录的 POSIX 风格路径。task JSON 的存在也是当前
-幂等判断依据。
+`cycles` 是按 `cycle_number` 排序的完成历史；开发条目记录本轮目标、结果、变更文件和测试，
+异常条目记录本轮目标、结果、诊断和建议动作。`document` 是相对于当前工作区能力目录的 POSIX
+风格路径。主 task JSON 中已存在的 cycle 编号是追加幂等判断依据。
 
 ### 6.2 能力 Markdown
 
-文档 frontmatter 包含 `schema_version`、`session_id`、`cycle_number`、`model`、`completed_at`，
-正文包含：
+文档 frontmatter 包含 `schema_version`、`workflow`、`session_id`、`cycle_count`、
+`last_cycle_number`、`model`、`created_at` 和 `updated_at`，正文包含：
 
 - 标题和摘要；
 - 适用场景；
@@ -616,12 +621,13 @@ completed_at
 - 任务证据；
 - 来源目标、结果和变更文件。
 
-第 1 轮文件名为 `<session-id>.md`，后续为 `<session-id>-cycle-002.md` 等独立文件。同一轮
-重复记录返回已有文件，新一轮不会修改或追加旧 MD。文件名不使用模型生成的标题，从根本上
-避免标题里的敏感值通过文件名或索引链接泄漏。
+文件名始终为 `<session-id>.md`。首次完成写入完整正文；后续 cycle 完成时在同一文件追加
+“后续工作轮次”或“后续诊断轮次”章节。同一 cycle 重复记录返回已有内容，不会重复追加。
+文件名不使用模型生成的标题，从根本上避免标题里的敏感值通过文件名或索引链接泄漏。
 
-`CAPABILITIES.md` 由全部 task JSON 重建，每项链接到对应能力文档，并附最终结果的前
-240 个字符。该索引明确提示历史知识可能过期。
+`CAPABILITIES.md` 由 task JSON 重建，每个 Session 只生成一个链接，显示累计完成轮次和最新结果
+前 240 个字符。该索引明确提示历史知识可能过期。v0.5.3 的旧逐轮记录在索引层按 Session 去重，
+后续写入时可以折叠进主文档，旧源文件不自动删除。
 
 ## 7. CLI 接口
 
@@ -813,8 +819,8 @@ outcome = incidents.start(
 | `events(session_id)` / `runs(session_id)` | 返回可审计事件与 Runtime Run |
 
 `source` 与 `external_reference` 为钉钉消息来源和外部消息/工单 ID 预留。当前调用是同步的；
-`completed` 会话允许继续发送并生成新的逐轮异常能力文档。`recovery_scan` 给出本次应用启动
-发现并暂停的孤儿异常任务。
+`completed` 会话允许继续发送；再次完成时把新诊断追加到原异常能力文档。`recovery_scan` 给出
+本次应用启动发现并暂停的孤儿异常任务。
 
 ### 11.2 状态与结构化决定
 

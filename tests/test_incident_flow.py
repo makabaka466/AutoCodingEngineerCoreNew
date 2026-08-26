@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Iterable
 from pathlib import Path
@@ -177,7 +178,7 @@ def test_incident_flow_locates_page_queries_data_and_diagnoses(tmp_path: Path) -
     assert any(event.type == EventType.DATABASE_QUERIES_EXECUTED for event in outcome.events)
 
 
-def test_completed_incident_reopens_and_writes_a_new_cycle_document(
+def test_completed_incident_reopens_and_appends_to_one_capability_document(
     tmp_path: Path,
 ) -> None:
     workspace = tmp_path / "workspace-follow-up"
@@ -209,6 +210,8 @@ def test_completed_incident_reopens_and_writes_a_new_cycle_document(
     )
 
     first = engine.start(workspace, "Order page is stale", "/orders/42")
+    first_document = Path(first.capability_document or "")
+    first_content = first_document.read_text(encoding="utf-8")
     saved = store.load(first.session_id)
     saved.query_rounds = 2
     store.save(saved)
@@ -223,7 +226,6 @@ def test_completed_incident_reopens_and_writes_a_new_cycle_document(
         command_id="incident-follow-up-2",
     )
     session = store.load(first.session_id)
-    first_document = Path(first.capability_document or "")
     second_document = Path(second.capability_document or "")
 
     assert second.status == duplicate.status == IncidentStatus.COMPLETED
@@ -236,10 +238,27 @@ def test_completed_incident_reopens_and_writes_a_new_cycle_document(
     assert len(runtime.turns) == 2
     assert first_document.is_file()
     assert second_document.is_file()
-    assert first_document != second_document
-    assert second_document.name.endswith("-cycle-002.md")
-    assert "cycle_number: 1" in first_document.read_text(encoding="utf-8")
-    assert "cycle_number: 2" in second_document.read_text(encoding="utf-8")
+    assert first_document == second_document
+    assert second_document.name == f"{first.session_id}.md"
+    updated_content = second_document.read_text(encoding="utf-8")
+    assert first_content != updated_content
+    assert "The first symptom is explained." in updated_content
+    assert "cycle_count: 2" in updated_content
+    assert "last_cycle_number: 2" in updated_content
+    assert "## 后续诊断轮次 2" in updated_content
+    assert "does the refresh action use the same endpoint" in updated_content
+    capability_dir = second_document.parent
+    assert len(list(capability_dir.glob("*.md"))) == 1
+    task_record = json.loads(
+        (capability_dir.parent / "tasks" / f"{first.session_id}.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert task_record["cycle_count"] == 2
+    assert [item["cycle_number"] for item in task_record["cycles"]] == [1, 2]
+    index = (capability_dir.parent / "CAPABILITIES.md").read_text(encoding="utf-8")
+    assert index.count(f"capabilities/{first.session_id}.md") == 1
+    assert "共 2 轮" in index
     event_types = [event.type for event in session.events]
     assert event_types.count(EventType.TASK_REOPENED) == 1
     assert event_types.count(EventType.TASK_COMPLETED) == 2

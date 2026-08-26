@@ -1,6 +1,6 @@
 # AutoCoding Engineer 架构说明
 
-本文描述当前 `0.5.3` 代码已经实现的架构。数据字段、公共方法和命令行参数见
+本文描述当前 `0.5.4` 代码已经实现的架构。数据字段、公共方法和命令行参数见
 [接口与数据契约](INTERFACES.md)。
 
 ## 1. 项目目标
@@ -402,7 +402,8 @@ flowchart LR
 ```
 
 只有 `completed` 会触发 `CapabilityStore.record()`。澄清、查询、审批和验证只是同一工作轮次的
-中间状态，不单独生成 MD。模型应在最终决定中提供
+中间状态，不单独生成或追加 MD。一个新 Session 首次完成时创建一份文档；同一 Session 重新打开
+并再次完成时，把本轮内容追加到原文档。模型应在最终决定中提供
 `CapabilityDraft`；若没有，存储器会根据目标、最终消息、下一步和测试摘要创建保底草稿。
 
 当前落盘结构是：
@@ -419,13 +420,13 @@ flowchart LR
    ├─ development/
    │  ├─ CAPABILITIES.md
    │  ├─ pinned/<二级路径>/<二级路径名>.md
-   │  ├─ tasks/<session-id>[-cycle-NNN].json
-   │  └─ capabilities/<session-id>[-cycle-NNN].md
+   │  ├─ tasks/<session-id>.json
+   │  └─ capabilities/<session-id>.md
    └─ incident/
       ├─ CAPABILITIES.md
       ├─ pinned/<二级路径>/<二级路径名>.md
-      ├─ tasks/<session-id>[-cycle-NNN].json
-      └─ capabilities/<session-id>[-cycle-NNN].md
+      ├─ tasks/<session-id>.json
+      └─ capabilities/<session-id>.md
 ```
 
 用户直接维护的源文件不在 `<data_dir>`，而在本项目：
@@ -441,9 +442,11 @@ knowledge/
 结果、变更文件、测试摘要、模型和能力文档相对路径。写入前会替换工作区绝对路径、用户
 主目录以及常见 token/password/secret 形式。Markdown 和 JSON 都通过临时文件替换写入。
 
-同一 session 的第 1 轮沿用 `<session-id>.md` 保持兼容，第 2 轮起使用
-`<session-id>-cycle-002.md`。每轮以自己的 task JSON 为幂等依据：重复记录同一轮返回原文档且
-`created=false`，新轮次写入新的不可覆盖文档并独立加入索引。
+同一 Session 始终使用 `<session-id>.md` 和 `<session-id>.json`。主 task JSON 保存 `cycles`、
+`cycle_count` 和 `last_cycle_number`；已记录的 cycle 再次提交时直接返回，不重复追加。新 cycle
+完成时原子重写 frontmatter 并在正文末尾追加独立的后续轮次章节，索引仍只有一个 Session 条目。
+v0.5.3 曾短暂产生的 `-cycle-NNN` 文件不会被删除；Store 在下次触碰该 Session 时读取其元数据、
+把内容折叠进主文档，并在索引中按 Session 去重。
 能力保存失败只追加 `capability_failed` 事件，不会把已经完成的软件任务改为失败。
 
 只读轮次通过 Claude Code 的 `--add-dir` 获得当前流程自己的工作区能力目录，并被提示先查看
@@ -453,9 +456,9 @@ knowledge/
 
 ### 当前能力记忆边界
 
-当前实现是“每个完成工作轮次一份能力文档”，尚未实现语义去重、跨任务合并、修订历史、证据
-指纹、自动陈旧标记或跨工作区共享。`CAPABILITIES.md` 只是根据 task JSON 重建的 Markdown
-索引。第一项任务完成前也会存在一个明确写着暂无能力条目的空索引。
+当前实现是“每个完成 Session 一份能力文档，后续 cycle 追加章节”，尚未实现语义去重、跨任务
+合并、章节压缩、证据指纹、自动陈旧标记或跨工作区共享。`CAPABILITIES.md` 只是根据 task JSON
+重建的 Markdown 索引。第一项任务完成前也会存在一个明确写着暂无能力条目的空索引。
 
 ## 8. 持久化和路径边界
 

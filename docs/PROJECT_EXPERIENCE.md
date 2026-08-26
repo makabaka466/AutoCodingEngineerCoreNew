@@ -1,8 +1,8 @@
 # AutoCodingEngineerCoreNew 项目开发与工程经验
 
-> 文档基线：2026-08-25，项目版本 `0.5.3`。本文以当前代码为准，并明确区分“已实现”、
-> “当前限制”和“后续规划”。本版本完成任务卡 `ACE-RUNTIME-001`：开发 Agent 已升级为由
-> 状态机、追加事件、运行记录、决策审计、任务产物和保守恢复共同驱动的可恢复 Runtime。
+> 文档基线：2026-08-26，项目版本 `0.5.4`。本文以当前代码为准，并明确区分“已实现”、
+> “当前限制”和“后续规划”。当前 Agent 已具备状态机、追加事件、运行记录、决策审计、
+> 任务产物、保守恢复，以及按会话持续沉淀开发/异常能力知识的 Runtime 内核。
 
 ## 1. 文档目的
 
@@ -1579,6 +1579,9 @@ SQLite 乐观并发拒绝、异常孤儿 run 启动暂停和显式恢复，以�
 
 ## 23. 已完成会话续聊与逐轮能力文档
 
+> 历史决策说明：本节记录 `v0.5.3` 引入完成后续聊时的原始设计。状态机与 Cycle 设计继续有效；
+> “每个 Cycle 单独生成 MD”的 ADR-033 已在 `v0.5.4` 被第 24 节的新决策替代。
+
 ### 23.1 背景问题
 
 早期实现把 `completed` 同时解释为“模型已经完成本次工作”和“整个会话永久关闭”：状态转换表
@@ -1655,3 +1658,128 @@ Project Knowledge 和 Engineering Experience 总文档也不会自动混入完�
 SQLite 回放、Runtime Session 复用、查询/重规划预算重置、逐轮 MD 命名、同 command ID 幂等、
 Artifact cycle metadata，以及桌面两套流程完成后继续输入。最终验证结果记录在
 `docs/tasks/ACE-RUNTIME-006-reopen-completed-session.md`。
+
+---
+
+## 24. 会话级能力文档与续聊追加
+
+### 24.1 需求修订与业务理解
+
+`v0.5.3` 解决了“completed 后不能继续对话”，并将每次重新完成视为一个独立 Cycle 文档。这在
+技术上边界清晰，却把同一个问题的连续调查拆散成多个文件：首轮完成、用户追问、补充修改和最终
+结论彼此高度相关，检索时却会命中多个相似条目，既增加索引噪声，也让 Agent 难以判断哪一份代表
+当前会话的最终认识。
+
+业务规则最终明确为：
+
+```text
+新建开发 Session ──首次 completed──> 新建 development/<session-id>.md
+                         │
+                         └─续聊后再次 completed──> 追加原 development MD
+
+新建异常 Session ──首次 completed──> 新建 incident/<session-id>.md
+                         │
+                         └─续聊后再次 completed──> 追加原 incident MD
+```
+
+这里的“新文档”边界是 Session，而不是一条消息或一个 Cycle。澄清、查库、审批、实施和验证仍是
+Cycle 中间阶段，不写能力文档；同一 Session 的下一次 completed 只增加一个带轮次编号的章节。
+用户点击“新建任务”产生新的 Session 时，才会产生新的 MD。开发和异常处理使用不同目录、索引和
+正文结构，即使 Session 目标相似也不会混写。
+
+### 24.2 设计思路
+
+Session、Cycle 和 Capability 现在各自承担不同职责：
+
+- Session 是对话与知识文档的身份边界，一份 Session 对应一份主 task JSON 和一份 Capability MD；
+- Cycle 是执行与审计边界，继续负责状态转换、预算重置、Event、Artifact 和幂等；
+- Capability MD 是会话级知识视图，首轮写完整能力，后续轮次追加结构化章节；
+- `CAPABILITIES.md` 是 Session 级索引，不为同一会话重复创建条目。
+
+因此没有删除 `cycle_number`、`cycle_objective` 或 `cycle_query_observation_start`。如果为了合并 MD
+而移除 Cycle，会同时破坏查询次数重置、恢复回放和“本轮数据不混入上轮总结”等已经验证的能力。
+本次只改变知识产物的聚合键，不改变 Runtime 生命周期。
+
+### 24.3 核心实现
+
+开发 `CapabilityStore` 和异常 `IncidentCapabilityStore` 都改用稳定路径：
+
+```text
+workspaces/<workspace-id>/development/
+├─ tasks/<session-id>.json
+└─ capabilities/<session-id>.md
+
+workspaces/<workspace-id>/incident/
+├─ tasks/<session-id>.json
+└─ capabilities/<session-id>.md
+```
+
+首次 completed 时写入 schema v2 task JSON，除原字段外增加：
+
+- `cycle_count`：当前主文档包含的完成轮次数；
+- `last_cycle_number`：最后一次完成的 Cycle；
+- `created_at/updated_at`：会话知识文档的创建和更新时间；
+- `cycles`：按轮次保存目标、结果及流程专有摘要的轻量历史。
+
+后续 completed 时，Store 先读取 `cycles` 判断当前 `cycle_number` 是否已经记录。已存在则直接返回，
+防止命令重试或重复保存产生重复章节；不存在时才更新 frontmatter，并把当前轮内容追加到正文。
+开发章节保存目标、总结、方法、验证、风险、证据和变更文件；异常章节保存页面/路由、代码定位、
+诊断、发现、数据库查询审计、建议动作与自动化边界。所有新文本仍经过路径与密钥脱敏，文件更新
+仍使用临时文件替换，避免进程中断留下半份 Markdown 或 JSON。
+
+`CapabilityReceipt.created` 没有扩展公共契约：首次创建返回 true；后续追加或同轮幂等返回 false。
+调用方只需要展示稳定文档路径，不需要理解文件更新细节。
+
+### 24.4 旧版本兼容
+
+`v0.5.3` 曾使用 `<session-id>-cycle-002.md/json`。直接删除这些文件会损失已经沉淀的事实，继续把
+它们全部放入索引又会违背“一会话一条知识”的新语义。因此采用保守兼容：
+
+1. 不自动删除旧逐轮文件，保留可回退原始证据；
+2. 重建索引时按 `session_id` 聚合，只展示一个主文档链接和累计轮次；
+3. 同一 Session 下次写入时读取旧 task JSON，把尚未进入主文档的旧轮次正文折叠为“历史记录迁移”
+   章节，并把轮次元数据合并进主 task JSON；
+4. 合并以 `cycle_number` 去重，重复调用不会再次追加迁移章节。
+
+这个策略刻意避免后台批量迁移全部工作区。只有再次使用的热会话才按需折叠，降低启动成本，也
+避免一次性大范围改写用户本机的历史知识文件。
+
+### 24.5 技术难点与解决方案
+
+**追加与原子性冲突。** 直接使用文件 append 可以保留旧正文，却无法可靠同步 frontmatter 的
+`cycle_count/updated_at`，而且 Markdown 成功、JSON 失败时容易不一致。实现选择读取旧正文、重建
+小型 frontmatter、追加新章节后整体写入临时文件并原子替换。逻辑语义是追加，物理写入仍具备
+崩溃安全性。
+
+**索引不能按文件数量计数。** 兼容目录可能同时存在主文件和 v0.5.3 逐轮文件。索引生成器按
+`session_id` 分组，再合并各 task JSON 的 Cycle 元数据，选择主记录作为链接，从而不会把一个会话
+显示成多个能力。
+
+**同一文档可能逐渐变长。** 合并会话内容提升连续性，但无限续聊仍可能导致知识臃肿。当前先遵循
+业务规则保存完整的已提炼章节，不写原始聊天和数据库业务行；不相关的新问题应新建 Session。
+后续 Engineering Experience/RAG 阶段可以在不改变原始 MD 的前提下增加章节摘要、语义索引和
+陈旧标记，而不是现在引入不可验证的自动删除。
+
+**开发与异常的复用结构不同。** 两者共享文件身份、frontmatter、轮次合并和索引去重工具，但正文
+渲染保持独立。这样避免复制存储机制，同时不把“代码变更与测试”和“页面诊断与数据库审计”压成
+一个失去业务含义的通用模板。
+
+### 24.6 技术选型与决策记录
+
+- ADR-036（替代 ADR-033）：Capability 的持久化身份是 Session ID，不再是 Session + Cycle；
+- ADR-037：同一 Session 后续 completed 追加原 MD，Cycle 仍作为执行、审计和幂等边界；
+- ADR-038：开发和异常共享会话聚合机制，但使用独立目录、索引和轮次正文模板；
+- ADR-039：task JSON schema v2 保存轻量 cycles 历史，Markdown 保存供人和 Agent 阅读的知识；
+- ADR-040：v0.5.3 逐轮文件只读保留、索引去重，并在热会话后续写入时按需折叠；
+- ADR-041：通过原子替换实现逻辑追加，不使用裸文件 append 牺牲元数据一致性。
+
+### 24.7 当前边界与验证
+
+当前不会自动判断两个不同 Session 是否属于同一个业务问题，也不会跨 Session 合并文档；这种判断
+容易误合并不同时间、环境或权限下的结论。当前也没有自动压缩超长会话文档，后续应通过可追溯的
+摘要层和 RAG 索引解决，而不是覆盖原始工程经验。
+
+确定性测试覆盖开发和异常 Session 的两次 completed 使用同一路径、只存在一个新格式 MD、后续
+章节内容、schema v2 cycle 历史、索引单条目、同 command ID 幂等，以及 v0.5.3 旧逐轮记录折叠和
+重复调用不重复追加。最终验证与发布结果记录在
+`docs/tasks/ACE-KNOWLEDGE-007-session-capability-document.md`。
