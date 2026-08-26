@@ -16,6 +16,7 @@ from autocoding_agent.core.models import (
     ApprovalScope,
     ChangeProposal,
     ChatMessage,
+    MessageAttachment,
     MessageRole,
     ProposedChange,
 )
@@ -40,6 +41,10 @@ from autocoding_agent.sqlserver_config import (
     SQLServerAuthentication,
     SQLServerConfigState,
     SQLServerConnectionConfig,
+)
+from autocoding_agent.workspace_config import (
+    WorkspaceConfig,
+    WorkspaceConfigState,
 )
 from autocoding_agent.workspace_knowledge import KnowledgeDomain, MarkdownKnowledgeService
 
@@ -136,6 +141,7 @@ class FakeIncidentApplication:
     def __init__(self, sessions: list[IncidentSession] | None = None) -> None:
         self.sessions = {item.id: item for item in sessions or []}
         self.calls: list[tuple[str, ...]] = []
+        self.attachments: list[list[MessageAttachment]] = []
 
     def list_sessions(self) -> list[IncidentSession]:
         return list(self.sessions.values())
@@ -150,8 +156,10 @@ class FakeIncidentApplication:
         page_hint: str | None = None,
         *,
         project: str | None = None,
+        attachments: list[MessageAttachment] | None = None,
     ) -> IncidentOutcome:
         self.calls.append(("start", str(workspace), problem, page_hint or "", project or ""))
+        self.attachments.append(list(attachments or []))
         session = IncidentSession(
             id=str(uuid4()),
             workspace=str(workspace),
@@ -169,8 +177,15 @@ class FakeIncidentApplication:
             question="受影响的记录是什么？",
         )
 
-    def send(self, session_id: str, message: str) -> IncidentOutcome:
+    def send(
+        self,
+        session_id: str,
+        message: str,
+        command_id: str | None = None,
+        attachments: list[MessageAttachment] | None = None,
+    ) -> IncidentOutcome:
         self.calls.append(("send", session_id, message))
+        self.attachments.append(list(attachments or []))
         session = self.sessions[session_id]
         return IncidentOutcome(
             session_id=session.id,
@@ -206,6 +221,24 @@ class FakeIncidentApplication:
             message="已取消异常诊断",
         )
 
+
+class FakeWorkspaceService:
+    def __init__(self, path: Path) -> None:
+        self.state = WorkspaceConfigState(
+            config=WorkspaceConfig(path=str(path)),
+            available=path.is_dir(),
+        )
+
+    def inspect(self) -> WorkspaceConfigState:
+        return self.state
+
+    def save(self, workspace: str | Path) -> WorkspaceConfigState:
+        path = Path(workspace).resolve()
+        self.state = WorkspaceConfigState(
+            config=WorkspaceConfig(path=str(path)),
+            available=path.is_dir(),
+        )
+        return self.state
 
 @pytest.fixture(scope="session")
 def tk_root() -> Iterator[tk.Tk]:
@@ -395,9 +428,12 @@ def test_new_task_routes_first_message_to_application_start(
     root: tk.Toplevel, tmp_path: Path
 ) -> None:
     application = FakeApplication()
-    client = DesktopClient(root, application)  # type: ignore[arg-type]
+    client = DesktopClient(
+        root,
+        application,  # type: ignore[arg-type]
+        workspace_service=FakeWorkspaceService(tmp_path),  # type: ignore[arg-type]
+    )
     operations = _capture_operation(client)
-    client.workspace_var.set(str(tmp_path))
     client.prompt_input.insert("1.0", "调查 src/app.py 的报错")
 
     client._send_message()
@@ -431,7 +467,7 @@ def test_completed_task_keeps_composer_available_for_follow_up(root: tk.Toplevel
 
     client._render_session(session)
     assert client.prompt_input.cget("state") == "normal"
-    assert client.workspace_entry.cget("state") == "disabled"
+    assert not hasattr(client, "workspace_entry")
     assert client.send_button.cget("text") == "继续对话"
     assert "继续追问" in client.prompt_placeholder.cget("text")
     client.prompt_input.insert("1.0", "继续说明重试边界")
@@ -441,7 +477,6 @@ def test_completed_task_keeps_composer_available_for_follow_up(root: tk.Toplevel
 
     client._new_task()
     assert client.prompt_input.cget("state") == "normal"
-    assert client.workspace_entry.cget("state") == "normal"
     assert client.send_button.cget("text") == "发送任务"
     assert "任务目标" in client.prompt_placeholder.cget("text")
 
@@ -484,7 +519,6 @@ def test_busy_state_blocks_conflicting_controls(root: tk.Toplevel) -> None:
 
     assert client.send_button.cget("state") == "disabled"
     assert client.new_task_button.cget("state") == "disabled"
-    assert client.browse_button.cget("state") == "disabled"
     assert client.sessions_list.cget("state") == "disabled"
     assert client.model_config_button.cget("state") == "disabled"
 
@@ -529,16 +563,19 @@ def test_system_settings_combines_model_and_shared_database_without_revealing_se
 
     knowledge_service = MarkdownKnowledgeService(tmp_path / "state")
     knowledge_service.create_branch(KnowledgeDomain.DEVELOPMENT, "生物")
+    workspace_service = FakeWorkspaceService(tmp_path)
     dialog = SystemSettingsDialog(
         root,
         FakeModelService(),  # type: ignore[arg-type]
         FakeDatabaseService(),  # type: ignore[arg-type]
         knowledge_service=knowledge_service,
+        workspace_service=workspace_service,  # type: ignore[arg-type]
     )
 
     assert [dialog.notebook.tab(tab, "text") for tab in dialog.notebook.tabs()] == [
         "模型与 Claude Code",
         "SQL Server",
+        "项目路径",
         "MD 能力配置",
     ]
     root.update_idletasks()
@@ -558,6 +595,11 @@ def test_system_settings_combines_model_and_shared_database_without_revealing_se
     assert dialog.database_test_button.winfo_manager() == "pack"
     assert dialog.database_save_button.winfo_manager() == "pack"
     assert dialog.model_save_button.winfo_manager() == ""
+    dialog.notebook.select(dialog.workspace_tab)
+    dialog._sync_footer_actions()
+    root.update_idletasks()
+    assert dialog.workspace_save_button.winfo_manager() == "pack"
+    assert dialog.workspace_path_var.get() == str(tmp_path)
     dialog.notebook.select(dialog.knowledge_tab)
     dialog._sync_footer_actions()
     root.update_idletasks()
@@ -580,15 +622,17 @@ def test_system_settings_combines_model_and_shared_database_without_revealing_se
     dialog._close()
 
 
-def test_light_theme_and_workspace_row_are_part_of_composer(root: tk.Toplevel) -> None:
+def test_light_theme_and_configured_workspace_keep_composer_compact(
+    root: tk.Toplevel,
+) -> None:
     client = DesktopClient(root, FakeApplication())  # type: ignore[arg-type]
 
     assert COLORS["window"] == "#EEF3FA"
-    assert client.workspace_entry.master.master == client.composer_frame
+    assert not hasattr(client, "workspace_entry")
+    assert not hasattr(client, "browse_button")
     assert isinstance(client.send_button, RoundedButton)
     assert client.send_button.cget("background") == COLORS["accent"]
     assert client.send_button.cget("foreground") == "#FFFFFF"
-    assert client.browse_button.cget("background") == COLORS["panel"]
     assert client.transcript.tag_cget("user_message", "background") == COLORS["accent_soft"]
     assert client.status_badge.cget("highlightthickness") == 1
 
@@ -632,7 +676,7 @@ def test_flow_selector_shows_active_flow_and_reveals_incident_fields(
     assert client.flow == FlowKind.DEVELOPMENT
     assert client.development_flow_button.selected is True
     assert client.incident_flow_button.selected is False
-    assert client.incident_context_frame.winfo_manager() == ""
+    assert not hasattr(client, "incident_context_frame")
     assert client.project_var.get() == "生物"
     assert client.project_path_var.get() == "knowledge/development/生物/生物.md"
 
@@ -641,16 +685,15 @@ def test_flow_selector_shows_active_flow_and_reveals_incident_fields(
     assert client.flow == FlowKind.INCIDENT
     assert client.incident_flow_button.selected is True
     assert client.development_flow_button.selected is False
-    assert client.incident_context_frame.winfo_manager() == "grid"
     assert "异常诊断" in client.new_task_button.cget("text")
     assert client.task_title_var.get() == "新异常诊断"
-    assert client.page_hint_entry.winfo_manager() == "grid"
+    assert not hasattr(client, "page_hint_entry")
     assert not hasattr(client, "database_browse_button")
     assert client.project_var.get() == "生物"
     assert client.project_path_var.get() == "knowledge/incident/生物/生物.md"
 
 
-def test_incident_flow_routes_problem_and_page_to_incident_application(
+def test_incident_flow_routes_problem_from_configured_workspace(
     root: tk.Toplevel,
     tmp_path: Path,
 ) -> None:
@@ -659,20 +702,90 @@ def test_incident_flow_routes_problem_and_page_to_incident_application(
         root,
         FakeApplication(),  # type: ignore[arg-type]
         incident_application,  # type: ignore[arg-type]
+        workspace_service=FakeWorkspaceService(tmp_path),  # type: ignore[arg-type]
     )
     client._select_flow(FlowKind.INCIDENT)
     operations = _capture_operation(client)
-    client.workspace_var.set(str(tmp_path))
-    client.page_hint_var.set("/orders/42")
-    client.prompt_input.insert("1.0", "订单一直停留在处理中")
+    client.prompt_input.insert("1.0", "订单页面 /orders/42 一直停留在处理中")
 
     client._send_message()
     outcome = operations[0]()
 
     assert outcome.status == IncidentStatus.NEEDS_INPUT
     assert incident_application.calls == [
-        ("start", str(tmp_path), "订单一直停留在处理中", "/orders/42", "生物")
+        (
+            "start",
+            str(tmp_path),
+            "订单页面 /orders/42 一直停留在处理中",
+            "",
+            "生物",
+        )
     ]
+
+
+def test_incident_screenshot_paste_attaches_image_and_allows_image_only_send(
+    root: tk.Toplevel,
+    tmp_path: Path,
+) -> None:
+    image = tmp_path / "attachment" / "incident-screenshot.png"
+    image.parent.mkdir()
+    image.write_bytes(b"png-image")
+    attachment = MessageAttachment(
+        path=str(image),
+        name=image.name,
+        media_type="image/png",
+        size_bytes=image.stat().st_size,
+    )
+
+    class FakeAttachmentStore:
+        def capture_clipboard_image(self) -> MessageAttachment:
+            return attachment
+
+    incident_application = FakeIncidentApplication()
+    client = DesktopClient(
+        root,
+        FakeApplication(),  # type: ignore[arg-type]
+        incident_application,  # type: ignore[arg-type]
+        workspace_service=FakeWorkspaceService(tmp_path),  # type: ignore[arg-type]
+        attachment_store=FakeAttachmentStore(),  # type: ignore[arg-type]
+    )
+    client._select_flow(FlowKind.INCIDENT)
+    operations = _capture_operation(client)
+
+    assert client._on_prompt_paste(object()) == "break"  # type: ignore[arg-type]
+    assert client.attachment_frame.winfo_manager() == "grid"
+    assert "1 张异常截图" in client.attachment_status_var.get()
+    client._send_message()
+    outcome = operations[0]()
+
+    assert outcome.status == IncidentStatus.NEEDS_INPUT
+    assert incident_application.calls == [
+        (
+            "start",
+            str(tmp_path),
+            "请根据粘贴的异常界面截图定位并诊断问题。",
+            "",
+            "生物",
+        )
+    ]
+    assert incident_application.attachments == [[attachment]]
+    assert client.attachment_frame.winfo_manager() == ""
+
+
+def test_development_text_paste_does_not_invoke_image_clipboard(
+    root: tk.Toplevel,
+) -> None:
+    class FailingAttachmentStore:
+        def capture_clipboard_image(self) -> MessageAttachment:
+            raise AssertionError("development paste must keep Tk text behavior")
+
+    client = DesktopClient(
+        root,
+        FakeApplication(),  # type: ignore[arg-type]
+        attachment_store=FailingAttachmentStore(),  # type: ignore[arg-type]
+    )
+
+    assert client._on_prompt_paste(object()) is None  # type: ignore[arg-type]
 
 
 def test_log_button_opens_application_log_directory(

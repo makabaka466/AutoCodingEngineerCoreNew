@@ -9,7 +9,7 @@ from autocoding_agent.adapters.claude_code import ClaudeCodeRuntime
 from autocoding_agent.adapters.sqlite_database import SQLiteDatabaseReader
 from autocoding_agent.adapters.sqlite_incident_store import SQLiteIncidentStore
 from autocoding_agent.config import Settings, get_settings
-from autocoding_agent.core.models import AgentEvent
+from autocoding_agent.core.models import AgentEvent, MessageAttachment
 from autocoding_agent.core.recovery.models import RecoveryAction, RecoveryScanResult
 from autocoding_agent.core.runtime.models import RuntimeRunRecord
 from autocoding_agent.core.state_machine.machine import AgentStateMachine
@@ -45,6 +45,7 @@ class IncidentApplication:
         project: str | None = None,
         source: str = "manual",
         external_reference: str | None = None,
+        attachments: list[MessageAttachment] | None = None,
     ) -> IncidentOutcome:
         return self._engine.start(
             workspace,
@@ -53,6 +54,7 @@ class IncidentApplication:
             project=project,
             source=source,
             external_reference=external_reference,
+            attachments=attachments,
         )
 
     def send(
@@ -60,8 +62,9 @@ class IncidentApplication:
         session_id: str,
         message: str,
         command_id: str | None = None,
+        attachments: list[MessageAttachment] | None = None,
     ) -> IncidentOutcome:
-        return self._engine.send(session_id, message, command_id)
+        return self._engine.send(session_id, message, command_id, attachments)
 
     def resume(
         self,

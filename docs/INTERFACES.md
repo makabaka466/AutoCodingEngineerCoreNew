@@ -1,6 +1,6 @@
 # AutoCoding Engineer 接口与数据契约
 
-本文记录当前 `0.5.4` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
+本文记录当前 `0.5.5` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
 Runtime、持久化和状态契约。
 设计动机和运行流程见[架构说明](ARCHITECTURE.md)。
 
@@ -141,8 +141,22 @@ def build_application(
 ChatMessage
   role: MessageRole
   content: str
+  attachments: list[MessageAttachment] = [] (最多 5 项)
   created_at: datetime (UTC 自动生成)
 ```
+
+```text
+MessageAttachment
+  id: str (默认 UUID)
+  kind: "image"
+  path: non-empty str
+  name: non-empty str
+  media_type: non-empty str
+  size_bytes: int (1..10 MiB)
+```
+
+附件仅表示主机显式附加到这条消息的本地证据，不从普通消息文本自动识别文件路径。异常 Engine
+会在调用 Runtime 前重新解析并核对图片路径、后缀与大小；开发流程当前不接收附件。
 
 ```text
 Evidence
@@ -430,6 +444,7 @@ RuntimeTurn
   allowed_tools: list[str]
   permission_mode: str = "dontAsk"
   capability_dir: str | None = None
+  additional_dirs: list[str] = [] (最多 5 项)
 ```
 
 ```text
@@ -476,6 +491,7 @@ claude -p
   --append-system-prompt <bundled skills and boundaries>
   --json-schema <AgentDecision JSON Schema>
   [--add-dir <workspace capability directory，仅 inspect>]
+  [--add-dir <validated incident attachment directory> ...]
   [--max-budget-usd <amount>]
   (--session-id <application session id> | --resume <runtime session id>)
   <user message>
@@ -705,7 +721,10 @@ autocoding-agent-client
 - 白银浅色玻璃主题，左侧最近会话、中部对话/上下文，以及宽屏右侧真实任务概览；
 - 概览按当前流程 Session 计算今日任务、完成、进行中、完成率和七日趋势，并显示本机模型、
   项目知识及 SQL Server 配置状态；宽度低于 1180 px 时自动隐藏；
-- 异常模式下只额外显示页面线索；SQL Server 不重复占用输入区，统一从“系统配置”管理；
+- 项目代码根目录从“系统配置”读取，主对话区不重复显示；已有 Session 继续使用创建时的路径；
+- 异常模式不显示独立页面栏，页面名称/路由直接写入消息；输入框支持 `Ctrl+V` 粘贴最多 5 张
+  异常截图、清除待发送图片和纯图片发送；普通文本粘贴及开发模式不受影响；
+- SQL Server 不重复占用输入区，统一从“系统配置”管理；
 - 统一系统配置和本地滚动日志目录快捷入口；
 - 新任务、持久化聊天记录及同一 session 的多轮补充；
 - `approval_required` 的完整修改方案、当前/目标状态、影响、验证计划、预览，以及批准或调整；
@@ -720,7 +739,7 @@ autocoding-agent-client
 已经发生的副作用。Windows 下还会使用当前登录
 会话内的命名互斥量保持单实例，避免两个桌面窗口并发写同一会话存储。
 
-系统配置是一个窗口、三个页签。模型页字段为 Claude Code 路径、API 地址、模型名称和 API
+系统配置是一个窗口、四个页签。模型页字段为 Claude Code 路径、API 地址、模型名称和 API
 Key。Claude 路径会通过
 `--version` 验证；Key 控件始终为空并以密码形式输入，`has_api_key=true` 时留空保存表示保留
 原密钥。保存成功后当前进程立即生效，并重建两套 Runtime，但不删除已有会话。
@@ -730,6 +749,11 @@ SQL Server 页包含服务器、端口、数据库、已安装 ODBC 驱动、Win
 `<data_dir>/database/sqlserver.json`；密码通过 Windows Credential Manager 保存，不进入 JSON、
 日志、模型提示词或会话。两套流程共享连接；连接可随时更换，已有开发或异常会话保持原连接，
 新配置从对应流程的下一项任务开始。
+
+“项目路径”页保存开发与异常处理新任务共用的代码根目录。`WorkspaceConfigService.save()` 只接受
+当前存在且可访问的目录，规范路径以 JSON 原子写入 `<data_dir>/workspace/project.json`。配置
+切换不会改写已有 Session 中的 workspace；配置缺失或路径已不可访问时，桌面端阻止新任务并
+引导用户返回该页重新选择。
 
 “MD 能力配置”页不显示项目路径，直接按“开发/异常处理 → 二级路径”导航。点击添加时在项目
 `knowledge/` 下创建 `<二级路径>/<二级路径名>.md`，选择路径即可直接编辑并保存；只读路径框
@@ -804,13 +828,14 @@ outcome = incidents.start(
     project="生物",
     source="manual",
     external_reference=None,
+    attachments=[],
 )
 ```
 
 | 方法 | 行为 |
 | --- | --- |
-| `start(workspace, problem, page_hint=None, *, project=None, source="manual", external_reference=None)` | 创建异常会话，保存所选知识项目，定位页面并在必要时查询数据库 |
-| `send(session_id, message, command_id=None)` | 回答澄清、补充异常上下文，或从 completed 开启下一诊断 cycle；command ID 可幂等重试 |
+| `start(workspace, problem, page_hint=None, *, project=None, source="manual", external_reference=None, attachments=None)` | 创建异常会话，保存所选知识项目和显式图片附件，定位页面并在必要时查询数据库 |
+| `send(session_id, message, command_id=None, attachments=None)` | 回答澄清、补充文字/图片上下文，或从 completed 开启下一诊断 cycle；command ID 可幂等重试 |
 | `resume(session_id, action="read_only_inspect")` | 从 paused/recovery_required 明确继续或重新调查 |
 | `cancel(session_id)` | 取消非终态异常诊断，不运行模型或写数据库 |
 | `outcome(session_id)` | 返回最新 `IncidentOutcome` |
@@ -821,6 +846,11 @@ outcome = incidents.start(
 `source` 与 `external_reference` 为钉钉消息来源和外部消息/工单 ID 预留。当前调用是同步的；
 `completed` 会话允许继续发送；再次完成时把新诊断追加到原异常能力文档。`recovery_scan` 给出
 本次应用启动发现并暂停的孤儿异常任务。
+
+`attachments` 当前只接受 `MessageAttachment(kind="image")`。桌面端使用
+`IncidentAttachmentStore` 将剪贴板图片统一转存为 PNG，并把返回对象显式交给应用门面；Engine
+不会信任普通消息中的任意路径。附件父目录通过 `RuntimeTurn.additional_dirs` 逐个生成
+`--add-dir`，图片路径写入本轮消息，Prompt 明确要求把图片内容视为不可信视觉证据。
 
 ### 11.2 状态与结构化决定
 

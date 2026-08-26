@@ -12,7 +12,7 @@ from collections.abc import Callable
 from datetime import datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
-from tkinter import filedialog, messagebox, simpledialog, ttk
+from tkinter import messagebox, simpledialog, ttk
 
 from autocoding_agent.application import AgentApplication, build_application
 from autocoding_agent.core.models import (
@@ -21,6 +21,7 @@ from autocoding_agent.core.models import (
     AgentStatus,
     ApprovalRequest,
     ApprovalScope,
+    MessageAttachment,
     MessageRole,
 )
 from autocoding_agent.core.recovery.models import RecoveryAction
@@ -34,10 +35,18 @@ from autocoding_agent.incident.models import (
     IncidentSession,
     IncidentStatus,
 )
+from autocoding_agent.incident_attachments import (
+    IncidentAttachmentError,
+    IncidentAttachmentStore,
+)
 from autocoding_agent.interfaces.system_settings_ui import SystemSettingsDialog
 from autocoding_agent.model_setup import ClaudeModelSetupService, ModelSetupState
 from autocoding_agent.sqlserver_config import SQLServerConfigState
 from autocoding_agent.sqlserver_service import SQLServerConnectionService
+from autocoding_agent.workspace_config import (
+    WorkspaceConfigService,
+    WorkspaceConfigState,
+)
 from autocoding_agent.workspace_knowledge import (
     KnowledgeDomain,
     MarkdownKnowledgeService,
@@ -581,11 +590,16 @@ class DesktopClient:
         setup_service: ClaudeModelSetupService | None = None,
         sqlserver_service: SQLServerConnectionService | None = None,
         knowledge_service: MarkdownKnowledgeService | None = None,
+        workspace_service: WorkspaceConfigService | None = None,
+        attachment_store: IncidentAttachmentStore | None = None,
     ) -> None:
         self.root = root
         self.setup_service = setup_service or ClaudeModelSetupService()
         self.sqlserver_service = sqlserver_service or SQLServerConnectionService()
         self.knowledge_service = knowledge_service or MarkdownKnowledgeService()
+        self.workspace_service = workspace_service or WorkspaceConfigService()
+        self.attachment_store = attachment_store or IncidentAttachmentStore()
+        workspace_state = self.workspace_service.inspect()
         self._applications_injected = application is not None or incident_application is not None
         self._settings_dialog: SystemSettingsDialog | None = None
         self._active_development_database_reference: str | None = None
@@ -625,11 +639,14 @@ class DesktopClient:
             FlowKind.DEVELOPMENT: "",
             FlowKind.INCIDENT: "",
         }
+        self._pending_attachments: list[MessageAttachment] = []
 
-        self.workspace_var = tk.StringVar(value=str(Path.cwd()))
+        self.workspace_var = tk.StringVar(
+            value=workspace_state.config.path if workspace_state.config else ""
+        )
         self.project_var = tk.StringVar()
         self.project_path_var = tk.StringVar()
-        self.page_hint_var = tk.StringVar()
+        self.attachment_status_var = tk.StringVar()
         self.status_var = tk.StringVar(value="就绪")
         self.task_title_var = tk.StringVar(value="新开发任务")
         self.flow_caption_var = tk.StringVar(value="开发流程 · AI 工程工作台")
@@ -1101,71 +1118,6 @@ class DesktopClient:
             anchor="w",
         ).grid(row=0, column=2, sticky="ew", padx=(12, 0))
 
-        workspace_row = tk.Frame(self.composer_frame, bg=COLORS["input"])
-        workspace_row.grid(row=2, column=0, sticky="ew", padx=14, pady=(2, 5))
-        workspace_row.grid_columnconfigure(1, weight=1)
-        tk.Label(
-            workspace_row,
-            text="项目路径",
-            font=("Microsoft YaHei UI", 8, "bold"),
-            fg=COLORS["muted"],
-            bg=COLORS["input"],
-        ).grid(row=0, column=0, sticky="w", padx=(0, 9))
-        self.workspace_entry = tk.Entry(
-            workspace_row,
-            textvariable=self.workspace_var,
-            font=("Microsoft YaHei UI", 9),
-            fg=COLORS["text"],
-            bg=COLORS["surface_subtle"],
-            insertbackground=COLORS["text"],
-            selectbackground="#BFDBFE",
-            selectforeground=COLORS["text"],
-            relief="flat",
-            highlightthickness=1,
-            highlightbackground=COLORS["border"],
-            highlightcolor=COLORS["accent"],
-        )
-        self.workspace_entry.grid(row=0, column=1, sticky="ew", ipady=6)
-        self.browse_button = self._button(
-            workspace_row,
-            "浏览…",
-            self._browse_workspace,
-            background=COLORS["panel"],
-            active_background=COLORS["panel_hover"],
-        )
-        self.browse_button.grid(row=0, column=2, padx=(8, 0), sticky="ns")
-
-        self.incident_context_frame = tk.Frame(self.composer_frame, bg=COLORS["input"])
-        self.incident_context_frame.grid(
-            row=3,
-            column=0,
-            sticky="ew",
-            padx=14,
-            pady=(2, 4),
-        )
-        self.incident_context_frame.grid_columnconfigure(1, weight=1)
-        tk.Label(
-            self.incident_context_frame,
-            text="异常页面",
-            font=("Microsoft YaHei UI", 8, "bold"),
-            fg=COLORS["muted"],
-            bg=COLORS["input"],
-        ).grid(row=0, column=0, sticky="w", padx=(0, 9), pady=(0, 4))
-        self.page_hint_entry = tk.Entry(
-            self.incident_context_frame,
-            textvariable=self.page_hint_var,
-            font=("Microsoft YaHei UI", 9),
-            fg=COLORS["text"],
-            bg=COLORS["surface_subtle"],
-            insertbackground=COLORS["text"],
-            selectbackground="#BFDBFE",
-            relief="flat",
-            highlightthickness=1,
-            highlightbackground=COLORS["border"],
-            highlightcolor=COLORS["accent"],
-        )
-        self.page_hint_entry.grid(row=0, column=1, sticky="ew", ipady=6)
-
         self.prompt_input = tk.Text(
             self.composer_frame,
             height=4,
@@ -1182,9 +1134,9 @@ class DesktopClient:
             undo=True,
         )
         tk.Frame(self.composer_frame, bg=COLORS["border"], height=1).grid(
-            row=4, column=0, sticky="ew", padx=14, pady=(5, 0)
+            row=2, column=0, sticky="ew", padx=14, pady=(5, 0)
         )
-        self.prompt_input.grid(row=5, column=0, sticky="ew", padx=2)
+        self.prompt_input.grid(row=3, column=0, sticky="ew", padx=2)
         self.prompt_placeholder = tk.Label(
             self.prompt_input,
             text="描述任务目标、约束条件，以及相关文件或页面线索…",
@@ -1200,8 +1152,37 @@ class DesktopClient:
         self.prompt_input.bind("<KeyPress>", self._hide_prompt_placeholder, add="+")
         self.prompt_input.bind("<Return>", self._on_return)
         self.prompt_input.bind("<Control-Return>", self._on_control_return)
+        self.prompt_input.bind("<<Paste>>", self._on_prompt_paste, add="+")
+
+        self.attachment_frame = tk.Frame(self.composer_frame, bg=COLORS["accent_soft"])
+        self.attachment_frame.grid(row=4, column=0, sticky="ew", padx=14, pady=(0, 6))
+        self.attachment_frame.grid_columnconfigure(0, weight=1)
+        tk.Label(
+            self.attachment_frame,
+            textvariable=self.attachment_status_var,
+            font=("Microsoft YaHei UI", 8, "bold"),
+            fg=COLORS["accent"],
+            bg=COLORS["accent_soft"],
+            anchor="w",
+            padx=10,
+            pady=6,
+        ).grid(row=0, column=0, sticky="ew")
+        tk.Button(
+            self.attachment_frame,
+            text="清除",
+            command=self._clear_pending_attachments,
+            font=("Microsoft YaHei UI", 8),
+            fg=COLORS["muted"],
+            bg=COLORS["accent_soft"],
+            activebackground=COLORS["panel_hover"],
+            relief="flat",
+            borderwidth=0,
+            cursor="hand2",
+        ).grid(row=0, column=1, padx=(4, 8))
+        self.attachment_frame.grid_remove()
+
         action_row = tk.Frame(self.composer_frame, bg=COLORS["input"])
-        action_row.grid(row=6, column=0, sticky="ew", padx=12, pady=(0, 11))
+        action_row.grid(row=5, column=0, sticky="ew", padx=12, pady=(0, 11))
         action_row.grid_columnconfigure(0, weight=1)
         tk.Label(
             action_row,
@@ -1573,6 +1554,7 @@ class DesktopClient:
                 parent=self.root,
             )
             return
+        self._clear_pending_attachments()
         self._flow_session_ids[self.flow] = self.session_id
         self.flow = flow
         self.session_id = self._flow_session_ids[flow]
@@ -1602,10 +1584,6 @@ class DesktopClient:
         self.new_task_button.configure(
             text="新建开发任务" if is_development else "新建异常诊断"
         )
-        if is_development:
-            self.incident_context_frame.grid_remove()
-        else:
-            self.incident_context_frame.grid()
         self.prompt_placeholder.configure(
             text=self._default_prompt_placeholder_text()
         )
@@ -1615,7 +1593,7 @@ class DesktopClient:
         return (
             "描述任务目标、约束条件，以及相关文件或页面线索…"
             if self.flow == FlowKind.DEVELOPMENT
-            else "描述异常现象、影响范围，以及可复现条件…"
+            else "描述异常现象或页面名称，也可直接 Ctrl+V 粘贴异常截图…"
         )
 
     def _knowledge_domain(self) -> KnowledgeDomain:
@@ -1674,14 +1652,15 @@ class DesktopClient:
             self.task_title_var.set("新异常诊断")
             message = (
                 "你好，我会协助定位和诊断应用异常。\n\n"
-                "请填写项目路径，尽量提供异常页面、路由或标题。需要业务数据时会使用系统"
+                "请描述异常现象、页面名称或路由，也可以直接在输入框粘贴异常截图。项目路径"
+                "和只读数据库连接来自系统配置；需要业务数据时会使用系统"
                 "配置中的共用只读连接；当前流程不会修改文件或数据库。"
             )
         else:
             self.task_title_var.set("新开发任务")
             message = (
                 "你好，我是 AutoCoding Engineer。\n\n"
-                "选择项目目录，然后描述要调查、修改或验证的开发任务。"
+                "项目路径来自系统配置。请描述要调查、修改或验证的开发任务。"
                 "如果需求还不够清楚，我会先向你确认最关键的信息。"
             )
         self._replace_transcript(
@@ -1703,7 +1682,7 @@ class DesktopClient:
                 MessageRole.ASSISTANT: "assistant",
                 MessageRole.SYSTEM: "system",
             }[item.role]
-            entries.append((role, item.content))
+            entries.append((role, self._message_display_content(item)))
 
         decision = session.last_decision
         if decision is not None:
@@ -1776,7 +1755,7 @@ class DesktopClient:
                 MessageRole.ASSISTANT: "assistant",
                 MessageRole.SYSTEM: "system",
             }[item.role]
-            entries.append((role, item.content))
+            entries.append((role, self._message_display_content(item)))
 
         decision = session.last_decision
         if decision is not None:
@@ -1822,7 +1801,6 @@ class DesktopClient:
         self.project_var.set(session.project or "")
         self._flow_projects[FlowKind.INCIDENT] = session.project or ""
         self._refresh_project_path()
-        self.page_hint_var.set(session.page_hint or "")
         title = " ".join(session.problem.split()) or "未命名异常"
         self.task_title_var.set(title[:64] + ("…" if len(title) > 64 else ""))
         if session.task_state in {TaskState.PAUSED, TaskState.RECOVERY_REQUIRED}:
@@ -1852,6 +1830,15 @@ class DesktopClient:
             else:
                 self.status_var.set("异常诊断失败，可补充信息重试；详情请查看本地日志。")
         self._sync_controls()
+
+    @staticmethod
+    def _message_display_content(message: object) -> str:
+        content = str(getattr(message, "content", ""))
+        attachments = list(getattr(message, "attachments", []))
+        if not attachments:
+            return content
+        names = "、".join(str(item.name) for item in attachments)
+        return f"{content}\n[异常截图：{names}]"
 
     def _replace_transcript(self, entries: list[tuple[str, str]]) -> None:
         self.transcript.configure(state="normal")
@@ -1884,8 +1871,6 @@ class DesktopClient:
                 else incident_session_list_label(session, max_length=14)
             )
             self.sessions_list.insert("end", label.replace("\n", "  "))
-        if sessions and not self.session_id:
-            self.workspace_var.set(sessions[0].workspace)
         if select_current and self.session_id in self._session_ids:
             index = self._session_ids.index(self.session_id)
             self.sessions_list.selection_clear(0, "end")
@@ -1920,22 +1905,12 @@ class DesktopClient:
         self.sessions_list.selection_clear(0, "end")
         self.task_title_var.set("新开发任务" if self.flow == FlowKind.DEVELOPMENT else "新异常诊断")
         self._hide_approval()
+        self._clear_pending_attachments()
+        self._reload_configured_workspace()
         self._refresh_project_options()
         self._render_welcome()
         self._sync_controls()
         self.prompt_input.focus_set()
-
-    def _browse_workspace(self) -> None:
-        if self._busy:
-            return
-        initial = self.workspace_var.get().strip()
-        if not Path(initial).is_dir():
-            initial = str(Path.cwd())
-        selected = filedialog.askdirectory(
-            title="选择项目目录", initialdir=initial, mustexist=True, parent=self.root
-        )
-        if selected:
-            self.workspace_var.set(str(Path(selected).resolve()))
 
     def _open_system_settings(self, section: str = "model") -> None:
         if self._busy:
@@ -1943,6 +1918,7 @@ class DesktopClient:
         if self._settings_dialog is not None and self._settings_dialog.window.winfo_exists():
             selected_tab = {
                 "database": self._settings_dialog.database_tab,
+                "workspace": self._settings_dialog.workspace_tab,
                 "knowledge": self._settings_dialog.knowledge_tab,
             }.get(section, self._settings_dialog.model_tab)
             self._settings_dialog.notebook.select(selected_tab)
@@ -1954,10 +1930,30 @@ class DesktopClient:
             self.setup_service,
             self.sqlserver_service,
             initial_section=section,
+            workspace_service=self.workspace_service,
             on_model_saved=self._apply_model_configuration,
             on_database_saved=self._apply_sqlserver_configuration,
+            on_workspace_saved=self._apply_workspace_configuration,
             on_knowledge_changed=self._refresh_project_options,
         )
+
+    def _apply_workspace_configuration(self, state: WorkspaceConfigState) -> None:
+        if state.configured and state.config is not None:
+            if self.session_id is None:
+                self.workspace_var.set(state.config.path)
+            self.status_var.set("项目路径已保存；新任务将使用该路径。")
+        else:
+            self.status_var.set("项目路径尚未配置或当前不可访问。")
+        self._sync_controls()
+
+    def _reload_configured_workspace(self) -> None:
+        try:
+            state = self.workspace_service.inspect()
+        except Exception as exc:
+            self.workspace_var.set("")
+            self.status_var.set(f"读取项目路径配置失败：{exc}")
+            return
+        self.workspace_var.set(state.config.path if state.configured and state.config else "")
 
     def _apply_sqlserver_configuration(self, state: SQLServerConfigState) -> None:
         if not state.configured or state.config is None:
@@ -2062,6 +2058,9 @@ class DesktopClient:
         if self._busy:
             return
         message = self.prompt_input.get("1.0", "end-1c").strip()
+        attachments = list(self._pending_attachments)
+        if not message and self.flow == FlowKind.INCIDENT and attachments:
+            message = "请根据粘贴的异常界面截图定位并诊断问题。"
         if not message:
             self.status_var.set("请先输入任务内容。")
             return
@@ -2071,13 +2070,19 @@ class DesktopClient:
             if not project:
                 self.status_var.set("请先选择项目；可在系统配置中添加项目。")
                 return
-            workspace = self.workspace_var.get().strip()
-            if not workspace:
-                self.status_var.set("请先选择项目目录。")
+            try:
+                workspace_state = self.workspace_service.inspect()
+            except Exception as exc:
+                self.status_var.set(f"读取项目路径配置失败：{exc}")
                 return
+            if not workspace_state.configured or workspace_state.config is None:
+                self.status_var.set("请先在系统配置的“项目路径”中选择项目代码目录。")
+                return
+            workspace = workspace_state.config.path
+            self.workspace_var.set(workspace)
             path = Path(workspace).expanduser()
             if not path.is_dir():
-                self.status_var.set("项目目录不存在，请重新选择。")
+                self.status_var.set("配置的项目目录不存在，请在系统配置中重新选择。")
                 return
             if self.flow == FlowKind.DEVELOPMENT:
 
@@ -2085,12 +2090,17 @@ class DesktopClient:
                     return self.application.start(path, message, project)
 
             else:
-                page_hint = self.page_hint_var.get().strip() or None
                 database_reference = self._active_incident_database_reference
 
                 def operation() -> AgentOutcome | IncidentOutcome:
                     application = self._incident_application_for_database(database_reference)
-                    return application.start(path, message, page_hint, project=project)
+                    return application.start(
+                        path,
+                        message,
+                        None,
+                        project=project,
+                        attachments=attachments,
+                    )
 
         else:
             session_id = self.session_id
@@ -2112,18 +2122,69 @@ class DesktopClient:
 
                 def operation() -> AgentOutcome | IncidentOutcome:
                     application = self._incident_application_for_database(database_reference)
-                    return application.send(session_id, message)
+                    return application.send(
+                        session_id,
+                        message,
+                        attachments=attachments,
+                    )
 
         self.prompt_input.delete("1.0", "end")
-        self._append_optimistic_user_message(message)
+        self._pending_attachments.clear()
+        self._refresh_attachment_display()
+        self._append_optimistic_user_message(message, attachments)
         self._run_in_background(operation, "Claude Code 正在分析")
 
-    def _append_optimistic_user_message(self, message: str) -> None:
+    def _append_optimistic_user_message(
+        self,
+        message: str,
+        attachments: list[MessageAttachment] | None = None,
+    ) -> None:
+        attachment_note = (
+            f"\n[已附加 {len(attachments)} 张异常截图]" if attachments else ""
+        )
         self.transcript.configure(state="normal")
         self.transcript.insert("end", "你\n", "user_name")
-        self.transcript.insert("end", f"{message}\n\n", "message")
+        self.transcript.insert("end", f"{message}{attachment_note}\n\n", "message")
         self.transcript.configure(state="disabled")
         self.transcript.see("end")
+
+    def _on_prompt_paste(self, _event: tk.Event[tk.Misc]) -> str | None:
+        if self.flow != FlowKind.INCIDENT or self._busy:
+            return None
+        if len(self._pending_attachments) >= 5:
+            self.status_var.set("每条消息最多粘贴 5 张异常截图。")
+            return "break"
+        try:
+            attachment = self.attachment_store.capture_clipboard_image()
+        except IncidentAttachmentError as exc:
+            self.status_var.set(str(exc))
+            return "break"
+        except Exception as exc:
+            self.status_var.set(f"粘贴异常截图失败：{exc}")
+            return "break"
+        if attachment is None:
+            return None
+        self._pending_attachments.append(attachment)
+        self._refresh_attachment_display()
+        self._hide_prompt_placeholder()
+        self.status_var.set("异常截图已附加；发送后 Agent 会读取图片进行诊断。")
+        return "break"
+
+    def _clear_pending_attachments(self) -> None:
+        self._pending_attachments.clear()
+        self._refresh_attachment_display()
+
+    def _refresh_attachment_display(self) -> None:
+        count = len(self._pending_attachments)
+        if not count or self.flow != FlowKind.INCIDENT:
+            self.attachment_status_var.set("")
+            self.attachment_frame.grid_remove()
+            return
+        total_bytes = sum(item.size_bytes for item in self._pending_attachments)
+        self.attachment_status_var.set(
+            f"已粘贴 {count} 张异常截图 · {total_bytes / 1024:.1f} KiB"
+        )
+        self.attachment_frame.grid()
 
     def _approve(self) -> None:
         if (
@@ -2291,7 +2352,7 @@ class DesktopClient:
         """Keep controls consistent with the durable task state and current worker."""
 
         can_start_new = not self._busy
-        can_choose_workspace = not self._busy and self.session_id is None
+        can_choose_project = not self._busy and self.session_id is None
         can_send = not self._busy and self._current_task_state not in {
             TaskState.CANCELLED,
             TaskState.PAUSED,
@@ -2303,9 +2364,7 @@ class DesktopClient:
             and self._current_status == AgentStatus.APPROVAL_REQUIRED
         )
         self.new_task_button.configure(state="normal" if can_start_new else "disabled")
-        self.workspace_entry.configure(state="normal" if can_choose_workspace else "disabled")
-        self.browse_button.configure(state="normal" if can_choose_workspace else "disabled")
-        self.project_combo.configure(state="readonly" if can_choose_workspace else "disabled")
+        self.project_combo.configure(state="readonly" if can_choose_project else "disabled")
         recovery_state = False
         if self.session_id:
             try:
@@ -2317,10 +2376,6 @@ class DesktopClient:
                 }
             except Exception:
                 recovery_state = False
-        incident_input_state = (
-            "normal" if can_choose_workspace and self.flow == FlowKind.INCIDENT else "disabled"
-        )
-        self.page_hint_entry.configure(state=incident_input_state)
         self.prompt_input.configure(state="normal" if can_send else "disabled")
         self.send_button.configure(state="normal" if can_send else "disabled")
         self.approve_button.configure(
@@ -2458,7 +2513,7 @@ class DesktopClient:
         self.prompt_input.focus_set()
         self.prompt_placeholder.place_forget()
 
-    def _hide_prompt_placeholder(self, _event: tk.Event[tk.Misc]) -> None:
+    def _hide_prompt_placeholder(self, _event: tk.Event[tk.Misc] | None = None) -> None:
         self.prompt_placeholder.place_forget()
 
     def _restore_prompt_placeholder(self, _event: tk.Event[tk.Misc]) -> None:
@@ -2545,6 +2600,7 @@ def main() -> None:
     root.withdraw()
     setup_service = ClaudeModelSetupService()
     sqlserver_service = SQLServerConnectionService()
+    workspace_service = WorkspaceConfigService()
     client: DesktopClient | None = None
 
     def launch_client(_state: ModelSetupState | None = None) -> None:
@@ -2559,7 +2615,10 @@ def main() -> None:
             root,
             setup_service=setup_service,
             sqlserver_service=sqlserver_service,
+            workspace_service=workspace_service,
         )
+        if not workspace_service.inspect().configured:
+            root.after(100, lambda: client and client._open_system_settings("workspace"))
 
     try:
         setup_state = setup_service.inspect()
@@ -2571,6 +2630,7 @@ def main() -> None:
                 setup_service,
                 sqlserver_service,
                 initial_section="model",
+                workspace_service=workspace_service,
                 required_model_setup=True,
                 on_model_saved=launch_client,
             )

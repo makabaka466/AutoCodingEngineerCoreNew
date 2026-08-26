@@ -388,8 +388,13 @@ class ClaudeCodeRuntime:
         ]
         if stream:
             command.extend(["--verbose", "--include-hook-events"])
-        if turn.capability_dir:
-            command.extend(["--add-dir", turn.capability_dir])
+        read_directories = [
+            item
+            for item in [turn.capability_dir, *turn.additional_dirs]
+            if item
+        ]
+        for directory in dict.fromkeys(read_directories):
+            command.extend(["--add-dir", directory])
         if self.settings.max_budget_usd is not None:
             command.extend(["--max-budget-usd", str(self.settings.max_budget_usd)])
         if turn.runtime_session_id:

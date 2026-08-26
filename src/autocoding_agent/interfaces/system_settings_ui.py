@@ -6,6 +6,7 @@ import queue
 import threading
 import tkinter as tk
 from collections.abc import Callable
+from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from autocoding_agent.model_setup import (
@@ -21,6 +22,10 @@ from autocoding_agent.sqlserver_config import (
 from autocoding_agent.sqlserver_service import (
     SQLServerConnectionService,
     build_connection_config,
+)
+from autocoding_agent.workspace_config import (
+    WorkspaceConfigService,
+    WorkspaceConfigState,
 )
 from autocoding_agent.workspace_knowledge import (
     KnowledgeDomain,
@@ -50,21 +55,26 @@ class SystemSettingsDialog:
         *,
         initial_section: str = "model",
         knowledge_service: MarkdownKnowledgeService | None = None,
+        workspace_service: WorkspaceConfigService | None = None,
         required_model_setup: bool = False,
         on_model_saved: Callable[[ModelSetupState], None] | None = None,
         on_database_saved: Callable[[SQLServerConfigState], None] | None = None,
         on_knowledge_changed: Callable[[], None] | None = None,
+        on_workspace_saved: Callable[[WorkspaceConfigState], None] | None = None,
     ) -> None:
         self.parent = parent
         self.model_service = model_service
         self.database_service = database_service
         self.knowledge_service = knowledge_service or MarkdownKnowledgeService()
+        self.workspace_service = workspace_service or WorkspaceConfigService()
         self.on_model_saved = on_model_saved
         self.on_database_saved = on_database_saved
         self.on_knowledge_changed = on_knowledge_changed
+        self.on_workspace_saved = on_workspace_saved
         self.required_model_setup = required_model_setup
         self.model_state = model_service.inspect()
         self.database_state = database_service.inspect()
+        self.workspace_state = self.workspace_service.inspect()
         self._test_results: queue.Queue[tuple[str, object]] = queue.Queue()
         self._testing_database = False
 
@@ -81,8 +91,10 @@ class SystemSettingsDialog:
         self._build()
         self._load_model_state(self.model_state)
         self._load_database_state(self.database_state)
+        self._load_workspace_state(self.workspace_state)
         selected_tab = {
             "database": self.database_tab,
+            "workspace": self.workspace_tab,
             "knowledge": self.knowledge_tab,
         }.get(initial_section, self.model_tab)
         self.notebook.select(selected_tab)
@@ -113,7 +125,7 @@ class SystemSettingsDialog:
         ).pack(anchor="w")
         tk.Label(
             header,
-            text="模型、数据库和工作区 Markdown 知识在这里统一管理。",
+            text="模型、数据库、项目路径和工作区 Markdown 知识在这里统一管理。",
             font=("Microsoft YaHei UI", 9),
             fg=MUTED,
             bg=WINDOW,
@@ -138,12 +150,15 @@ class SystemSettingsDialog:
         self.notebook.grid(row=1, column=0, sticky="nsew", padx=30, pady=(0, 12))
         self.model_tab = tk.Frame(self.notebook, bg=CARD)
         self.database_tab = tk.Frame(self.notebook, bg=CARD)
+        self.workspace_tab = tk.Frame(self.notebook, bg=CARD)
         self.knowledge_tab = tk.Frame(self.notebook, bg=CARD)
         self.notebook.add(self.model_tab, text="模型与 Claude Code")
         self.notebook.add(self.database_tab, text="SQL Server")
+        self.notebook.add(self.workspace_tab, text="项目路径")
         self.notebook.add(self.knowledge_tab, text="MD 能力配置")
         self._build_model_tab()
         self._build_database_tab()
+        self._build_workspace_tab()
         self._build_knowledge_tab()
 
         footer = tk.Frame(self.window, bg=WINDOW)
@@ -157,6 +172,9 @@ class SystemSettingsDialog:
         )
         self.database_save_button = self._button(
             footer, "保存数据库配置", self._save_database, ACCENT, "#FFFFFF"
+        )
+        self.workspace_save_button = self._button(
+            footer, "保存项目路径", self._save_workspace, ACCENT, "#FFFFFF"
         )
         self.knowledge_save_button = self._button(
             footer, "保存 Markdown", self._save_knowledge, ACCENT, "#FFFFFF"
@@ -337,6 +355,33 @@ class SystemSettingsDialog:
             button.pack(side="left", padx=(0, 18))
             self.db_option_buttons.append(button)
 
+    def _build_workspace_tab(self) -> None:
+        tab = self.workspace_tab
+        tab.grid_columnconfigure(0, weight=1)
+        self.workspace_path_var = tk.StringVar()
+        self.workspace_status_var = tk.StringVar()
+        self.workspace_status_label = self._status(tab, self.workspace_status_var, 0)
+        self._field_label(tab, "项目代码根目录", 1)
+        path_row = tk.Frame(tab, bg=CARD)
+        path_row.grid(row=2, column=0, sticky="ew", padx=26)
+        path_row.grid_columnconfigure(0, weight=1)
+        self.workspace_path_entry = self._entry(path_row, self.workspace_path_var)
+        self.workspace_path_entry.grid(row=0, column=0, sticky="ew", ipady=5)
+        self.workspace_browse_button = self._button(
+            path_row, "浏览…", self._browse_workspace, PANEL, TEXT
+        )
+        self.workspace_browse_button.grid(row=0, column=1, padx=(8, 0))
+        tk.Label(
+            tab,
+            text=(
+                "开发与异常处理的新任务共用此路径；已创建的会话继续使用其保存的原路径。"
+            ),
+            font=("Microsoft YaHei UI", 8),
+            fg=MUTED,
+            bg=CARD,
+            anchor="w",
+        ).grid(row=3, column=0, sticky="ew", padx=26, pady=(8, 12))
+
     def _build_knowledge_tab(self) -> None:
         tab = self.knowledge_tab
         tab.grid_columnconfigure(0, weight=1)
@@ -436,6 +481,7 @@ class SystemSettingsDialog:
             self.model_save_button,
             self.database_test_button,
             self.database_save_button,
+            self.workspace_save_button,
             self.knowledge_save_button,
         ):
             button.pack_forget()
@@ -443,6 +489,8 @@ class SystemSettingsDialog:
         if self.notebook.select() == str(self.database_tab):
             self.database_save_button.pack(side="right", padx=(0, 8))
             self.database_test_button.pack(side="right", padx=(0, 8))
+        elif self.notebook.select() == str(self.workspace_tab):
+            self.workspace_save_button.pack(side="right", padx=(0, 8))
         elif self.notebook.select() == str(self.knowledge_tab):
             self.knowledge_save_button.pack(side="right", padx=(0, 8))
         else:
@@ -477,6 +525,17 @@ class SystemSettingsDialog:
             "已保存；留空保持不变" if state.has_password else "不会显示已有密码"
         )
         self._sync_database_auth()
+
+    def _load_workspace_state(self, state: WorkspaceConfigState) -> None:
+        self.workspace_state = state
+        if state.config is not None:
+            self.workspace_path_var.set(state.config.path)
+        if state.configured:
+            self._set_workspace_status("项目路径已配置并可访问。", SUCCESS)
+        elif state.config is not None:
+            self._set_workspace_status("已保存的项目路径当前不可访问，请重新选择。", DANGER)
+        else:
+            self._set_workspace_status("尚未配置项目路径。", MUTED)
 
     def _detect_model(self) -> None:
         self._load_model_state(
@@ -581,6 +640,30 @@ class SystemSettingsDialog:
         self._set_database_status("SQL Server 配置已保存，将用于两套流程的新任务。", SUCCESS)
         if self.on_database_saved:
             self.on_database_saved(state)
+
+    def _browse_workspace(self) -> None:
+        initial = self.workspace_path_var.get().strip()
+        if not initial or not Path(initial).is_dir():
+            initial = str(Path.cwd())
+        selected = filedialog.askdirectory(
+            title="选择项目代码根目录",
+            initialdir=initial,
+            mustexist=True,
+            parent=self.window,
+        )
+        if selected:
+            self.workspace_path_var.set(str(Path(selected).resolve()))
+
+    def _save_workspace(self) -> None:
+        try:
+            state = self.workspace_service.save(self.workspace_path_var.get())
+        except Exception as exc:
+            messagebox.showerror("项目路径未保存", str(exc), parent=self.window)
+            return
+        self._load_workspace_state(state)
+        self._set_workspace_status("项目路径已保存，将用于两套流程的新任务。", SUCCESS)
+        if self.on_workspace_saved:
+            self.on_workspace_saved(state)
 
     def _knowledge_domain(self) -> KnowledgeDomain:
         return (
@@ -746,6 +829,10 @@ class SystemSettingsDialog:
     def _set_database_status(self, message: str, color: str) -> None:
         self.database_status_var.set(message)
         self.database_status_label.configure(fg=color)
+
+    def _set_workspace_status(self, message: str, color: str) -> None:
+        self.workspace_status_var.set(message)
+        self.workspace_status_label.configure(fg=color)
 
     @staticmethod
     def _status(parent: tk.Misc, variable: tk.StringVar, row: int) -> tk.Label:

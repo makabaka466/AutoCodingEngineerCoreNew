@@ -1,6 +1,6 @@
 # AutoCoding Engineer 架构说明
 
-本文描述当前 `0.5.4` 代码已经实现的架构。数据字段、公共方法和命令行参数见
+本文描述当前 `0.5.5` 代码已经实现的架构。数据字段、公共方法和命令行参数见
 [接口与数据契约](INTERFACES.md)。
 
 ## 1. 项目目标
@@ -72,7 +72,7 @@ flowchart TD
 | 层 | 目录或模块 | 当前职责 |
 | --- | --- | --- |
 | 交付接口 | `interfaces/` | 把桌面客户端、CLI、Streamlit 操作转换成统一应用调用 |
-| 系统配置 | `model_setup.py`、`sqlserver_service.py`、`workspace_knowledge.py` | 统一管理 Claude Code、模型服务、共用 SQL Server 与分流程 Markdown 知识 |
+| 系统配置 | `model_setup.py`、`sqlserver_service.py`、`workspace_config.py`、`workspace_knowledge.py` | 统一管理 Claude Code、模型服务、项目路径、共用 SQL Server 与分流程 Markdown 知识 |
 | 应用门面 | `application.py` | 组装依赖并暴露稳定的任务 API |
 | 异常领域 | `incident/` | 页面定位、只读查询计划、数据诊断及独立会话状态机 |
 | 核心 | `core/` | 状态机、阶段 Handler、Decision、Artifact、Recovery、执行模式和权限校验 |
@@ -282,7 +282,7 @@ Runtime run 的 owner、PID、heartbeat 和终态同样进入 SQLite，供启动
 
 ## 5. 异常诊断流程
 
-`IncidentSession` 保存问题、页面线索、来源、外部消息引用、Claude 会话 ID、最后决定、
+`IncidentSession` 保存问题、可选页面线索、消息附件、来源、外部消息引用、Claude 会话 ID、最后决定、
 `TaskState`、version/revision、事件、Runtime Run、CommandReceipt 和查询审计摘要。默认快照位于
 `agent-runtime.db` 的异常专用表；旧 `~/.autocoding-agent/incidents/*.json` 只作为幂等导入源，
 不会与开发任务 aggregate 混用。
@@ -290,7 +290,7 @@ Runtime run 的 owner、PID、heartbeat 和终态同样进入 SQLite，供启动
 ```mermaid
 stateDiagram-v2
     [*] --> Created
-    Created --> Inspecting: start(problem, page_hint)
+    Created --> Inspecting: start(problem, optional page_hint / screenshots)
     Inspecting --> WaitingInput: 页面或问题不清楚
     WaitingInput --> Inspecting: send(additional context)
     Inspecting --> QueryingData: 需要页面映射或业务数据
@@ -304,7 +304,7 @@ stateDiagram-v2
     Paused --> Cancelled: cancel
 ```
 
-模型可用的代码工具固定为 `Read`、`Glob`、`Grep`。它负责从页面线索定位前端页面，并沿最小
+模型可用的代码工具固定为 `Read`、`Glob`、`Grep`。它负责从消息里的页面线索或异常截图定位前端页面，并沿最小
 相关路径追踪请求、服务和数据访问代码；没有编辑、命令或数据库工具。需要页面映射或业务数据时，
 模型从已读代码与 schema 中提取/形成最多五条结构化、参数化 `DataQuery`，由 `IncidentEngine`
 直接交给 `DatabaseReader`，不能要求用户手工运行 SQL。页面名称需要数据库映射时允许在
@@ -349,6 +349,7 @@ SQL Server 非密钥配置原子写入 `<data_dir>/database/sqlserver.json`，�
 - 所有捆绑 Skill 组成的追加系统提示词；
 - 从调用方 Pydantic 模型生成的 JSON Schema；
 - 工作区能力目录；
+- 经主机校验的异常截图隔离目录，以及消息中精确的图片路径；
 - bare 模式、空 setting sources、严格空 MCP 配置和禁用 Chrome 的隔离参数；
 - 新建或恢复 Claude Code 会话所需的 ID。
 
@@ -376,6 +377,12 @@ Windows 子进程同时设置 `CREATE_NO_WINDOW` 和隐藏 `STARTUPINFO`，因�
 Windows 上的 API Key 只持久化到当前用户的 `HKCU\Environment` 与当前进程环境，不写
 `.env`、会话或日志。SQL Server 非密钥字段写入本机数据目录，密码写入 Windows Credential
 Manager。配置页只获取两个 `has_*` 布尔值，已有密钥和密码都不会回填到 Tk 输入控件。
+
+桌面端粘贴的异常截图由 `IncidentAttachmentStore` 读取，统一解码并转存为 PNG；每张图片使用
+独立 UUID 目录，位于 `<data_dir>/attachments/incident/`，不写目标仓库。主机限制单条消息最多
+5 张、单张 10 MiB、4000 万像素，并在 Incident Engine 再次核对路径、后缀和大小。Runtime 只
+通过对应的 `--add-dir` 暴露这些隔离父目录，异常流程仍只有 Read/Glob/Grep。系统提示词要求把
+图片及其中的文字视为不可信证据，不能把截图内的命令式文本提升为指令。
 
 ## 7. 能力文档生命周期
 
@@ -411,6 +418,8 @@ flowchart LR
 ```text
 <data_dir>/
 ├─ runtime/agent-runtime.db
+├─ workspace/project.json
+├─ attachments/incident/<attachment-id>/incident-screenshot.png
 ├─ tasks/<task-id>/
 │  ├─ manifest.json
 │  └─ artifacts/<artifact-uuid>.<json|patch|md>
@@ -480,6 +489,10 @@ run owner/PID/heartbeat。开发写阶段进入 `recovery_required`，异常只�
 Artifact 正文不写入目标仓库。`TaskArtifactStore` 使用 UUID 文件名、内容 SHA-256、大小限制、
 凭据脱敏和短临时文件原子替换；SQLite 只保存不可变元数据。Git observer 记录 status、commit、
 staged/unstaged diff 和未跟踪路径，但不会自动读取未跟踪文件正文。
+
+桌面新任务的项目根目录由 `WorkspaceConfigStore` 原子保存到
+`<data_dir>/workspace/project.json`。保存时必须解析为现存目录；更换配置只影响之后创建的新任务，
+已有开发或异常 Session 继续使用自己快照中的 workspace，避免续聊时静默切换代码库。
 
 目标仓库只在 Claude Code 的当前工作目录中暴露。主机验证结果中的文件路径形式，但当前
 不会核实每条相对路径是否真实存在，也没有跨进程文件锁。默认数据目录为

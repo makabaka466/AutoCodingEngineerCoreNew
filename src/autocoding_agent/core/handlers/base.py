@@ -26,6 +26,7 @@ class HandlerContext:
     history: tuple[ChatMessage, ...]
     system_prompt: str
     capability_dir: str | None
+    additional_dirs: tuple[str, ...] = ()
     run_id: str | None = None
     runtime_event_sink: Callable[[RuntimeActivity], None] | None = None
 
@@ -60,6 +61,7 @@ class StateHandler:
             allowed_tools=list(profile.allowed_tools),
             permission_mode=profile.permission_mode,
             capability_dir=context.capability_dir,
+            additional_dirs=list(context.additional_dirs),
         )
         observed = getattr(self.runtime, "run_observed", None)
         if (

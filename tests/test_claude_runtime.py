@@ -108,6 +108,25 @@ def test_build_command_resumes_exact_runtime_session(tmp_path: Path) -> None:
     assert "--max-budget-usd" not in command
 
 
+def test_build_command_mounts_capability_and_isolated_attachment_directories(
+    tmp_path: Path,
+) -> None:
+    runtime = ClaudeCodeRuntime(_settings(tmp_path))
+    turn = _turn(tmp_path)
+    first = tmp_path / "attachments" / "one"
+    second = tmp_path / "attachments" / "two"
+    turn.additional_dirs = [str(first), str(second), str(first)]
+
+    command = runtime.build_command(turn)
+    mounted = [
+        command[index + 1]
+        for index, item in enumerate(command)
+        if item == "--add-dir"
+    ]
+
+    assert mounted == [turn.capability_dir, str(first), str(second)]
+
+
 def test_generic_structured_runtime_uses_incident_schema(tmp_path: Path) -> None:
     captured: dict[str, object] = {}
 

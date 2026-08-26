@@ -47,6 +47,21 @@ class MessageRole(StrEnum):
     SYSTEM = "system"
 
 
+class AttachmentKind(StrEnum):
+    IMAGE = "image"
+
+
+class MessageAttachment(BaseModel):
+    """A host-validated local file explicitly attached to one user message."""
+
+    id: str = Field(default_factory=lambda: str(uuid4()))
+    kind: AttachmentKind = AttachmentKind.IMAGE
+    path: NonEmptyText
+    name: NonEmptyText
+    media_type: NonEmptyText
+    size_bytes: int = Field(ge=1, le=10 * 1024 * 1024)
+
+
 class EventType(StrEnum):
     TASK_CREATED = "task_created"
     STATE_TRANSITIONED = "state_transitioned"
@@ -80,6 +95,7 @@ class EventType(StrEnum):
 class ChatMessage(BaseModel):
     role: MessageRole
     content: str
+    attachments: list[MessageAttachment] = Field(default_factory=list, max_length=5)
     created_at: datetime = Field(default_factory=utc_now)
 
 
@@ -286,6 +302,7 @@ class RuntimeTurn(BaseModel):
     allowed_tools: list[str]
     permission_mode: str = "dontAsk"
     capability_dir: str | None = None
+    additional_dirs: list[str] = Field(default_factory=list, max_length=5)
 
 
 class RuntimeResult(BaseModel):
