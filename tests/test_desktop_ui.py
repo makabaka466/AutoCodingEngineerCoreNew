@@ -785,8 +785,8 @@ def test_flow_selector_shows_active_flow_and_reveals_incident_fields(
     assert client.development_flow_button.selected is False
     assert "异常诊断" in client.new_task_button.cget("text")
     assert client.task_title_var.get() == "新异常诊断"
-    assert "页面名称" in client.prompt_placeholder.cget("text")
-    assert "包含页面标题" in client.transcript.get("1.0", "end")
+    assert "页面标题或路径" in client.prompt_placeholder.cget("text")
+    assert "先理解你的对话内容" in client.transcript.get("1.0", "end")
     assert not hasattr(client, "page_hint_entry")
     assert not hasattr(client, "database_browse_button")
     assert client.project_var.get() == "生物"

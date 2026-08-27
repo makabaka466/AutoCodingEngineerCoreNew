@@ -119,10 +119,10 @@ def _page() -> LocatedPage:
     )
 
 
-def test_incident_prompt_requires_page_name_before_bounded_investigation(
+def test_incident_prompt_uses_dialogue_then_image_for_page_identity(
     tmp_path: Path,
 ) -> None:
-    workspace = tmp_path / "workspace-page-first"
+    workspace = tmp_path / "workspace-page-evidence"
     workspace.mkdir()
     runtime = ScriptedStructuredRuntime(
         [
@@ -133,14 +133,17 @@ def test_incident_prompt_requires_page_name_before_bounded_investigation(
             )
         ]
     )
-    engine = IncidentEngine(runtime, JsonIncidentStore(tmp_path / "data-page-first"), None)
+    engine = IncidentEngine(runtime, JsonIncidentStore(tmp_path / "data-page-evidence"), None)
 
     outcome = engine.start(workspace, "The screen shows an error.")
 
     assert outcome.status == IncidentStatus.NEEDS_INPUT
     prompt = runtime.turns[0].system_prompt
-    assert "A reliable page name is a mandatory precondition" in prompt
-    assert "focus first on the title-bearing parts of the open page" in prompt
+    assert "Before inspecting any screenshot" in prompt
+    assert "credible page title or page path" in prompt
+    assert "image has no clear title but the conversation provides" in prompt
+    assert "ask the user to confirm which" in prompt
+    assert "A reliable page name is a mandatory precondition" not in prompt
     assert "at most 20 candidates" in prompt
     assert "Red\n  text is a common clue but not a rule" in prompt
     assert "Menu.NAME" not in prompt
