@@ -33,6 +33,14 @@ from autocoding_agent.core.models import (
     utc_now,
 )
 from autocoding_agent.core.policies import ExecutionPolicy
+from autocoding_agent.core.progress import (
+    ProgressEvent,
+    ProgressPhase,
+    ProgressProjector,
+    ProgressSink,
+    ProgressWorkflow,
+    emit_progress,
+)
 from autocoding_agent.core.recovery.models import RecoveryAction
 from autocoding_agent.core.runtime.models import (
     RunStatus,
@@ -115,6 +123,8 @@ class AgentEngine:
         workspace: str | Path,
         message: str,
         project: str | None = None,
+        *,
+        progress_sink: ProgressSink | None = None,
     ) -> AgentOutcome:
         canonical = Path(workspace).expanduser().resolve(strict=True)
         if not canonical.is_dir():
@@ -147,13 +157,17 @@ class AgentEngine:
             )
         )
         self.sessions.create(session)
-        return self._run_command(session, message.strip(), AgentMode.INSPECT, command)
+        return self._run_command(
+            session, message.strip(), AgentMode.INSPECT, command, progress_sink
+        )
 
     def send(
         self,
         session_id: str,
         message: str,
         command_id: str | None = None,
+        *,
+        progress_sink: ProgressSink | None = None,
     ) -> AgentOutcome:
         session = self.sessions.load(session_id)
         if duplicate := self._duplicate_command_outcome(session, command_id):
@@ -172,7 +186,9 @@ class AgentEngine:
         )
         if session.task_state == TaskState.COMPLETED:
             self._reopen_completed_cycle(session, message.strip(), command)
-        return self._run_command(session, message.strip(), AgentMode.INSPECT, command)
+        return self._run_command(
+            session, message.strip(), AgentMode.INSPECT, command, progress_sink
+        )
 
     @staticmethod
     def _reopen_completed_cycle(
@@ -203,7 +219,13 @@ class AgentEngine:
             )
         )
 
-    def approve(self, session_id: str, command_id: str | None = None) -> AgentOutcome:
+    def approve(
+        self,
+        session_id: str,
+        command_id: str | None = None,
+        *,
+        progress_sink: ProgressSink | None = None,
+    ) -> AgentOutcome:
         session = self.sessions.load(session_id)
         if duplicate := self._duplicate_command_outcome(session, command_id):
             return duplicate
@@ -247,13 +269,15 @@ class AgentEngine:
             "Continue from the existing investigation and execute only the exact proposal and "
             f"actions the user reviewed.{reviewed_scope}"
         )
-        return self._run_command(session, message, mode, command)
+        return self._run_command(session, message, mode, command, progress_sink)
 
     def reject(
         self,
         session_id: str,
         reason: str = "",
         command_id: str | None = None,
+        *,
+        progress_sink: ProgressSink | None = None,
     ) -> AgentOutcome:
         session = self.sessions.load(session_id)
         if duplicate := self._duplicate_command_outcome(session, command_id):
@@ -282,16 +306,20 @@ class AgentEngine:
             f"The user declined the requested {approval.scope.value} scope.{detail} "
             "Continue without that permission and provide the best truthful alternative."
         )
-        return self._run_command(session, message, AgentMode.INSPECT, command)
+        return self._run_command(
+            session, message, AgentMode.INSPECT, command, progress_sink
+        )
 
     def resume(
         self,
         session_id: str,
         action: RecoveryAction | str = RecoveryAction.READ_ONLY_INSPECT,
+        *,
+        progress_sink: ProgressSink | None = None,
     ) -> AgentOutcome:
         selected = RecoveryAction(action)
         if selected == RecoveryAction.CANCEL:
-            return self.cancel(session_id)
+            return self.cancel(session_id, progress_sink=progress_sink)
         session = self.sessions.load(session_id)
         if session.task_state not in {TaskState.PAUSED, TaskState.RECOVERY_REQUIRED}:
             raise ValueError(f"Task state {session.task_state.value} does not require recovery.")
@@ -321,7 +349,15 @@ class AgentEngine:
                 "recovery artifacts without modifying files or running side-effecting commands. "
                 "Explain what happened and propose safe next steps."
             )
-        return self.send(session_id, message)
+        emit_progress(
+            progress_sink,
+            ProgressEvent.for_phase(
+                ProgressWorkflow.DEVELOPMENT,
+                ProgressPhase.RECOVERING,
+                task_id=session_id,
+            ),
+        )
+        return self.send(session_id, message, progress_sink=progress_sink)
 
     def pause(self, session_id: str) -> AgentOutcome:
         session = self.sessions.load(session_id)
@@ -347,7 +383,12 @@ class AgentEngine:
         self.sessions.save(session)
         return self._to_outcome(session)
 
-    def cancel(self, session_id: str) -> AgentOutcome:
+    def cancel(
+        self,
+        session_id: str,
+        *,
+        progress_sink: ProgressSink | None = None,
+    ) -> AgentOutcome:
         session = self.sessions.load(session_id)
         if self.state_machine.is_terminal(session.task_state):
             raise ValueError("The task is already complete or cancelled.")
@@ -386,6 +427,15 @@ class AgentEngine:
         session.updated_at = utc_now()
         self._complete_command(session, command)
         self.sessions.save(session)
+        emit_progress(
+            progress_sink,
+            ProgressEvent.for_phase(
+                ProgressWorkflow.DEVELOPMENT,
+                ProgressPhase.FAILED,
+                task_id=session.id,
+                active=False,
+            ),
+        )
         return self._to_outcome(session)
 
     def get_session(self, session_id: str) -> AgentSession:
@@ -406,10 +456,32 @@ class AgentEngine:
         user_message: str,
         mode: AgentMode,
         command: AgentCommand,
+        progress_sink: ProgressSink | None = None,
     ) -> AgentOutcome:
-        self._execute(session, user_message, mode, command)
+        emit_progress(
+            progress_sink,
+            ProgressEvent.for_phase(
+                ProgressWorkflow.DEVELOPMENT,
+                ProgressPhase.PREPARING_CONTEXT,
+                task_id=session.id,
+            ),
+        )
+        try:
+            self._execute(session, user_message, mode, command, progress_sink)
+        except Exception:
+            emit_progress(
+                progress_sink,
+                ProgressEvent.for_phase(
+                    ProgressWorkflow.DEVELOPMENT,
+                    ProgressPhase.FAILED,
+                    task_id=session.id,
+                    active=False,
+                ),
+            )
+            raise
         self._complete_command(session, command)
         self.sessions.save(session)
+        self._emit_outcome_progress(session, progress_sink)
         return self._to_outcome(session)
 
     def _retrieve_knowledge(
@@ -418,9 +490,18 @@ class AgentEngine:
         query: str,
         mode: AgentMode,
         command_id: str,
+        progress_sink: ProgressSink | None = None,
     ) -> str:
         if mode != AgentMode.INSPECT or self.knowledge_retriever is None:
             return ""
+        emit_progress(
+            progress_sink,
+            ProgressEvent.for_phase(
+                ProgressWorkflow.DEVELOPMENT,
+                ProgressPhase.RETRIEVING_KNOWLEDGE,
+                task_id=session.id,
+            ),
+        )
         try:
             result = self.knowledge_retriever.retrieve(
                 query,
@@ -502,6 +583,7 @@ class AgentEngine:
         user_message: str,
         mode: AgentMode,
         command: AgentCommand,
+        progress_sink: ProgressSink | None = None,
     ) -> AgentOutcome:
         self._enter_mode_state(session, mode, command)
         session.messages.append(ChatMessage(role=MessageRole.USER, content=user_message))
@@ -532,7 +614,13 @@ class AgentEngine:
         # write/command tool exists; resumed modes retain anything already read.
         readable_capability_dir = str(capability_dir) if mode == AgentMode.INSPECT else None
         pending_message = user_message
-        knowledge_context = self._retrieve_knowledge(session, user_message, mode, command.id)
+        knowledge_context = self._retrieve_knowledge(
+            session,
+            user_message,
+            mode,
+            command.id,
+            progress_sink,
+        )
 
         while True:
             existing_runtime_session_id = session.runtime_session_id
@@ -543,6 +631,18 @@ class AgentEngine:
                 self.sessions.save(session)
             run = self._start_runtime_run(session, mode, command.id)
             self.sessions.save(session)
+            emit_progress(
+                progress_sink,
+                ProgressEvent.for_phase(
+                    ProgressWorkflow.DEVELOPMENT,
+                    {
+                        AgentMode.INSPECT: ProgressPhase.ANALYZING_REQUEST,
+                        AgentMode.IMPLEMENT: ProgressPhase.MODIFYING_CODE,
+                        AgentMode.VERIFY: ProgressPhase.VERIFYING_CHANGE,
+                    }[mode],
+                    task_id=session.id,
+                ),
+            )
             try:
                 database_schema = (
                     self.database.describe_schema()
@@ -570,11 +670,13 @@ class AgentEngine:
                         capability_dir=readable_capability_dir,
                         run_id=run.id,
                         runtime_event_sink=lambda activity, active_run=run: (
-                            self._record_runtime_activity(
+                            self._record_and_project_runtime_activity(
                                 session,
                                 active_run,
                                 activity,
                                 command.id,
+                                mode,
+                                progress_sink,
                             )
                         ),
                     )
@@ -695,6 +797,14 @@ class AgentEngine:
             session.updated_at = utc_now()
 
             if decision.status == AgentStatus.QUERY_REQUIRED:
+                emit_progress(
+                    progress_sink,
+                    ProgressEvent.for_phase(
+                        ProgressWorkflow.DEVELOPMENT,
+                        ProgressPhase.QUERYING_DATABASE,
+                        task_id=session.id,
+                    ),
+                )
                 try:
                     results = self._execute_database_queries(session, decision)
                 except Exception as exc:
@@ -725,6 +835,14 @@ class AgentEngine:
 
             self._append_status_event(session, decision)
             if decision.status == AgentStatus.COMPLETED:
+                emit_progress(
+                    progress_sink,
+                    ProgressEvent.for_phase(
+                        ProgressWorkflow.DEVELOPMENT,
+                        ProgressPhase.SAVING_CAPABILITY,
+                        task_id=session.id,
+                    ),
+                )
                 self._record_capability(session, decision)
                 if self.artifact_recorder is not None:
                     try:
@@ -919,6 +1037,25 @@ class AgentEngine:
                 )
             )
         self.sessions.save(session)
+
+    def _record_and_project_runtime_activity(
+        self,
+        session: AgentSession,
+        run: RuntimeRunRecord,
+        activity: RuntimeActivity,
+        command_id: str,
+        mode: AgentMode,
+        progress_sink: ProgressSink | None,
+    ) -> None:
+        self._record_runtime_activity(session, run, activity, command_id)
+        progress = ProgressProjector.from_runtime(
+            activity,
+            workflow=ProgressWorkflow.DEVELOPMENT,
+            task_id=session.id,
+            mode=mode.value,
+        )
+        if progress is not None:
+            emit_progress(progress_sink, progress)
 
     def _finish_runtime_run(
         self,
@@ -1258,6 +1395,27 @@ class AgentEngine:
                     "cycle_number": session.cycle_number,
                 },
             )
+        )
+
+    @staticmethod
+    def _emit_outcome_progress(
+        session: AgentSession,
+        progress_sink: ProgressSink | None,
+    ) -> None:
+        phase = {
+            AgentStatus.NEEDS_INPUT: ProgressPhase.WAITING_INPUT,
+            AgentStatus.APPROVAL_REQUIRED: ProgressPhase.WAITING_APPROVAL,
+            AgentStatus.COMPLETED: ProgressPhase.COMPLETED,
+            AgentStatus.FAILED: ProgressPhase.FAILED,
+        }.get(session.status, ProgressPhase.FAILED)
+        emit_progress(
+            progress_sink,
+            ProgressEvent.for_phase(
+                ProgressWorkflow.DEVELOPMENT,
+                phase,
+                task_id=session.id,
+                active=phase not in {ProgressPhase.COMPLETED, ProgressPhase.FAILED},
+            ),
         )
 
     @staticmethod

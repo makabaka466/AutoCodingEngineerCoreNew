@@ -17,6 +17,7 @@ from autocoding_agent.core.audit.models import ChangeExplanation
 from autocoding_agent.core.engine import AgentEngine
 from autocoding_agent.core.models import AgentEvent, AgentOutcome, AgentSession
 from autocoding_agent.core.policies import ExecutionPolicy
+from autocoding_agent.core.progress import ProgressSink
 from autocoding_agent.core.recovery.manager import RecoveryManager
 from autocoding_agent.core.recovery.models import RecoveryAction, RecoveryScanResult
 from autocoding_agent.core.runtime.models import RuntimeRunRecord
@@ -48,40 +49,78 @@ class AgentApplication:
         workspace: str | Path,
         message: str,
         project: str | None = None,
+        *,
+        progress_sink: ProgressSink | None = None,
     ) -> AgentOutcome:
-        return self._engine.start(workspace, message, project)
+        return self._engine.start(
+            workspace,
+            message,
+            project,
+            progress_sink=progress_sink,
+        )
 
     def send(
         self,
         session_id: str,
         message: str,
         command_id: str | None = None,
+        *,
+        progress_sink: ProgressSink | None = None,
     ) -> AgentOutcome:
-        return self._engine.send(session_id, message, command_id)
+        return self._engine.send(
+            session_id,
+            message,
+            command_id,
+            progress_sink=progress_sink,
+        )
 
-    def approve(self, session_id: str, command_id: str | None = None) -> AgentOutcome:
-        return self._engine.approve(session_id, command_id)
+    def approve(
+        self,
+        session_id: str,
+        command_id: str | None = None,
+        *,
+        progress_sink: ProgressSink | None = None,
+    ) -> AgentOutcome:
+        return self._engine.approve(
+            session_id,
+            command_id,
+            progress_sink=progress_sink,
+        )
 
     def reject(
         self,
         session_id: str,
         reason: str = "",
         command_id: str | None = None,
+        *,
+        progress_sink: ProgressSink | None = None,
     ) -> AgentOutcome:
-        return self._engine.reject(session_id, reason, command_id)
+        return self._engine.reject(
+            session_id,
+            reason,
+            command_id,
+            progress_sink=progress_sink,
+        )
 
     def resume(
         self,
         session_id: str,
         action: RecoveryAction | str = RecoveryAction.READ_ONLY_INSPECT,
+        *,
+        progress_sink: ProgressSink | None = None,
     ) -> AgentOutcome:
-        return self._engine.resume(session_id, action)
+        return self._engine.resume(session_id, action, progress_sink=progress_sink)
 
     def pause(self, session_id: str) -> AgentOutcome:
         return self._engine.pause(session_id)
 
-    def cancel(self, session_id: str) -> AgentOutcome:
-        return self._engine.cancel(session_id)
+    def cancel(
+        self,
+        session_id: str,
+        *,
+        progress_sink: ProgressSink | None = None,
+    ) -> AgentOutcome:
+        return self._engine.cancel(session_id, progress_sink=progress_sink)
 
     def outcome(self, session_id: str) -> AgentOutcome:
         return self._engine.outcome(session_id)

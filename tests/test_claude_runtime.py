@@ -348,6 +348,44 @@ def test_observed_runtime_parses_sanitized_tool_lifecycle(tmp_path: Path) -> Non
     assert "--include-hook-events" in command
 
 
+def test_observed_runtime_supports_incident_structured_contract(tmp_path: Path) -> None:
+    stream = [
+        {"type": "system", "subtype": "init", "model": "deepseek-test"},
+        {
+            "type": "result",
+            "subtype": "success",
+            "session_id": "runtime-incident-stream",
+            "structured_output": {
+                "status": "needs_input",
+                "message": "Need the page title.",
+                "question": "What title is visible on the page?",
+            },
+            "usage": {"input_tokens": 2, "output_tokens": 3},
+        },
+    ]
+    script = "import sys\n" + "\n".join(
+        f"print({json.dumps(json.dumps(item))}, flush=True)" for item in stream
+    )
+
+    def popen_factory(command: list[str], **kwargs: object) -> subprocess.Popen[str]:
+        return subprocess.Popen([sys.executable, "-c", script], **kwargs)
+
+    runtime = ClaudeCodeRuntime(_settings(tmp_path), popen_factory=popen_factory)
+    activities = []
+
+    result = runtime.run_structured_observed(
+        _turn(tmp_path),
+        IncidentDecision,
+        "incident-run-1",
+        activities.append,
+    )
+
+    assert result.runtime_session_id == "runtime-incident-stream"
+    assert result.output.status == IncidentStatus.NEEDS_INPUT
+    assert result.output.question == "What title is visible on the page?"
+    assert activities[0].kind == RuntimeEventKind.SYSTEM_INIT
+
+
 def test_observed_runtime_can_be_interrupted(tmp_path: Path) -> None:
     started = threading.Event()
 

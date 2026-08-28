@@ -19,6 +19,7 @@ from autocoding_agent.core.models import (
     MessageAttachment,
     RuntimeTurn,
 )
+from autocoding_agent.core.progress import ProgressPhase
 from autocoding_agent.core.state_machine.models import TaskState
 from autocoding_agent.incident.capability_store import IncidentCapabilityStore
 from autocoding_agent.incident.engine import IncidentEngine
@@ -230,11 +231,13 @@ def test_incident_flow_locates_page_queries_data_and_diagnoses(tmp_path: Path) -
         model="test-model",
     )
 
+    progress = []
     outcome = engine.start(
         workspace,
         "Order 42 never completes",
         "/orders/42",
         project="生物",
+        progress_sink=progress.append,
     )
 
     assert outcome.status == IncidentStatus.COMPLETED
@@ -267,6 +270,15 @@ def test_incident_flow_locates_page_queries_data_and_diagnoses(tmp_path: Path) -
         TaskState.COMPLETED.value,
     ]
     assert any(event.type == EventType.DATABASE_QUERIES_EXECUTED for event in outcome.events)
+    assert [event.phase for event in progress] == [
+        ProgressPhase.PREPARING_CONTEXT,
+        ProgressPhase.ANALYZING_REQUEST,
+        ProgressPhase.QUERYING_DATABASE,
+        ProgressPhase.DIAGNOSING_CAUSE,
+        ProgressPhase.ANALYZING_REQUEST,
+        ProgressPhase.SAVING_CAPABILITY,
+        ProgressPhase.COMPLETED,
+    ]
 
 
 def test_incident_flow_injects_retrieved_knowledge_and_audits_it(

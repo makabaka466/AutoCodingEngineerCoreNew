@@ -28,6 +28,7 @@ from autocoding_agent.core.models import (
     RuntimeResult,
     RuntimeTurn,
 )
+from autocoding_agent.core.progress import ProgressPhase
 from autocoding_agent.core.state_machine.models import TaskState
 from autocoding_agent.database_models import DataQuery, QueryResult
 from autocoding_agent.knowledge_rag.models import (
@@ -190,7 +191,13 @@ def test_multi_turn_clarification_preserves_full_history(tmp_path: Path) -> None
     )
     app = _app(tmp_path / "state", runtime)
 
-    first = app.start(workspace, "Please optimize this project.", project="生物")
+    progress = []
+    first = app.start(
+        workspace,
+        "Please optimize this project.",
+        project="生物",
+        progress_sink=progress.append,
+    )
     second = app.send(first.session_id, "The upload behavior is wrong.")
     final = app.send(first.session_id, "POST /upload succeeds but testMod is missing.")
 
@@ -231,6 +238,12 @@ def test_multi_turn_clarification_preserves_full_history(tmp_path: Path) -> None
     ]
     assert app.get_session(first.session_id).project == "生物"
     assert "selected the knowledge project '生物'" in runtime.turns[0].system_prompt
+    assert [event.phase for event in progress] == [
+        ProgressPhase.PREPARING_CONTEXT,
+        ProgressPhase.RETRIEVING_KNOWLEDGE,
+        ProgressPhase.ANALYZING_REQUEST,
+        ProgressPhase.WAITING_INPUT,
+    ]
 
 
 def test_development_flow_can_use_shared_read_only_database(tmp_path: Path) -> None:

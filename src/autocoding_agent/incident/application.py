@@ -10,6 +10,7 @@ from autocoding_agent.adapters.sqlite_database import SQLiteDatabaseReader
 from autocoding_agent.adapters.sqlite_incident_store import SQLiteIncidentStore
 from autocoding_agent.config import Settings, get_settings
 from autocoding_agent.core.models import AgentEvent, MessageAttachment
+from autocoding_agent.core.progress import ProgressSink
 from autocoding_agent.core.recovery.models import RecoveryAction, RecoveryScanResult
 from autocoding_agent.core.runtime.models import RuntimeRunRecord
 from autocoding_agent.core.state_machine.machine import AgentStateMachine
@@ -48,6 +49,7 @@ class IncidentApplication:
         source: str = "manual",
         external_reference: str | None = None,
         attachments: list[MessageAttachment] | None = None,
+        progress_sink: ProgressSink | None = None,
     ) -> IncidentOutcome:
         return self._engine.start(
             workspace,
@@ -57,6 +59,7 @@ class IncidentApplication:
             source=source,
             external_reference=external_reference,
             attachments=attachments,
+            progress_sink=progress_sink,
         )
 
     def send(
@@ -65,18 +68,33 @@ class IncidentApplication:
         message: str,
         command_id: str | None = None,
         attachments: list[MessageAttachment] | None = None,
+        *,
+        progress_sink: ProgressSink | None = None,
     ) -> IncidentOutcome:
-        return self._engine.send(session_id, message, command_id, attachments)
+        return self._engine.send(
+            session_id,
+            message,
+            command_id,
+            attachments,
+            progress_sink=progress_sink,
+        )
 
     def resume(
         self,
         session_id: str,
         action: RecoveryAction | str = RecoveryAction.READ_ONLY_INSPECT,
+        *,
+        progress_sink: ProgressSink | None = None,
     ) -> IncidentOutcome:
-        return self._engine.resume(session_id, action)
+        return self._engine.resume(session_id, action, progress_sink=progress_sink)
 
-    def cancel(self, session_id: str) -> IncidentOutcome:
-        return self._engine.cancel(session_id)
+    def cancel(
+        self,
+        session_id: str,
+        *,
+        progress_sink: ProgressSink | None = None,
+    ) -> IncidentOutcome:
+        return self._engine.cancel(session_id, progress_sink=progress_sink)
 
     def outcome(self, session_id: str) -> IncidentOutcome:
         return self._engine.outcome(session_id)

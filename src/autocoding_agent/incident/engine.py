@@ -18,8 +18,21 @@ from autocoding_agent.core.models import (
     RuntimeTurn,
     utc_now,
 )
+from autocoding_agent.core.progress import (
+    ProgressEvent,
+    ProgressPhase,
+    ProgressProjector,
+    ProgressSink,
+    ProgressWorkflow,
+    emit_progress,
+)
 from autocoding_agent.core.recovery.models import RecoveryAction
-from autocoding_agent.core.runtime.models import RunStatus, RuntimeRunRecord
+from autocoding_agent.core.runtime.models import (
+    RunStatus,
+    RuntimeActivity,
+    RuntimeEventKind,
+    RuntimeRunRecord,
+)
 from autocoding_agent.core.state_machine.machine import AgentStateMachine
 from autocoding_agent.core.state_machine.models import (
     AgentCommand,
@@ -86,6 +99,7 @@ class IncidentEngine:
         source: str = "manual",
         external_reference: str | None = None,
         attachments: list[MessageAttachment] | None = None,
+        progress_sink: ProgressSink | None = None,
     ) -> IncidentOutcome:
         canonical = Path(workspace).expanduser().resolve(strict=True)
         if not canonical.is_dir():
@@ -122,7 +136,13 @@ class IncidentEngine:
             "screenshot, and ask one focused question if it still cannot be located."
         )
         message = f"Problem:\n{session.problem}\n\nPage hint:\n{page}"
-        return self._execute(session, message, command, validated_attachments)
+        return self._execute(
+            session,
+            message,
+            command,
+            validated_attachments,
+            progress_sink,
+        )
 
     def send(
         self,
@@ -130,6 +150,8 @@ class IncidentEngine:
         message: str,
         command_id: str | None = None,
         attachments: list[MessageAttachment] | None = None,
+        *,
+        progress_sink: ProgressSink | None = None,
     ) -> IncidentOutcome:
         session = self.sessions.load(session_id)
         if duplicate := self._duplicate_command_outcome(session, command_id):
@@ -153,6 +175,7 @@ class IncidentEngine:
             message.strip(),
             command,
             self._validate_attachments(attachments or []),
+            progress_sink,
         )
 
     @staticmethod
@@ -187,10 +210,12 @@ class IncidentEngine:
         self,
         session_id: str,
         action: RecoveryAction | str = RecoveryAction.READ_ONLY_INSPECT,
+        *,
+        progress_sink: ProgressSink | None = None,
     ) -> IncidentOutcome:
         selected = RecoveryAction(action)
         if selected == RecoveryAction.CANCEL:
-            return self.cancel(session_id)
+            return self.cancel(session_id, progress_sink=progress_sink)
         session = self.sessions.load(session_id)
         if session.task_state not in {TaskState.PAUSED, TaskState.RECOVERY_REQUIRED}:
             raise ValueError(
@@ -221,9 +246,22 @@ class IncidentEngine:
                 "Recovery choice: continue read-only incident investigation. Recheck current "
                 "code and request only the minimum database evidence still needed."
             )
-        return self._execute(session, message, command)
+        emit_progress(
+            progress_sink,
+            ProgressEvent.for_phase(
+                ProgressWorkflow.INCIDENT,
+                ProgressPhase.RECOVERING,
+                task_id=session.id,
+            ),
+        )
+        return self._execute(session, message, command, progress_sink=progress_sink)
 
-    def cancel(self, session_id: str) -> IncidentOutcome:
+    def cancel(
+        self,
+        session_id: str,
+        *,
+        progress_sink: ProgressSink | None = None,
+    ) -> IncidentOutcome:
         session = self.sessions.load(session_id)
         if self.state_machine.is_terminal(session.task_state):
             raise ValueError("The incident is already complete or cancelled.")
@@ -262,6 +300,15 @@ class IncidentEngine:
         )
         self._complete_command(session, command)
         self.sessions.save(session)
+        emit_progress(
+            progress_sink,
+            ProgressEvent.for_phase(
+                ProgressWorkflow.INCIDENT,
+                ProgressPhase.FAILED,
+                task_id=session.id,
+                active=False,
+            ),
+        )
         return self._to_outcome(session)
 
     def outcome(self, session_id: str) -> IncidentOutcome:
@@ -279,8 +326,17 @@ class IncidentEngine:
         user_message: str,
         command: AgentCommand,
         attachments: list[MessageAttachment] | None = None,
+        progress_sink: ProgressSink | None = None,
     ) -> IncidentOutcome:
         attachments = attachments or []
+        emit_progress(
+            progress_sink,
+            ProgressEvent.for_phase(
+                ProgressWorkflow.INCIDENT,
+                ProgressPhase.PREPARING_CONTEXT,
+                task_id=session.id,
+            ),
+        )
         self.state_machine.transition(
             session,
             TaskState.INSPECTING,
@@ -312,19 +368,41 @@ class IncidentEngine:
         )
         pending_message = self._message_with_attachments(user_message, attachments)
         attachment_dirs = list(dict.fromkeys(str(Path(item.path).parent) for item in attachments))
-        knowledge_context = self._retrieve_knowledge(session, user_message, command.id)
+        knowledge_context = self._retrieve_knowledge(
+            session,
+            user_message,
+            command.id,
+            progress_sink,
+        )
 
         while True:
             session.updated_at = utc_now()
             self.sessions.save(session)
             run = self._start_runtime_run(session, command.id)
             self.sessions.save(session)
+            emit_progress(
+                progress_sink,
+                ProgressEvent.for_phase(
+                    ProgressWorkflow.INCIDENT,
+                    (
+                        ProgressPhase.ANALYZING_IMAGE
+                        if attachments
+                        else ProgressPhase.ANALYZING_REQUEST
+                    ),
+                    task_id=session.id,
+                    detail=(f"已附加 {len(attachments)} 张截图" if attachments else None),
+                ),
+            )
             try:
                 decision, usage = self._model_turn(
                     session,
                     pending_message,
                     attachment_dirs,
                     knowledge_context,
+                    run,
+                    command.id,
+                    progress_sink,
+                    [item.path for item in attachments],
                 )
                 self._validate_decision(decision)
             except Exception as exc:
@@ -393,6 +471,14 @@ class IncidentEngine:
 
             if decision.status != IncidentStatus.QUERY_REQUIRED:
                 if decision.status == IncidentStatus.COMPLETED and self.capabilities is not None:
+                    emit_progress(
+                        progress_sink,
+                        ProgressEvent.for_phase(
+                            ProgressWorkflow.INCIDENT,
+                            ProgressPhase.SAVING_CAPABILITY,
+                            task_id=session.id,
+                        ),
+                    )
                     try:
                         receipt = self.capabilities.record(session, decision, self.model)
                         session.capability_document = receipt.document_path
@@ -450,6 +536,7 @@ class IncidentEngine:
                 )
                 self._complete_command(session, command)
                 self.sessions.save(session)
+                self._emit_outcome_progress(session, progress_sink)
                 return self._to_outcome(session)
 
             if self.database is None:
@@ -476,6 +563,18 @@ class IncidentEngine:
                 )
 
             session.query_rounds += 1
+            emit_progress(
+                progress_sink,
+                ProgressEvent.for_phase(
+                    ProgressWorkflow.INCIDENT,
+                    (
+                        ProgressPhase.LOCATING_PAGE
+                        if decision.page is None
+                        else ProgressPhase.QUERYING_DATABASE
+                    ),
+                    task_id=session.id,
+                ),
+            )
             try:
                 results = [self.database.execute(query) for query in decision.queries]
             except Exception as exc:
@@ -528,6 +627,14 @@ class IncidentEngine:
                 continue
 
             self._record_query_results(session, decision, results, command.id)
+            emit_progress(
+                progress_sink,
+                ProgressEvent.for_phase(
+                    ProgressWorkflow.INCIDENT,
+                    ProgressPhase.DIAGNOSING_CAUSE,
+                    task_id=session.id,
+                ),
+            )
             # Raw rows are sent to the current model session but not persisted by our store.
             pending_message = (
                 "The host automatically executed your bounded read-only query plan. Treat every "
@@ -717,6 +824,53 @@ class IncidentEngine:
         )
         return run
 
+    def _record_and_project_runtime_activity(
+        self,
+        session: IncidentSession,
+        run: RuntimeRunRecord,
+        activity: RuntimeActivity,
+        command_id: str,
+        progress_sink: ProgressSink | None,
+        attachment_paths: list[str],
+    ) -> None:
+        if activity.run_id != run.id or run.status != RunStatus.STARTED:
+            raise ValueError("Runtime activity does not belong to the active incident run.")
+        run.heartbeat_at = max(run.heartbeat_at, activity.created_at)
+        run.activity_ids.append(activity.id)
+        event_type = {
+            RuntimeEventKind.TOOL_STARTED: EventType.TOOL_STARTED,
+            RuntimeEventKind.TOOL_FINISHED: EventType.TOOL_FINISHED,
+        }.get(activity.kind, EventType.RUNTIME_ACTIVITY)
+        session.events.append(
+            AgentEvent(
+                type=event_type,
+                message=activity.summary,
+                actor="runtime",
+                command_id=command_id,
+                correlation_id=run.id,
+                data={
+                    "activity_id": activity.id,
+                    "run_id": run.id,
+                    "kind": activity.kind.value,
+                    "tool_name": activity.tool_name,
+                    "tool_use_id": activity.tool_use_id,
+                    "workflow": "incident",
+                    **activity.data,
+                },
+                created_at=activity.created_at,
+            )
+        )
+        self.sessions.save(session)
+        progress = ProgressProjector.from_runtime(
+            activity,
+            workflow=ProgressWorkflow.INCIDENT,
+            task_id=session.id,
+            mode=AgentMode.INSPECT.value,
+            attachment_paths=attachment_paths,
+        )
+        if progress is not None:
+            emit_progress(progress_sink, progress)
+
     @staticmethod
     def _finish_runtime_run(
         session: IncidentSession,
@@ -761,6 +915,10 @@ class IncidentEngine:
         user_message: str,
         attachment_dirs: list[str] | None = None,
         knowledge_context: str = "",
+        run: RuntimeRunRecord | None = None,
+        command_id: str | None = None,
+        progress_sink: ProgressSink | None = None,
+        attachment_paths: list[str] | None = None,
     ) -> tuple[IncidentDecision, AgentUsage]:
         schema = (
             self.database.describe_schema()
@@ -794,7 +952,23 @@ class IncidentEngine:
             capability_dir=str(capability_dir) if capability_dir else None,
             additional_dirs=attachment_dirs or [],
         )
-        result = self.runtime.run_structured(turn, IncidentDecision)
+        observed = getattr(self.runtime, "run_structured_observed", None)
+        if callable(observed) and run is not None and command_id is not None:
+            result = observed(
+                turn,
+                IncidentDecision,
+                run.id,
+                lambda activity: self._record_and_project_runtime_activity(
+                    session,
+                    run,
+                    activity,
+                    command_id,
+                    progress_sink,
+                    attachment_paths or [],
+                ),
+            )
+        else:
+            result = self.runtime.run_structured(turn, IncidentDecision)
         session.runtime_session_id = result.runtime_session_id
         return result.output, result.usage
 
@@ -803,9 +977,18 @@ class IncidentEngine:
         session: IncidentSession,
         query: str,
         command_id: str,
+        progress_sink: ProgressSink | None = None,
     ) -> str:
         if self.knowledge_retriever is None:
             return ""
+        emit_progress(
+            progress_sink,
+            ProgressEvent.for_phase(
+                ProgressWorkflow.INCIDENT,
+                ProgressPhase.RETRIEVING_KNOWLEDGE,
+                task_id=session.id,
+            ),
+        )
         try:
             result = self.knowledge_retriever.retrieve(
                 query,
@@ -952,6 +1135,27 @@ class IncidentEngine:
         self._complete_command(session, command)
         self.sessions.save(session)
         return self._to_outcome(session)
+
+    @staticmethod
+    def _emit_outcome_progress(
+        session: IncidentSession,
+        progress_sink: ProgressSink | None,
+    ) -> None:
+        phase = {
+            IncidentStatus.NEEDS_INPUT: ProgressPhase.WAITING_INPUT,
+            IncidentStatus.QUERY_REQUIRED: ProgressPhase.QUERYING_DATABASE,
+            IncidentStatus.COMPLETED: ProgressPhase.COMPLETED,
+            IncidentStatus.FAILED: ProgressPhase.FAILED,
+        }.get(session.status, ProgressPhase.FAILED)
+        emit_progress(
+            progress_sink,
+            ProgressEvent.for_phase(
+                ProgressWorkflow.INCIDENT,
+                phase,
+                task_id=session.id,
+                active=phase not in {ProgressPhase.COMPLETED, ProgressPhase.FAILED},
+            ),
+        )
 
     @staticmethod
     def _to_outcome(session: IncidentSession) -> IncidentOutcome:

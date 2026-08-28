@@ -1043,3 +1043,27 @@ Failure Knowledge 只预留模型值。
 
 桌面“知识库管理”提供刷新、分块预览、多选加入/重建、移除和测试检索。模式徽标会明确显示
 “模拟模式”或当前正式 Voyage 模型 ID；任务完成生成的新 MD 只成为待加入文档。
+
+## 13. 实时进度接口
+
+```python
+class ProgressEvent(BaseModel):
+    task_id: str | None
+    workflow: ProgressWorkflow
+    phase: ProgressPhase
+    label: str
+    detail: str | None
+    active: bool
+    created_at: datetime
+
+ProgressSink = Callable[[ProgressEvent], None]
+```
+
+`AgentApplication` 和 `IncidentApplication` 的 `start()`、`send()`、`resume()`、`cancel()` 以及开发
+流程的 `approve()`、`reject()` 均接受关键字参数 `progress_sink`。调用方可以省略它，保持现有
+CLI/Web/测试兼容。Engine 使用 `emit_progress()` 调用回调；回调抛出的异常只记录警告，不传播到
+任务线程。
+
+`ProgressProjector.from_runtime()` 只接受脱敏后的 `RuntimeActivity`，按工作流、执行模式和已验证
+附件路径投影阶段。它不会复制工具输入，也不会把任意模型文本当作主状态。桌面端通过线程安全
+结果队列接收事件，相同阶段更新详情，不同阶段采用最小可见时间和轻量文本渐变。

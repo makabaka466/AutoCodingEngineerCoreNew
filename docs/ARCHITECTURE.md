@@ -574,3 +574,26 @@ staged/unstaged diff 和未跟踪路径，但不会自动读取未跟踪文件�
 
 该边界也支持测试时注入假 Runtime：`build_application(settings, runtime=...)` 可替换模型
 执行，而保留真实核心与本地存储行为。
+
+## 11. 实时进度投影
+
+`ProgressEvent` 是独立于 `TaskState` 的瞬时交互契约。开发与异常应用门面接受可选
+`ProgressSink`，Engine 在真实主机动作开始时发送稳定阶段；Observable Runtime 的
+`RuntimeActivity` 再由 `ProgressProjector` 投影为阅读代码、分析图片、修改和验证等安全状态。
+
+```text
+Host action / RuntimeActivity
+             ↓
+      ProgressProjector
+             ↓
+        ProgressEvent
+             ↓
+ Desktop queue → 淡出/淡入状态条
+
+TaskState / Event Store  ── 独立持久化，不由 UI 进度反向驱动
+```
+
+进度文案由主机维护的阶段表产生。模型和工具只能贡献经过裁剪的文件名等辅助详情，不能直接
+输出思维链、SQL、命令、密钥或原始工具输入。相同阶段合并，快速切换设置最小可见时间；
+`ProgressSink` 异常被隔离并写日志，不允许中断任务主流程。桌面端只从后台结果队列消费事件，
+所有 Tk 控件更新仍发生在 UI 线程。

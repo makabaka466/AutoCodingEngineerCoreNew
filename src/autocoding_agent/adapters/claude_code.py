@@ -65,7 +65,23 @@ class ClaudeCodeRuntime:
     ) -> RuntimeResult:
         """Run stream-json and emit sanitized lifecycle evidence as it arrives."""
 
-        command = self.build_command(turn, AgentDecision, stream=True)
+        result = self.run_structured_observed(turn, AgentDecision, run_id, event_sink)
+        return RuntimeResult(
+            decision=result.output,
+            runtime_session_id=result.runtime_session_id,
+            usage=result.usage,
+        )
+
+    def run_structured_observed(
+        self,
+        turn: RuntimeTurn,
+        response_model: type[StructuredOutputT],
+        run_id: str,
+        event_sink: RuntimeEventSink,
+    ) -> StructuredRuntimeResult[StructuredOutputT]:
+        """Run any structured contract through stream-json with live activity events."""
+
+        command = self.build_command(turn, response_model, stream=True)
         started_at = time.monotonic()
         logger.info(
             "observed_turn_started session_id=%s run_id=%s mode=%s model=%s resumed=%s",
@@ -181,7 +197,7 @@ class ClaudeCodeRuntime:
                 raise ClaudeCodeError(detail or "Claude Code returned a non-zero exit code.")
             if result_envelope is None:
                 raise ClaudeCodeError("Claude Code stream ended without a result envelope.")
-            result = _runtime_result_from_envelope(result_envelope)
+            result = _structured_result_from_envelope(result_envelope, response_model)
             logger.info(
                 "observed_turn_completed session_id=%s run_id=%s runtime_session_id=%s "
                 "elapsed_ms=%d",
@@ -421,6 +437,18 @@ class ClaudeCodeRuntime:
 
 
 def _runtime_result_from_envelope(envelope: dict[str, Any]) -> RuntimeResult:
+    result = _structured_result_from_envelope(envelope, AgentDecision)
+    return RuntimeResult(
+        decision=result.output,
+        runtime_session_id=result.runtime_session_id,
+        usage=result.usage,
+    )
+
+
+def _structured_result_from_envelope(
+    envelope: dict[str, Any],
+    response_model: type[StructuredOutputT],
+) -> StructuredRuntimeResult[StructuredOutputT]:
     if envelope.get("is_error") is True or envelope.get("subtype") not in {
         None,
         "success",
@@ -434,15 +462,16 @@ def _runtime_result_from_envelope(envelope: dict[str, Any]) -> RuntimeResult:
             "Claude Code completed without the structured result required by the agent contract."
         )
     try:
-        decision = AgentDecision.model_validate(structured)
+        output = response_model.model_validate(structured)
     except ValidationError as exc:
-        raise ClaudeCodeError(f"Claude Code returned an invalid agent decision: {exc}") from exc
+        label = "agent decision" if response_model is AgentDecision else "structured decision"
+        raise ClaudeCodeError(f"Claude Code returned an invalid {label}: {exc}") from exc
     runtime_session_id = envelope.get("session_id")
     if not isinstance(runtime_session_id, str) or not runtime_session_id:
         raise ClaudeCodeError("Claude Code result did not include a resumable session id.")
     usage_data = envelope.get("usage") or {}
-    return RuntimeResult(
-        decision=decision,
+    return StructuredRuntimeResult(
+        output=output,
         runtime_session_id=runtime_session_id,
         usage=AgentUsage(
             input_tokens=int(usage_data.get("input_tokens", 0) or 0),

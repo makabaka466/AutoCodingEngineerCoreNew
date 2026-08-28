@@ -6,6 +6,7 @@ import ctypes
 import os
 import queue
 import threading
+import time
 import tkinter as tk
 import webbrowser
 from collections.abc import Callable
@@ -23,6 +24,11 @@ from autocoding_agent.core.models import (
     ApprovalScope,
     MessageAttachment,
     MessageRole,
+)
+from autocoding_agent.core.progress import (
+    ProgressEvent,
+    ProgressPhase,
+    ProgressWorkflow,
 )
 from autocoding_agent.core.recovery.models import RecoveryAction
 from autocoding_agent.core.state_machine.models import TaskState
@@ -81,6 +87,9 @@ COLORS = {
     "accent_hover": "#1D4ED8",
     "accent_soft": "#EFF6FF",
     "accent_border": "#BFDBFE",
+    "progress_accent": "#667EEA",
+    "progress_accent_soft": "#F2F3FF",
+    "progress_border": "#D9DCFF",
     "user": "#EFF6FF",
     "success": "#15803D",
     "success_soft": "#F0FDF4",
@@ -126,6 +135,16 @@ def _rounded_points(
         x1,
         y1,
     ]
+
+
+def _blend_hex(start: str, end: str, amount: float) -> str:
+    """Blend two RGB colors for lightweight native-Tk fade transitions."""
+
+    ratio = min(1.0, max(0.0, amount))
+    left = tuple(int(start[index : index + 2], 16) for index in (1, 3, 5))
+    right = tuple(int(end[index : index + 2], 16) for index in (1, 3, 5))
+    values = tuple(round(a + (b - a) * ratio) for a, b in zip(left, right, strict=True))
+    return "#" + "".join(f"{value:02X}" for value in values)
 
 
 class GlassPanel(tk.Canvas):
@@ -647,6 +666,11 @@ class DesktopClient:
         self._busy = False
         self._busy_label = ""
         self._busy_tick = 0
+        self._progress_event: ProgressEvent | None = None
+        self._pending_progress_event: ProgressEvent | None = None
+        self._progress_changed_at = 0.0
+        self._progress_animation_token = 0
+        self._progress_pulse_tick = 0
         self._current_status: AgentStatus | IncidentStatus | None = None
         self._current_task_state: TaskState | None = None
         self._approval_can_execute = True
@@ -663,6 +687,8 @@ class DesktopClient:
         self.project_path_var = tk.StringVar()
         self.attachment_status_var = tk.StringVar()
         self.status_var = tk.StringVar(value="就绪")
+        self.activity_var = tk.StringVar(value="等待新任务")
+        self.activity_detail_var = tk.StringVar(value="开发与异常处理共用实时进度")
         self.task_title_var = tk.StringVar(value="新开发任务")
         self.flow_caption_var = tk.StringVar(value="开发流程 · AI 工程工作台")
         self.overview_today_var = tk.StringVar(value="0")
@@ -680,6 +706,7 @@ class DesktopClient:
         self._refresh_flow_presentation()
         self._load_recent_sessions()
         self._render_welcome()
+        self._animate_progress_pulse()
         self.root.after(100, self._drain_results)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -846,7 +873,7 @@ class DesktopClient:
             fill=COLORS["glass"],
             radius=24,
             padding=14,
-            height=98,
+            height=112,
         )
         self.header_panel.grid(row=0, column=0, columnspan=2, sticky="ew")
         header = self.header_panel.content
@@ -911,8 +938,71 @@ class DesktopClient:
             pady=(14, 0),
         )
         transcript_frame = self.transcript_panel.content
-        transcript_frame.grid_rowconfigure(0, weight=1)
+        transcript_frame.grid_rowconfigure(1, weight=1)
         transcript_frame.grid_columnconfigure(0, weight=1)
+
+        self.activity_frame = tk.Frame(
+            transcript_frame,
+            bg=COLORS["progress_accent_soft"],
+            highlightthickness=1,
+            highlightbackground=COLORS["progress_border"],
+        )
+        self.activity_frame.grid(
+            row=0,
+            column=0,
+            columnspan=2,
+            sticky="ew",
+            padx=4,
+            pady=(3, 8),
+        )
+        self.activity_frame.grid_columnconfigure(2, weight=1)
+        tk.Label(
+            self.activity_frame,
+            text="当前进度",
+            font=("Microsoft YaHei UI", 8, "bold"),
+            fg=COLORS["muted"],
+            bg=COLORS["progress_accent_soft"],
+        ).grid(row=0, column=0, sticky="w", padx=(14, 9), pady=9)
+        self.activity_dot = tk.Canvas(
+            self.activity_frame,
+            width=16,
+            height=16,
+            bg=COLORS["progress_accent_soft"],
+            highlightthickness=0,
+            borderwidth=0,
+        )
+        self.activity_dot.grid(row=0, column=1, padx=(0, 7))
+        self.activity_dot_oval = self.activity_dot.create_oval(
+            4,
+            4,
+            12,
+            12,
+            fill=COLORS["progress_accent"],
+            outline="",
+        )
+        activity_copy = tk.Frame(
+            self.activity_frame,
+            bg=COLORS["progress_accent_soft"],
+        )
+        activity_copy.grid(row=0, column=2, sticky="ew", padx=(0, 14), pady=6)
+        self.activity_label = tk.Label(
+            activity_copy,
+            textvariable=self.activity_var,
+            font=("Microsoft YaHei UI", 9, "bold"),
+            fg=COLORS["text"],
+            bg=COLORS["progress_accent_soft"],
+            anchor="w",
+        )
+        self.activity_label.pack(side="left", anchor="w")
+        self.activity_detail_label = tk.Label(
+            activity_copy,
+            textvariable=self.activity_detail_var,
+            font=("Microsoft YaHei UI", 8),
+            fg=COLORS["muted"],
+            bg=COLORS["progress_accent_soft"],
+            anchor="w",
+        )
+        self.activity_detail_label.pack(side="left", anchor="w", padx=(10, 0))
         self.transcript = tk.Text(
             transcript_frame,
             height=1,
@@ -930,11 +1020,11 @@ class DesktopClient:
             font=("Microsoft YaHei UI", 10),
             cursor="arrow",
         )
-        self.transcript.grid(row=0, column=0, sticky="nsew")
+        self.transcript.grid(row=1, column=0, sticky="nsew")
         transcript_scroll = ttk.Scrollbar(
             transcript_frame, orient="vertical", command=self.transcript.yview
         )
-        transcript_scroll.grid(row=0, column=1, sticky="ns")
+        transcript_scroll.grid(row=1, column=1, sticky="ns")
         self.transcript.configure(yscrollcommand=transcript_scroll.set)
         self.transcript.tag_configure(
             "user_name",
@@ -1585,6 +1675,7 @@ class DesktopClient:
         self._flow_session_ids[self.flow] = self.session_id
         self.flow = flow
         self.session_id = self._flow_session_ids[flow]
+        self._reset_progress_display()
         self._hide_approval()
         self._refresh_flow_presentation()
         self._load_recent_sessions(select_current=bool(self.session_id))
@@ -1615,6 +1706,20 @@ class DesktopClient:
             text=self._default_prompt_placeholder_text()
         )
         self._refresh_project_options()
+
+    def _reset_progress_display(self) -> None:
+        self._progress_animation_token += 1
+        self._progress_event = None
+        self._pending_progress_event = None
+        self._progress_changed_at = 0.0
+        self.activity_var.set("等待新任务" if self.session_id is None else "会话已载入")
+        self.activity_detail_var.set(
+            "开发流程已就绪"
+            if self.flow == FlowKind.DEVELOPMENT
+            else "异常处理流程已就绪"
+        )
+        if hasattr(self, "activity_label"):
+            self._set_progress_text_color(COLORS["text"])
 
     def _default_prompt_placeholder_text(self) -> str:
         return (
@@ -1938,6 +2043,7 @@ class DesktopClient:
         self._reload_configured_workspace()
         self._refresh_project_options()
         self._render_welcome()
+        self._reset_progress_display()
         self._sync_controls()
         self.prompt_input.focus_set()
 
@@ -2165,7 +2271,12 @@ class DesktopClient:
             if self.flow == FlowKind.DEVELOPMENT:
 
                 def operation() -> AgentOutcome | IncidentOutcome:
-                    return self.application.start(path, message, project)
+                    return self.application.start(
+                        path,
+                        message,
+                        project,
+                        progress_sink=self._queue_progress,
+                    )
 
             else:
                 database_reference = self._active_incident_database_reference
@@ -2178,6 +2289,7 @@ class DesktopClient:
                         None,
                         project=project,
                         attachments=attachments,
+                        progress_sink=self._queue_progress,
                     )
 
         else:
@@ -2185,7 +2297,11 @@ class DesktopClient:
             if self.flow == FlowKind.DEVELOPMENT:
 
                 def operation() -> AgentOutcome | IncidentOutcome:
-                    return self.application.send(session_id, message)
+                    return self.application.send(
+                        session_id,
+                        message,
+                        progress_sink=self._queue_progress,
+                    )
 
             else:
                 current_application = self._active_application()
@@ -2204,6 +2320,7 @@ class DesktopClient:
                         session_id,
                         message,
                         attachments=attachments,
+                        progress_sink=self._queue_progress,
                     )
 
         self.prompt_input.delete("1.0", "end")
@@ -2274,7 +2391,11 @@ class DesktopClient:
             return
         session_id = self.session_id
         self._run_in_background(
-            lambda: self.application.approve(session_id), "Claude Code 正在执行已批准的操作"
+            lambda: self.application.approve(
+                session_id,
+                progress_sink=self._queue_progress,
+            ),
+            "Claude Code 正在执行已批准的操作",
         )
 
     def _reject(self) -> None:
@@ -2289,7 +2410,11 @@ class DesktopClient:
             return
         session_id = self.session_id
         self._run_in_background(
-            lambda: self.application.reject(session_id, reason),
+            lambda: self.application.reject(
+                session_id,
+                reason,
+                progress_sink=self._queue_progress,
+            ),
             "Claude Code 正在按只读范围继续",
         )
 
@@ -2302,6 +2427,7 @@ class DesktopClient:
             lambda: application.resume(
                 session_id,
                 RecoveryAction.READ_ONLY_INSPECT,
+                progress_sink=self._queue_progress,
             ),
             "Claude Code 正在只读检查恢复现场",
         )
@@ -2312,7 +2438,11 @@ class DesktopClient:
         session_id = self.session_id
         application = self._active_application()
         self._run_in_background(
-            lambda: application.resume(session_id, RecoveryAction.REPLAN),
+            lambda: application.resume(
+                session_id,
+                RecoveryAction.REPLAN,
+                progress_sink=self._queue_progress,
+            ),
             "Claude Code 正在重新调查并制定方案",
         )
 
@@ -2332,7 +2462,10 @@ class DesktopClient:
         session_id = self.session_id
         application = self._active_application()
         self._run_in_background(
-            lambda: application.cancel(session_id),
+            lambda: application.cancel(
+                session_id,
+                progress_sink=self._queue_progress,
+            ),
             "正在取消任务",
         )
 
@@ -2351,10 +2484,17 @@ class DesktopClient:
 
         threading.Thread(target=worker, name="agent-turn", daemon=True).start()
 
+    def _queue_progress(self, event: ProgressEvent) -> None:
+        self._result_queue.put(("progress", event))
+
     def _drain_results(self) -> None:
         try:
             while True:
                 kind, payload = self._result_queue.get_nowait()
+                if kind == "progress":
+                    if isinstance(payload, ProgressEvent):
+                        self._present_progress(payload)
+                    continue
                 self._set_busy(False)
                 if kind == "success":
                     outcome = payload
@@ -2387,6 +2527,19 @@ class DesktopClient:
         self._busy_tick = 0
         self._sync_controls()
         if busy:
+            workflow = (
+                ProgressWorkflow.DEVELOPMENT
+                if self.flow == FlowKind.DEVELOPMENT
+                else ProgressWorkflow.INCIDENT
+            )
+            self._present_progress(
+                ProgressEvent.for_phase(
+                    workflow,
+                    ProgressPhase.PREPARING_CONTEXT,
+                    task_id=self.session_id,
+                ),
+                immediate=True,
+            )
             self._animate_busy_status()
         elif self.session_id:
             try:
@@ -2399,16 +2552,108 @@ class DesktopClient:
     def _animate_busy_status(self) -> None:
         if not self._busy:
             return
-        dots = "." * (self._busy_tick % 4)
         self._busy_tick += 1
-        self.status_var.set(f"{self._busy_label}{dots}")
+        if self._progress_event is None:
+            self.status_var.set(self._busy_label)
         self.status_badge.configure(
             text="处理中",
-            fg=COLORS["accent"],
-            bg=COLORS["accent_soft"],
-            highlightbackground=COLORS["accent_border"],
+            fg=COLORS["progress_accent"],
+            bg=COLORS["progress_accent_soft"],
+            highlightbackground=COLORS["progress_border"],
         )
         self.root.after(450, self._animate_busy_status)
+
+    def _present_progress(
+        self,
+        event: ProgressEvent,
+        *,
+        immediate: bool = False,
+    ) -> None:
+        if self._progress_event is not None and event.phase == self._progress_event.phase:
+            self._progress_event = event
+            self.activity_detail_var.set(event.detail or "")
+            self.status_var.set(event.label)
+            return
+        elapsed = time.monotonic() - self._progress_changed_at
+        if not immediate and self._progress_event is not None and elapsed < 0.65:
+            self._pending_progress_event = event
+            delay_ms = max(1, round((0.65 - elapsed) * 1000))
+            self.root.after(delay_ms, self._flush_pending_progress)
+            return
+        self._transition_progress(event, immediate=immediate)
+
+    def _flush_pending_progress(self) -> None:
+        event = self._pending_progress_event
+        self._pending_progress_event = None
+        if event is not None:
+            self._transition_progress(event)
+
+    def _transition_progress(
+        self,
+        event: ProgressEvent,
+        *,
+        immediate: bool = False,
+    ) -> None:
+        self._pending_progress_event = None
+        self._progress_animation_token += 1
+        token = self._progress_animation_token
+        if immediate or self._progress_event is None:
+            self._apply_progress_copy(event)
+            self._set_progress_text_color(COLORS["text"])
+            return
+
+        fade_target = COLORS["subtle"]
+        for step in range(1, 5):
+            self.root.after(
+                step * 32,
+                lambda current=step: self._progress_fade_frame(
+                    token,
+                    _blend_hex(COLORS["text"], fade_target, current / 4),
+                ),
+            )
+        self.root.after(138, lambda: self._swap_progress_copy(token, event))
+        for step in range(1, 6):
+            self.root.after(
+                138 + step * 34,
+                lambda current=step: self._progress_fade_frame(
+                    token,
+                    _blend_hex(fade_target, COLORS["text"], current / 5),
+                ),
+            )
+
+    def _swap_progress_copy(self, token: int, event: ProgressEvent) -> None:
+        if token == self._progress_animation_token:
+            self._apply_progress_copy(event)
+
+    def _progress_fade_frame(self, token: int, color: str) -> None:
+        if token == self._progress_animation_token:
+            self._set_progress_text_color(color)
+
+    def _apply_progress_copy(self, event: ProgressEvent) -> None:
+        self._progress_event = event
+        self._progress_changed_at = time.monotonic()
+        self.activity_var.set(event.label)
+        self.activity_detail_var.set(event.detail or "")
+        self.status_var.set(event.label)
+
+    def _set_progress_text_color(self, color: str) -> None:
+        self.activity_label.configure(fg=color)
+        self.activity_detail_label.configure(
+            fg=_blend_hex(color, COLORS["muted"], 0.55)
+        )
+
+    def _animate_progress_pulse(self) -> None:
+        if not hasattr(self, "activity_dot"):
+            return
+        if self._busy:
+            pulse = ("#667EEA", "#7F91ED", "#A5B4FC", "#7F91ED")
+            color = pulse[self._progress_pulse_tick % len(pulse)]
+            self._progress_pulse_tick += 1
+        else:
+            color = "#B8C2D1"
+            self._progress_pulse_tick = 0
+        self.activity_dot.itemconfigure(self.activity_dot_oval, fill=color)
+        self.root.after(220, self._animate_progress_pulse)
 
     def _set_status(self, status: AgentStatus | IncidentStatus | None) -> None:
         self._current_status = status

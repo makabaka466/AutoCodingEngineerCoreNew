@@ -21,6 +21,12 @@ from autocoding_agent.core.models import (
     MessageRole,
     ProposedChange,
 )
+from autocoding_agent.core.progress import (
+    ProgressEvent,
+    ProgressPhase,
+    ProgressSink,
+    ProgressWorkflow,
+)
 from autocoding_agent.core.recovery.models import RecoveryAction
 from autocoding_agent.core.state_machine.models import TaskState
 from autocoding_agent.embedding_setup import (
@@ -72,6 +78,8 @@ class FakeApplication:
         workspace: str | Path,
         message: str,
         project: str | None = None,
+        *,
+        progress_sink: ProgressSink | None = None,
     ) -> AgentOutcome:
         self.calls.append(("start", str(workspace), message, project or ""))
         session = AgentSession(
@@ -89,7 +97,13 @@ class FakeApplication:
             message="请补充信息",
         )
 
-    def send(self, session_id: str, message: str) -> AgentOutcome:
+    def send(
+        self,
+        session_id: str,
+        message: str,
+        *,
+        progress_sink: ProgressSink | None = None,
+    ) -> AgentOutcome:
         self.calls.append(("send", session_id, message))
         session = self.sessions[session_id]
         return AgentOutcome(
@@ -99,7 +113,12 @@ class FakeApplication:
             message="继续处理",
         )
 
-    def approve(self, session_id: str) -> AgentOutcome:
+    def approve(
+        self,
+        session_id: str,
+        *,
+        progress_sink: ProgressSink | None = None,
+    ) -> AgentOutcome:
         self.calls.append(("approve", session_id))
         session = self.sessions[session_id]
         return AgentOutcome(
@@ -109,7 +128,13 @@ class FakeApplication:
             message="已完成",
         )
 
-    def reject(self, session_id: str, reason: str = "") -> AgentOutcome:
+    def reject(
+        self,
+        session_id: str,
+        reason: str = "",
+        *,
+        progress_sink: ProgressSink | None = None,
+    ) -> AgentOutcome:
         self.calls.append(("reject", session_id, reason))
         session = self.sessions[session_id]
         return AgentOutcome(
@@ -123,6 +148,8 @@ class FakeApplication:
         self,
         session_id: str,
         action: RecoveryAction = RecoveryAction.READ_ONLY_INSPECT,
+        *,
+        progress_sink: ProgressSink | None = None,
     ) -> AgentOutcome:
         self.calls.append(("resume", session_id, action.value))
         session = self.sessions[session_id]
@@ -133,7 +160,12 @@ class FakeApplication:
             message="已恢复",
         )
 
-    def cancel(self, session_id: str) -> AgentOutcome:
+    def cancel(
+        self,
+        session_id: str,
+        *,
+        progress_sink: ProgressSink | None = None,
+    ) -> AgentOutcome:
         self.calls.append(("cancel", session_id))
         session = self.sessions[session_id]
         return AgentOutcome(
@@ -164,6 +196,7 @@ class FakeIncidentApplication:
         *,
         project: str | None = None,
         attachments: list[MessageAttachment] | None = None,
+        progress_sink: ProgressSink | None = None,
     ) -> IncidentOutcome:
         self.calls.append(("start", str(workspace), problem, page_hint or "", project or ""))
         self.attachments.append(list(attachments or []))
@@ -190,6 +223,8 @@ class FakeIncidentApplication:
         message: str,
         command_id: str | None = None,
         attachments: list[MessageAttachment] | None = None,
+        *,
+        progress_sink: ProgressSink | None = None,
     ) -> IncidentOutcome:
         self.calls.append(("send", session_id, message))
         self.attachments.append(list(attachments or []))
@@ -205,6 +240,8 @@ class FakeIncidentApplication:
         self,
         session_id: str,
         action: RecoveryAction = RecoveryAction.READ_ONLY_INSPECT,
+        *,
+        progress_sink: ProgressSink | None = None,
     ) -> IncidentOutcome:
         self.calls.append(("resume", session_id, action.value))
         session = self.sessions[session_id]
@@ -217,7 +254,12 @@ class FakeIncidentApplication:
             question="请补充记录编号",
         )
 
-    def cancel(self, session_id: str) -> IncidentOutcome:
+    def cancel(
+        self,
+        session_id: str,
+        *,
+        progress_sink: ProgressSink | None = None,
+    ) -> IncidentOutcome:
         self.calls.append(("cancel", session_id))
         session = self.sessions[session_id]
         return IncidentOutcome(
@@ -733,6 +775,29 @@ def test_light_theme_and_configured_workspace_keep_composer_compact(
     assert client.send_button.cget("foreground") == "#FFFFFF"
     assert client.transcript.tag_cget("user_message", "background") == COLORS["accent_soft"]
     assert client.status_badge.cget("highlightthickness") == 1
+    assert COLORS["progress_accent"] == "#667EEA"
+    assert client.activity_frame.cget("background") == COLORS["progress_accent_soft"]
+
+
+def test_progress_queue_keeps_worker_busy_and_uses_curated_copy(root: tk.Toplevel) -> None:
+    client = DesktopClient(root, FakeApplication())  # type: ignore[arg-type]
+    client._set_busy(True, "处理中")
+    client._result_queue.put(
+        (
+            "progress",
+            ProgressEvent.for_phase(
+                ProgressWorkflow.DEVELOPMENT,
+                ProgressPhase.PREPARING_CONTEXT,
+                detail="已读取任务配置",
+            ),
+        )
+    )
+
+    client._drain_results()
+
+    assert client._busy is True
+    assert client.activity_var.get() == "正在准备任务上下文"
+    assert client.activity_detail_var.get() == "已读取任务配置"
 
 
 def test_overview_uses_real_sessions_and_hides_at_compact_width(
