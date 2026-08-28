@@ -86,6 +86,8 @@ class Settings(BaseSettings):
     hermes_skills_enabled: bool = True
     hermes_command: str = Field(default_factory=_default_hermes_command)
     hermes_home: Path = Field(default_factory=_default_hermes_home)
+    hermes_use_ace_provider: bool = True
+    hermes_model: str = "deepseek-v4-flash"
     hermes_skill_allowed_categories: str = "software-development,github,research"
     hermes_skill_timeout_seconds: int = Field(default=120, ge=10, le=600)
     hermes_skill_max_output_chars: int = Field(default=12000, ge=1000, le=16000)

@@ -1,6 +1,6 @@
 # AutoCodingEngineerCoreNew 项目开发与工程经验
 
-> 文档基线：2026-08-28，项目版本 `0.7.0`。本文以当前代码为准，并明确区分“已实现”、
+> 文档基线：2026-08-28，项目版本 `0.7.1`。本文以当前代码为准，并明确区分“已实现”、
 > “当前限制”和“后续规划”。当前 Agent 已具备状态机、追加事件、运行记录、决策审计、
 > 任务产物、保守恢复，以及按会话持续沉淀开发/异常能力知识的 Runtime 内核。
 
@@ -1234,7 +1234,8 @@ FTS 精确词检索 ─┐
 - `v0.6.2`：异常流程页面名称前置、截图标题识别、项目映射分层和有界候选验证；
 - `v0.6.3`：对话先于图片、标题/路径联合入口、候选与截图冲突澄清；
 - `v0.6.4`：双流程实时进度投影与持久状态分层；
-- `v0.7.0（当前）`：Hermes Skill 只读工程经验端口、双流程回灌、事件/Artifact 和失败降级；
+- `v0.7.0`：Hermes Skill 只读工程经验端口、双流程回灌、事件/Artifact 和失败降级；
+- `v0.7.1（当前）`：ACE 到 Hermes 的 DeepSeek provider 安全桥接、独立 Flash 模型和真实联调；
 - 下一检索迭代：外部 VectorStore、健康检查、批量迁移和真实检索评测集；
 - 治理迭代：统一 Engineering Knowledge/Candidate 模型，把 Capability、异常与失败日志转为候选；
 - 质量迭代：脱敏、去重、冲突检测、陈旧标记、人工审核与基于证据的晋级；
@@ -2391,8 +2392,71 @@ Skill；Python 宿主不使用关键词规则决定 Skill，但强制分类白�
 
 ### 31.6 当前边界与后续方向
 
-本版已从本机 `HERMES_HOME` 识别允许分类 Skill，但 Hermes 模型尚未配置，因此发布验证只覆盖目录
-发现、命令构造、脱敏、超时、Fake Service 双流程闭环和失败降级，不执行真实模型调用。配置 Hermes
-模型后应使用一个无敏感数据的固定问题完成 live smoke test，并检查 Event、Artifact 和 Claude 二次
-核验结果。后续可增加 UI 配置与健康检查、按 Skill 质量评测和人工反馈，但仍不应默认共享两套
-Memory 或授予 Hermes 项目写权限。
+`v0.7.0` 发布时已从本机 `HERMES_HOME` 识别允许分类 Skill，但尚未配置 Hermes 模型，因此当时只
+验证了目录发现、命令构造、脱敏、超时、Fake Service 双流程闭环和失败降级。该缺口已由
+`v0.7.1` 的 ACE provider 桥接和无敏感数据 live smoke test 闭环。后续仍可增加 UI 健康检查、
+按 Skill 质量评测和人工反馈，但不应默认共享两套 Memory 或授予 Hermes 项目写权限。
+
+## 32. ACE 到 Hermes 的 DeepSeek 模型桥接（v0.7.1）
+
+### 32.1 背景与业务目标
+
+`v0.7.0` 已能安全发现和咨询 Hermes Skill，但要求用户另外维护 Hermes provider、模型和 API Key。
+这会产生重复配置、密钥轮换不同步和“Claude Code 可用但 Hermes 不可用”的运维分叉。本次将 ACE
+确定为生成模型配置的唯一入口：Hermes 沿用 ACE 已保存的 DeepSeek 地址与密钥，同时使用成本和
+响应速度更适合短咨询的独立模型 `deepseek-v4-flash`。用户只配置一次，两个 Runtime 仍保留不同
+模型职责。
+
+### 32.2 设计思路与安全边界
+
+模型复用不等于把配置文件互相复制。非敏感地址可以读取，密钥则只在 Hermes 调用发生时从 Windows
+用户环境读取，并放入受控子进程环境；命令行参数、Prompt、日志、Event、Artifact 和 Hermes
+`config.yaml` 都不得出现密钥。Hermes 仍只收到抽象工程问题，不会因为共享 provider 而获得项目、
+数据库或状态机权限。
+
+为防止配置错误造成凭据外发，桥接只接受 HTTPS、精确主机 `api.deepseek.com` 和精确
+`/anthropic` 路径。调用时显式使用 `--provider custom`，通过 `CUSTOM_BASE_URL` 指定端点，并把
+ACE 的 `ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_API_KEY` 临时映射成 Hermes 按目标主机识别的
+`DEEPSEEK_API_KEY`。子进程继承环境中的同类模型凭据会先被移除，避免其他 provider Key 参与路由。
+
+### 32.3 核心实现
+
+- `Settings.hermes_use_ace_provider=true` 控制默认桥接，可由高级部署显式关闭；
+- `Settings.hermes_model=deepseek-v4-flash` 把 Hermes 模型与 Claude 主模型分离；
+- `build_configured_hermes_service()` 使用 `UserEnvironmentStore` 读取当前进程或 Windows 用户配置，
+  不持久化第二份 Secret；
+- `HermesCliSkillService` 在实际 `invoke()` 时才取 Key，并追加
+  `--model deepseek-v4-flash --provider custom`；
+- `_validate_inherited_route()` 对协议、主机、路径和模型名做确定性边界校验；
+- Windows 子进程显式使用 `PYTHONUTF8=1`、`PYTHONIOENCODING=utf-8` 和父进程 UTF-8 解码，避免
+  Hermes 的 Unicode 输出被系统 GBK 破坏；
+- 缺失 Key、错误地址和外部调用失败继续转换为既有 failed Observation，主 Agent 自动降级。
+
+### 32.4 实现问题、定位证据与解决方案
+
+第一次 live smoke test 返回 HTTP 400。Hermes 日志证明 endpoint、provider 和协议已经正确，服务端
+明确列出合法模型为 `deepseek-v4-pro`、`deepseek-v4-flash` 和
+`deepseek-v4-flash-vision-exp`；用户输入的 `deeps-v4-flash` 少了 `eek`。因此按真实 API 证据纠正
+为 `deepseek-v4-flash`，而不是为错误别名增加代码兼容。
+
+第二次调用模型成功，但 Windows `subprocess` 默认使用 GBK 读取 Hermes 输出，UTF-8 字节触发
+`UnicodeDecodeError`，有效输出被表现为 `None`。根因位于进程边界而非模型响应。修复是在父进程
+明确 `encoding=utf-8, errors=replace`，并让 Hermes Python 子进程强制 UTF-8 标准流。定向复测取得
+非空工程建议，证明路由、认证、协议、模型和输出读取形成完整闭环。
+
+### 32.5 技术选型与决策记录
+
+- ADR-089：ACE 是 DeepSeek 地址和 API Key 的唯一持久配置源，Hermes 不保存第二份密钥；
+- ADR-090：Hermes 默认使用独立的 `deepseek-v4-flash`，不机械沿用 Claude 主模型名；
+- ADR-091：桥接使用 Hermes 原生 `custom + CUSTOM_BASE_URL + DEEPSEEK_API_KEY` 契约，不修改
+  Hermes 源码，也不覆盖用户 `config.yaml`；
+- ADR-092：凭据发送前使用精确 HTTPS 主机/路径校验，当前不自动信任任意 Anthropic 兼容代理；
+- ADR-093：模型名以实际服务端响应为准，不为拼写错误建立隐式别名；
+- ADR-094：跨 Windows Python CLI 的文本管道显式固定 UTF-8，不能依赖本机活动代码页。
+
+### 32.6 当前边界与后续方向
+
+当前桥接有意只支持 DeepSeek 官方 Anthropic 兼容地址。将来如果需要企业代理或第二家 provider，
+应在配置页增加可见的 Hermes 路由选择和目标主机确认，而不是放宽现有凭据校验。Hermes Skill 的
+建议仍是 `host_verified=false` 候选证据；模型共享不改变每轮一次、只读 Web toolset、无代码/SQL
+权限和主流程失败降级等边界。

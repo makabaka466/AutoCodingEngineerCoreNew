@@ -10,6 +10,7 @@ import subprocess
 import time
 from collections.abc import Callable, Collection
 from pathlib import Path
+from urllib.parse import urlparse
 
 from autocoding_agent.adapters.process_options import hidden_window_options
 from autocoding_agent.config import Settings
@@ -26,6 +27,14 @@ logger = logging.getLogger("autocoding_agent.hermes")
 _SKILL_NAME = re.compile(r"^[a-z0-9][a-z0-9._-]{0,79}$")
 _FRONTMATTER_LINE = re.compile(r"^(name|description)\s*:\s*(.+?)\s*$")
 Runner = Callable[..., subprocess.CompletedProcess[str]]
+CredentialReader = Callable[[], str | None]
+
+_MODEL_CREDENTIAL_ENV_NAMES = (
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_TOKEN",
+    "DEEPSEEK_API_KEY",
+)
 
 
 class HermesSkillError(RuntimeError):
@@ -49,6 +58,9 @@ class HermesCliSkillService(HermesSkillService):
         max_output_chars: int = 12000,
         max_turns: int = 4,
         runner: Runner = subprocess.run,
+        inherited_endpoint: str | None = None,
+        inherited_model: str | None = None,
+        credential_reader: CredentialReader | None = None,
     ) -> None:
         if timeout_seconds < 10 or timeout_seconds > 600:
             raise ValueError("Hermes timeout must be between 10 and 600 seconds.")
@@ -70,6 +82,13 @@ class HermesCliSkillService(HermesSkillService):
         self.max_output_chars = max_output_chars
         self.max_turns = max_turns
         self._runner = runner
+        self.inherited_endpoint, self.inherited_model = _validate_inherited_route(
+            inherited_endpoint,
+            inherited_model,
+        )
+        self._credential_reader = credential_reader
+        if self.inherited_endpoint and self._credential_reader is None:
+            raise ValueError("An ACE credential reader is required for the inherited route.")
         self._skills = self._discover_skills()
         if not self._skills:
             raise HermesSkillUnavailable("No allowed Hermes skills were discovered.")
@@ -116,6 +135,31 @@ class HermesCliSkillService(HermesSkillService):
         ]
         environment = os.environ.copy()
         environment["HERMES_HOME"] = str(self.home)
+        # Hermes is a Python CLI; force a stable pipe encoding instead of the Windows code page.
+        environment["PYTHONUTF8"] = "1"
+        environment["PYTHONIOENCODING"] = "utf-8"
+        if self.inherited_endpoint:
+            credential_reader = self._credential_reader
+            if credential_reader is None:
+                raise HermesSkillUnavailable("The ACE credential reader is unavailable.")
+            api_key = (credential_reader() or "").strip()
+            if not api_key:
+                raise HermesSkillUnavailable(
+                    "The ACE model API key is unavailable for the Hermes subprocess."
+                )
+            # Do not let unrelated provider credentials compete with the explicit route.
+            for name in _MODEL_CREDENTIAL_ENV_NAMES:
+                environment.pop(name, None)
+            environment["CUSTOM_BASE_URL"] = self.inherited_endpoint
+            environment["DEEPSEEK_API_KEY"] = api_key
+            args.extend(
+                [
+                    "--model",
+                    self.inherited_model,
+                    "--provider",
+                    "custom",
+                ]
+            )
         started = time.perf_counter()
         try:
             completed = self._runner(
@@ -125,6 +169,8 @@ class HermesCliSkillService(HermesSkillService):
                 env=environment,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=self.timeout_seconds,
                 check=False,
                 **hidden_window_options(),
@@ -204,6 +250,24 @@ def build_configured_hermes_service(settings: Settings) -> HermesSkillService | 
         return None
     categories = [item for item in settings.hermes_skill_allowed_categories.split(",")]
     try:
+        inherited_endpoint: str | None = None
+        inherited_model: str | None = None
+        credential_reader: CredentialReader | None = None
+        if settings.hermes_use_ace_provider:
+            # Keep ACE as the only persisted source. The reader fetches the current key only
+            # when Hermes starts, so it is never copied into config.yaml or retained in args.
+            from autocoding_agent.model_setup import DEFAULT_ENDPOINT, UserEnvironmentStore
+
+            environment = UserEnvironmentStore()
+            inherited_endpoint = environment.get("ANTHROPIC_BASE_URL") or DEFAULT_ENDPOINT
+            inherited_model = settings.hermes_model
+
+            def read_ace_credential() -> str | None:
+                return environment.get("ANTHROPIC_AUTH_TOKEN") or environment.get(
+                    "ANTHROPIC_API_KEY"
+                )
+
+            credential_reader = read_ace_credential
         return HermesCliSkillService(
             command=settings.hermes_command,
             home=settings.hermes_home,
@@ -211,6 +275,9 @@ def build_configured_hermes_service(settings: Settings) -> HermesSkillService | 
             timeout_seconds=settings.hermes_skill_timeout_seconds,
             max_output_chars=settings.hermes_skill_max_output_chars,
             max_turns=settings.hermes_skill_max_turns,
+            inherited_endpoint=inherited_endpoint,
+            inherited_model=inherited_model,
+            credential_reader=credential_reader,
         )
     except (HermesSkillError, ValueError) as exc:
         logger.info("hermes_skill_provider_unavailable reason=%s", exc)
@@ -241,3 +308,27 @@ def _read_frontmatter(path: Path) -> dict[str, str]:
             value = match.group(2).strip().strip("'\"")
             metadata[match.group(1)] = value
     return metadata
+
+
+def _validate_inherited_route(
+    endpoint: str | None,
+    model: str | None,
+) -> tuple[str | None, str | None]:
+    endpoint = (endpoint or "").strip().rstrip("/")
+    model = (model or "").strip()
+    if not endpoint and not model:
+        return None, None
+    if not endpoint or not model:
+        raise ValueError("The inherited Hermes endpoint and model must be configured together.")
+    parsed = urlparse(endpoint)
+    if (
+        parsed.scheme != "https"
+        or (parsed.hostname or "").casefold() != "api.deepseek.com"
+        or parsed.path.rstrip("/").casefold() != "/anthropic"
+    ):
+        raise ValueError(
+            "Hermes provider inheritance currently accepts only the DeepSeek /anthropic endpoint."
+        )
+    if len(model) > 200 or any(character.isspace() for character in model):
+        raise ValueError("The inherited Hermes model name is invalid.")
+    return endpoint, model

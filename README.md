@@ -74,7 +74,7 @@ ACE 会从 `HERMES_HOME/skills/<category>/<skill>/SKILL.md` 动态发现允许�
 中立工作目录和隐藏控制台执行咨询。整段用户对话、源码、数据库结果和工作区不会被自动转发。
 
 Hermes 输出会脱敏、截断并标记为“不可信候选工程经验”，再交回当前 Claude 会话结合代码和数据
-证据核验。每个命令默认最多咨询一次；Hermes 未安装、模型未配置、超时或返回错误时会留下事件与
+证据核验。每个命令默认最多咨询一次；Hermes 未安装、ACE 模型配置缺失、超时或返回错误时会留下事件与
 Artifact，并自动继续原有 Claude 流程。首版不共享 Hermes Memory，不让 Hermes 修改项目、执行
 SQL、改变 TaskState 或绕过审批。
 
@@ -153,9 +153,13 @@ powershell -ExecutionPolicy Bypass -File .\scripts\configure_deepseek.ps1
 
 脚本同样只把 API Key 写入当前 Windows 用户环境变量。
 
-Hermes 第一版通常无需修改项目配置：系统依次读取 `AUTO_CODING_HERMES_COMMAND`、PATH 和
+Hermes 通常无需再次配置模型：系统依次读取 `AUTO_CODING_HERMES_COMMAND`、PATH 和
 `HERMES_HOME/bin/hermes.exe`，Windows 下也会读取刚保存但尚未进入当前进程的用户级
-`HERMES_HOME`。高级部署可用 `AUTO_CODING_HERMES_SKILLS_ENABLED=false` 完全关闭。
+`HERMES_HOME`。默认由 ACE 提供已保存的 DeepSeek `/anthropic` 地址和 API Key，Hermes 子进程
+固定使用 `deepseek-v4-flash`；密钥只进入该子进程环境，不写入 Hermes `config.yaml`、命令参数、
+Prompt、日志或 Artifact。高级部署可用 `AUTO_CODING_HERMES_USE_ACE_PROVIDER=false` 恢复 Hermes
+自有 provider 配置，或用 `AUTO_CODING_HERMES_MODEL` 更换其独立模型；
+`AUTO_CODING_HERMES_SKILLS_ENABLED=false` 可完全关闭。
 
 ## CLI
 

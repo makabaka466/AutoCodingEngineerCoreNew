@@ -1,6 +1,6 @@
 # AutoCoding Engineer 架构说明
 
-本文描述当前 `0.7.0` 代码已经实现的架构。数据字段、公共方法和命令行参数见
+本文描述当前 `0.7.1` 代码已经实现的架构。数据字段、公共方法和命令行参数见
 [接口与数据契约](INTERFACES.md)。
 
 ## 1. 项目目标
@@ -616,6 +616,7 @@ Claude structured request
 HermesConsultationCoordinator
           ↓ allowlist / timeout / redaction / one-call budget
 Hermes CLI --ignore-rules --toolsets web --skills <exact-name> --max-turns 4
+           --model deepseek-v4-flash --provider custom
           ↓ sanitized, bounded output
 untrusted candidate guidance
           ↓
@@ -623,11 +624,15 @@ same Claude session validates against code / authorized data / user intent
 ```
 
 CLI 子进程的 cwd 固定为 `HERMES_HOME`，不挂载目标工作区；使用 `--ignore-rules` 跳过自动注入的
-AGENTS/Memory/规则，只开放 `web` toolset，并在 Windows 隐藏控制台。保留用户 Hermes 模型与
-provider 配置，避免 `--safe-mode` 连同 `config.yaml` 一起屏蔽。宿主不会自动发送用户历史、源码或数据库行，只发送模型生成且
+AGENTS/Memory/规则，只开放 `web` toolset，并在 Windows 隐藏控制台。默认桥接 ACE 已保存的
+DeepSeek `/anthropic` 地址和 API Key，同时用 `--model deepseek-v4-flash --provider custom`
+覆盖 Hermes 的推理路由。密钥仅在启动前读取并写入该子进程的 `DEEPSEEK_API_KEY`，不会复制到
+Hermes `config.yaml`、参数、Prompt、事件或 Artifact；非 DeepSeek HTTPS `/anthropic` 地址会被
+宿主拒绝，防止把凭据转发到非预期主机。关闭桥接后仍可保留 Hermes 自有模型/provider 配置。
+宿主不会自动发送用户历史、源码或数据库行，只发送模型生成且
 经过凭据脱敏的抽象问题。输出最长 16,000 字符，并通过 `hermes_skill_requested/completed/failed`
 事件和 `hermes_skill_result` Artifact 留痕；Artifact 的 `host_verified=false` 明确表示外部建议不是
-工程事实。服务不存在、模型未配置、超时或非零返回码都不会终止主流程，Claude 会收到脱敏失败
+工程事实。服务不存在、ACE 凭据缺失、超时或非零返回码都不会终止主流程，Claude 会收到脱敏失败
 说明并继续处理。
 
 首版不开放 Hermes 文件工具、Shell、业务数据库、Memory 同步、Skill 写入或状态控制。这个边界

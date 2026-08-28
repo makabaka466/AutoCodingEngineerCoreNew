@@ -2,9 +2,10 @@
 
 - 任务编号：`ACE-HERMES-014`
 - 当前状态：`done`
-- 下一步责任方：用户配置 Hermes 模型后执行一次无敏感数据的 live smoke test
+- 下一步责任方：用户在开发或异常任务中观察 Hermes Skill 建议质量；后续按真实样本决定是否增加健康检查 UI
 - 创建日期：2026-08-28
-- 用户授权：完成 ACE 直接使用 Hermes Skill 的第一版；每次迭代提交、标记版本并推送 GitHub。
+- 用户授权：完成 ACE 直接使用 Hermes Skill 的第一版；后续让 Hermes 沿用 ACE 的 DeepSeek
+  地址与 API Key，Hermes 固定使用 `deepseek-v4-flash`；每次迭代提交、标记版本并推送 GitHub。
 - 修改前回退点：tag `v0.6.4`，提交 `97997cd599755d53095a3a1ddcbb1c801b65760c`。
 
 ## 目标
@@ -45,9 +46,16 @@
 ## 当前发现
 
 - Hermes CLI 位于 `D:\learning\tool\hermes-home\bin\hermes.exe`，数据目录为 `D:\learning\tool\hermes-home`；
-- 当前 Hermes 模型尚未配置，因此本次只完成可测试的接口与安全降级，真实模型联调作为后续验证；
+- `v0.7.0` 发布时 Hermes 模型尚未配置，因此当时只完成可测试的接口与安全降级；
 - Hermes 0.20.6 支持 `chat --query-file - --skills <name> --ignore-rules --toolsets web --quiet --source tool`；`--safe-mode` 会额外忽略用户模型/provider 配置，因此不适合本适配器；
 - Skill 当前按分类嵌套存储，首版采用动态发现而非硬编码名称。
+- Hermes 0.20.6 可通过 `--provider custom`、`CUSTOM_BASE_URL` 和按目标主机派生的
+  `DEEPSEEK_API_KEY` 使用 DeepSeek `/anthropic` 端点；模型可由 `--model` 显式覆盖，因此无需
+  把密钥复制到 Hermes 配置文件。
+- 2026-08-28 用户决定由 ACE 作为唯一配置源：地址和密钥沿用 ACE，Hermes 模型使用
+  `deepseek-v4-flash`。用户最初写作 `deeps-v4-flash`，真实 API 返回 HTTP 400 并明确列出正式
+  名称为 `deepseek-v4-flash`，因此按服务端证据纠正。密钥只能进入受控子进程环境，不得进入
+  命令参数、提示词、日志或 Artifact。
 
 ## 验证记录
 
@@ -59,13 +67,18 @@
 | 2026-08-28 | 自动化测试 | `174 passed` | 适配器、开发、异常、失败降级及既有回归全部通过 |
 | 2026-08-28 | 静态与构建检查 | Ruff、`compileall`、`git diff --check` 全部通过 | 发布门禁通过 |
 | 2026-08-28 | Hermes live 模型调用 | 未执行：Hermes 模型尚未配置 | 不影响主流程；配置模型后仍需补一次 live smoke test |
+| 2026-08-28 | 首次 provider 桥接 live smoke | DeepSeek 返回 HTTP 400，明确指出 `deeps-v4-flash` 不是合法名称 | 桥接地址、认证和 Anthropic 协议已生效；按服务端证据改为 `deepseek-v4-flash` |
+| 2026-08-28 | Windows 输出复测 | 模型调用成功，但默认 GBK 读取 UTF-8 输出触发 `UnicodeDecodeError` | 父子进程统一显式 UTF-8，不依赖活动代码页 |
+| 2026-08-28 | 最终 live smoke | `deepseek-v4-flash` 在约 11.5 秒内返回 1,351 字符的非空工程建议 | 地址、密钥桥接、模型、协议、Skill 和输出读取已闭环 |
+| 2026-08-28 | 完整自动化测试 | `180 passed` | 新增桥接、密钥隔离、错误端点拒绝和既有流程回归均通过 |
+| 2026-08-28 | 发布门禁 | Ruff、`compileall`、`git diff --check` 通过；当前配置的 API Key 未出现在 diff | 代码质量与敏感信息检查通过 |
 
 ## 交付与发布
 
 - Hermes 端口与 CLI 适配器；
 - 双流程接入、事件/Artifact、进度映射和降级处理；
 - 自动化测试与项目文档；
-- 目标分支：`origin/main`；发布版本：`v0.7.0`；
+- 首版发布版本：`v0.7.0`；本次桥接发布版本：`v0.7.1`；目标分支：`origin/main`；
 - 回退方式：切换到 `v0.6.4` 或提交 `97997cd599755d53095a3a1ddcbb1c801b65760c`；
-- 剩余风险：尚未验证用户未来选择的 Hermes provider/model、网络和真实 Skill 响应质量；外部建议
-  继续按 `host_verified=false` 处理，不能直接作为修改或诊断事实。
+- 剩余风险：只验证了 DeepSeek 官方 `/anthropic` 与固定无敏感问题，尚未建立不同 Skill 的质量
+  评测集；外部建议继续按 `host_verified=false` 处理，不能直接作为修改或诊断事实。

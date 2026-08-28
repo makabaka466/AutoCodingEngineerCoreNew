@@ -1,6 +1,6 @@
 # AutoCoding Engineer 接口与数据契约
 
-本文记录当前 `0.7.0` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
+本文记录当前 `0.7.1` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
 Runtime、持久化和状态契约。
 设计动机和运行流程见[架构说明](ARCHITECTURE.md)。
 
@@ -814,6 +814,8 @@ Web 模式。
 | `AUTO_CODING_HERMES_SKILLS_ENABLED` | `true` | 是否自动发现并启用可选 Hermes Skill 服务 |
 | `AUTO_CODING_HERMES_COMMAND` | 自动发现 | Hermes CLI 可执行路径；依次检查显式配置、PATH 与 `HERMES_HOME/bin` |
 | `AUTO_CODING_HERMES_HOME` | `HERMES_HOME` 或 `~/.hermes` | Hermes 数据和 Skill 根目录 |
+| `AUTO_CODING_HERMES_USE_ACE_PROVIDER` | `true` | 是否沿用 ACE 的 DeepSeek 地址/API Key；关闭后使用 Hermes 自有 provider 配置 |
+| `AUTO_CODING_HERMES_MODEL` | `deepseek-v4-flash` | 启用 ACE provider 桥接时传给 Hermes 的独立模型名 |
 | `AUTO_CODING_HERMES_SKILL_ALLOWED_CATEGORIES` | `software-development,github,research` | 允许暴露给模型的 Skill 分类，逗号分隔 |
 | `AUTO_CODING_HERMES_SKILL_TIMEOUT_SECONDS` | `120` | 单次咨询超时，范围 10–600 秒 |
 | `AUTO_CODING_HERMES_SKILL_MAX_OUTPUT_CHARS` | `12000` | 脱敏后回灌文本上限，范围 1000–16000 字符 |
@@ -822,7 +824,9 @@ Web 模式。
 
 `ANTHROPIC_BASE_URL`、`ANTHROPIC_AUTH_TOKEN` 等模型服务环境变量不由 `Settings` 解析，
 但会由 Claude Code 子进程继承。桌面配置页把它们保存为 Windows 当前用户环境变量；API Key
-不会进入 `ModelSetupState`，也不会回填到界面。不要把真实密钥提交到项目 `.env` 或能力文档。
+不会进入 `ModelSetupState`，也不会回填到界面。Hermes 桥接只在调用时从同一用户配置读取地址和
+密钥，将密钥映射到子进程专用 `DEEPSEEK_API_KEY`，不进行第二次持久化。不要把真实密钥提交到
+项目 `.env` 或能力文档。
 
 ## 11. 异常诊断接口
 
@@ -1106,10 +1110,13 @@ Markdown。调用参数固定包含：
 ```text
 hermes chat --query-file - --toolsets web --skills <exact-name>
             --max-turns 4 --quiet --ignore-rules --source tool
+            --model deepseek-v4-flash --provider custom
 ```
 
 问题通过 stdin 传入，cwd 固定为 `HERMES_HOME`，超时和输出长度由 Settings 限制；Windows 使用
-隐藏子进程参数。未知 Skill 在启动进程前拒绝。
+隐藏子进程参数，并显式使用 UTF-8 管道编码。启用默认桥接时，`CUSTOM_BASE_URL` 指向经 HTTPS
+主机校验的 DeepSeek `/anthropic`，ACE Key 仅放入子进程 `DEEPSEEK_API_KEY`；未知 Skill、错误
+端点或缺失密钥都在模型调用前拒绝。
 
 ### 14.3 结果、事件、Artifact 与降级
 
