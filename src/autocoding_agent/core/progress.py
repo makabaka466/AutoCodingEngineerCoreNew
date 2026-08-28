@@ -27,6 +27,7 @@ class ProgressWorkflow(StrEnum):
 class ProgressPhase(StrEnum):
     PREPARING_CONTEXT = "preparing_context"
     RETRIEVING_KNOWLEDGE = "retrieving_knowledge"
+    CONSULTING_ENGINEERING_EXPERIENCE = "consulting_engineering_experience"
     ANALYZING_REQUEST = "analyzing_request"
     ANALYZING_IMAGE = "analyzing_image"
     LOCATING_PAGE = "locating_page"
@@ -48,6 +49,7 @@ class ProgressPhase(StrEnum):
 PROGRESS_LABELS: dict[ProgressPhase, str] = {
     ProgressPhase.PREPARING_CONTEXT: "正在准备任务上下文",
     ProgressPhase.RETRIEVING_KNOWLEDGE: "正在检索项目知识",
+    ProgressPhase.CONSULTING_ENGINEERING_EXPERIENCE: "正在咨询工程经验",
     ProgressPhase.ANALYZING_REQUEST: "正在分析任务需求",
     ProgressPhase.ANALYZING_IMAGE: "正在分析异常截图",
     ProgressPhase.LOCATING_PAGE: "正在定位异常页面",

@@ -1,6 +1,6 @@
 # AutoCoding Engineer 接口与数据契约
 
-本文记录当前 `0.6.1` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
+本文记录当前 `0.7.0` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
 Runtime、持久化和状态契约。
 设计动机和运行流程见[架构说明](ARCHITECTURE.md)。
 
@@ -811,6 +811,14 @@ Web 模式。
 | `AUTO_CODING_DATABASE_MAX_QUERY_ROUNDS` | `2` | 每个开发或异常会话最多自动查询轮次，范围 1–5 |
 | `AUTO_CODING_AGENT_MAX_REPLAN_ROUNDS` | `2` | 验证失败后的最大重规划轮数，范围 1–10 |
 | `AUTO_CODING_RUNTIME_LEASE_SECONDS` | `30` | 启动恢复扫描使用的本地运行租约秒数，范围 5–3600 |
+| `AUTO_CODING_HERMES_SKILLS_ENABLED` | `true` | 是否自动发现并启用可选 Hermes Skill 服务 |
+| `AUTO_CODING_HERMES_COMMAND` | 自动发现 | Hermes CLI 可执行路径；依次检查显式配置、PATH 与 `HERMES_HOME/bin` |
+| `AUTO_CODING_HERMES_HOME` | `HERMES_HOME` 或 `~/.hermes` | Hermes 数据和 Skill 根目录 |
+| `AUTO_CODING_HERMES_SKILL_ALLOWED_CATEGORIES` | `software-development,github,research` | 允许暴露给模型的 Skill 分类，逗号分隔 |
+| `AUTO_CODING_HERMES_SKILL_TIMEOUT_SECONDS` | `120` | 单次咨询超时，范围 10–600 秒 |
+| `AUTO_CODING_HERMES_SKILL_MAX_OUTPUT_CHARS` | `12000` | 脱敏后回灌文本上限，范围 1000–16000 字符 |
+| `AUTO_CODING_HERMES_SKILL_MAX_TURNS` | `4` | Hermes 单次咨询最多工具循环，范围 1–12 |
+| `AUTO_CODING_HERMES_SKILL_MAX_ROUNDS` | `1` | 单个用户命令最多咨询次数，当前范围 1–2 |
 
 `ANTHROPIC_BASE_URL`、`ANTHROPIC_AUTH_TOKEN` 等模型服务环境变量不由 `Settings` 解析，
 但会由 Claude Code 子进程继承。桌面配置页把它们保存为 Windows 当前用户环境变量；API Key
@@ -1067,3 +1075,52 @@ CLI/Web/测试兼容。Engine 使用 `emit_progress()` 调用回调；回调抛�
 `ProgressProjector.from_runtime()` 只接受脱敏后的 `RuntimeActivity`，按工作流、执行模式和已验证
 附件路径投影阶段。它不会复制工具输入，也不会把任意模型文本当作主状态。桌面端通过线程安全
 结果队列接收事件，相同阶段更新详情，不同阶段采用最小可见时间和轻量文本渐变。
+
+## 14. Hermes Skill 接口
+
+### 14.1 端口与结构化模型请求
+
+```python
+class HermesSkillService(Protocol):
+    def available_skills(self) -> list[HermesSkillSummary]: ...
+    def invoke(self, request: HermesSkillRequest) -> HermesSkillResult: ...
+```
+
+`AgentDecision` 与 `IncidentDecision` 增加内部状态 `hermes_skill_required` 和可空字段
+`hermes_skill`。只有该状态必须提供 `HermesSkillRequest(skill, question, reason)`，其他状态携带该
+字段会被 Pydantic 拒绝。Engine 只在 inspect 阶段接受此状态；它不会映射为新的 `TaskState`，而是
+在当前 `inspecting` 状态内完成一次外部咨询并继续同一 Claude Runtime session。
+
+### 14.2 发现与执行契约
+
+`HermesCliSkillService` 只扫描：
+
+```text
+<HERMES_HOME>/skills/<allowed-category>/<exact-skill>/SKILL.md
+```
+
+分类来自宿主配置；Skill 目录名必须符合小写安全 slug，frontmatter 的 `name` 必须与目录一致，
+路径必须解析在 skills 根目录内。模型只看到名称、分类和最多 500 字的描述，不接收完整 Skill
+Markdown。调用参数固定包含：
+
+```text
+hermes chat --query-file - --toolsets web --skills <exact-name>
+            --max-turns 4 --quiet --ignore-rules --source tool
+```
+
+问题通过 stdin 传入，cwd 固定为 `HERMES_HOME`，超时和输出长度由 Settings 限制；Windows 使用
+隐藏子进程参数。未知 Skill 在启动进程前拒绝。
+
+### 14.3 结果、事件、Artifact 与降级
+
+`HermesSkillObservation` 保存 Skill、completed/failed、脱敏输出或错误、耗时和 Artifact ID。
+开发与异常 Session/Outcome 均返回当前 cycle 的 observation；异常应用也新增 `artifacts()`。
+
+- `hermes_skill_requested`：模型选择一个目录 Skill；
+- `hermes_skill_completed`：收到脱敏、有界候选建议；
+- `hermes_skill_failed`：缺失、超时、进程或模型配置失败；
+- `hermes_skill_result` Artifact：保存脱敏 observation，`host_verified=false`。
+
+调用失败不把任务置为 failed；Engine 把脱敏错误回给 Claude，要求依靠当前代码、RAG 和授权数据
+继续。只有模型在本命令预算耗尽后仍重复请求 Hermes，才作为结构化协议违例结束该命令，避免
+无限 Agent 循环。

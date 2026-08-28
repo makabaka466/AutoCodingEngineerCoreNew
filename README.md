@@ -3,7 +3,8 @@
 默认双击 `start.cmd` 会启动桌面客户端。
 
 一个以 **Agent 专业能力** 为核心、与具体平台解耦的任务内核。目前包含两条彼此独立、
-共享 Claude Code Runtime 的流程：软件开发，以及页面与业务数据联合诊断的异常处理。
+共享 Claude Code Runtime 的流程：软件开发，以及页面与业务数据联合诊断的异常处理。两条流程
+还可以按需咨询本机 Hermes Skill，把通用工程经验作为候选证据交回主模型核验。
 
 原生桌面客户端、CLI 和备用网页只是输入输出媒介；真正的产品是应用内核。它们把用户任务
 交给 Claude Code，由模型判断需求是否清楚、应该读哪些文件、如何调查和解决；Python 主机
@@ -17,6 +18,7 @@
 - 每个完成会话自动生成一份可复用能力文档；同一会话续聊后的完成内容追加到原文档。
 - 开发任务和异常工单共享 TaskState、Event、Runtime Run 与恢复扫描内核，同时保留各自的业务决定。
 - 两套流程的 Task/Event/Run 由同一个 runtime SQLite 数据库原子保存，可回放、可审计并支持命令幂等。
+- Hermes 是可选的只读工程经验提供者，不控制状态机，也不能修改代码或查询业务数据库。
 - 写阶段中断不自动重试；系统生成恢复证据，由用户选择只读检查、重新规划或取消。
 
 ## 开发工作流程
@@ -26,6 +28,7 @@
   -> 模型判断是否清楚
      -> 不清楚：每轮只问一个最关键问题，并恢复同一 Claude 会话
      -> 清楚：读取目标及必要关联代码
+        -> 需要通用工程方法：可选择一个已安装 Hermes Skill，只读咨询后由 Claude 核验
         -> 需要核对业务数据：模型提出最小只读 SQL 查询，由主机执行后继续同一任务
         -> 只读结论：完成
         -> 需要修改：先展示现状、修改方案、目标效果、影响、验证计划和可用预览
@@ -63,6 +66,18 @@ FTS5 数据库，切换配置不会复用旧模拟向量，也不会自动上传
 手动建立索引。查询同时取得 Dense Top 20 与 BM25 Top 20，再通过 RRF 融合，默认向 Agent 返回
 最多 6 个 Chunk、每篇文档最多 2 个。检索失败会留下事件并降级为无 RAG 继续执行。
 
+### Hermes 工程经验 Skill（第一版）
+
+ACE 会从 `HERMES_HOME/skills/<category>/<skill>/SKILL.md` 动态发现允许分类的 Skill，并只把名称、
+分类和简短描述放入 Claude 提示词。Claude 只有在 inspect 阶段认为通用工程方法能显著帮助当前
+任务时，才会结构化请求一个精确 Skill；宿主随后让 Hermes 跳过自动规则/Memory，仅开放只读 Web toolset、
+中立工作目录和隐藏控制台执行咨询。整段用户对话、源码、数据库结果和工作区不会被自动转发。
+
+Hermes 输出会脱敏、截断并标记为“不可信候选工程经验”，再交回当前 Claude 会话结合代码和数据
+证据核验。每个命令默认最多咨询一次；Hermes 未安装、模型未配置、超时或返回错误时会留下事件与
+Artifact，并自动继续原有 Claude 流程。首版不共享 Hermes Memory，不让 Hermes 修改项目、执行
+SQL、改变 TaskState 或绕过审批。
+
 ## 异常处理流程
 
 ```text
@@ -75,6 +90,7 @@ FTS5 数据库，切换配置不会复用旧模拟向量，也不会自动上传
      -> 对话和图片都无可信标题/路径：只追问一个页面线索，不扫描全部页面
   -> 路径可信：直接读取代码验证；标题需映射：先有界精确/前缀，无结果再有界模糊查询
   -> 模型结合对话、映射 URL、当前代码以及可用截图验证页面
+     -> 需要通用诊断方法时：可只读咨询一个 Hermes Skill，再核对当前页面、代码和数据证据
      -> 定位页面、请求链路、服务与数据访问代码
         -> 页面映射或业务数据在数据库：模型从代码/schema 提取最小参数化只读 SQL
         -> 主机自动校验并执行，不要求用户手工查询
@@ -103,6 +119,7 @@ password/token/secret 等敏感列脱敏。接口已预留 `source` 与 `externa
 - Claude Code（客户端启动时自动检测；未检测到时会在配置页提示安装或选择 `claude.exe`）
 - 一个可用的 Anthropic 兼容端点、模型名和 API Key
 - 需要真实语义 RAG 时使用 Voyage Embedding 端点和 API Key；未配置时继续使用模拟检索器
+- 可选 Hermes Agent；安装后设置 `HERMES_HOME` 并确保 `hermes.exe` 可执行即可自动发现 Skill
 - 两套流程需要查询业务数据时，需安装 Microsoft ODBC Driver 17 或 18 for SQL Server
 
 安装项目依赖：
@@ -135,6 +152,10 @@ powershell -ExecutionPolicy Bypass -File .\scripts\configure_deepseek.ps1
 ```
 
 脚本同样只把 API Key 写入当前 Windows 用户环境变量。
+
+Hermes 第一版通常无需修改项目配置：系统依次读取 `AUTO_CODING_HERMES_COMMAND`、PATH 和
+`HERMES_HOME/bin/hermes.exe`，Windows 下也会读取刚保存但尚未进入当前进程的用户级
+`HERMES_HOME`。高级部署可用 `AUTO_CODING_HERMES_SKILLS_ENABLED=false` 完全关闭。
 
 ## CLI
 

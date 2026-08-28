@@ -1,6 +1,6 @@
 # AutoCoding Engineer 架构说明
 
-本文描述当前 `0.6.1` 代码已经实现的架构。数据字段、公共方法和命令行参数见
+本文描述当前 `0.7.0` 代码已经实现的架构。数据字段、公共方法和命令行参数见
 [接口与数据契约](INTERFACES.md)。
 
 ## 1. 项目目标
@@ -41,9 +41,12 @@ flowchart TD
     ENGINE --> RUNTIME_PORT["AgentRuntime port"]
     ENGINE --> DB_PORT
     ENGINE --> RAG["KnowledgeRAGService"]
+    ENGINE --> HERMES_COORD["HermesConsultationCoordinator"]
     INCIDENT_ENGINE --> STRUCTURED_PORT["StructuredRuntime port"]
     INCIDENT_ENGINE --> DB_PORT["DatabaseReader port"]
     INCIDENT_ENGINE --> RAG
+    INCIDENT_ENGINE --> HERMES_COORD
+    INCIDENT_ENGINE --> ARTIFACTS
     INCIDENT_ENGINE --> INCIDENT_STORE["IncidentSessionStore"]
     INCIDENT_ENGINE --> STATE
     ENGINE --> SESSION_PORT["SessionStore port"]
@@ -56,6 +59,8 @@ flowchart TD
     INCIDENT_STORE --> INCIDENT_SQLITE["SQLiteIncidentStore + EventStore"]
     SESSION_PORT --> TASK_STORE["SQLiteTaskStore + EventStore"]
     ARTIFACTS --> ARTIFACT_STORE["TaskArtifactStore + Git observer"]
+    HERMES_COORD --> HERMES_PORT["HermesSkillService port"]
+    HERMES_PORT --> HERMES_CLI["Hermes CLI isolated rules + web tools"]
     APP --> RECOVERY["RecoveryManager"]
     INCIDENT_APP --> INCIDENT_RECOVERY["IncidentRecoveryManager"]
     RECOVERY --> SCANNER["OrphanedRunScanner"]
@@ -597,3 +602,33 @@ TaskState / Event Store  ── 独立持久化，不由 UI 进度反向驱动
 输出思维链、SQL、命令、密钥或原始工具输入。相同阶段合并，快速切换设置最小可见时间；
 `ProgressSink` 异常被隔离并写日志，不允许中断任务主流程。桌面端只从后台结果队列消费事件，
 所有 Tk 控件更新仍发生在 UI 线程。
+
+## 12. Hermes Skill 外部经验边界
+
+Hermes 以可替换 `HermesSkillService` 端口接入，不取代 Claude Code Runtime。开发与异常模型在
+只读 inspect 阶段可返回 `hermes_skill_required`，其中只包含一个动态目录中的精确 Skill 名称、
+抽象问题和选择原因。`HermesConsultationCoordinator` 统一处理预算、事件、结果 Artifact 与失败
+降级，任务状态在咨询期间保持 `inspecting`。
+
+```text
+Claude structured request
+          ↓ exact skill + abstract question
+HermesConsultationCoordinator
+          ↓ allowlist / timeout / redaction / one-call budget
+Hermes CLI --ignore-rules --toolsets web --skills <exact-name> --max-turns 4
+          ↓ sanitized, bounded output
+untrusted candidate guidance
+          ↓
+same Claude session validates against code / authorized data / user intent
+```
+
+CLI 子进程的 cwd 固定为 `HERMES_HOME`，不挂载目标工作区；使用 `--ignore-rules` 跳过自动注入的
+AGENTS/Memory/规则，只开放 `web` toolset，并在 Windows 隐藏控制台。保留用户 Hermes 模型与
+provider 配置，避免 `--safe-mode` 连同 `config.yaml` 一起屏蔽。宿主不会自动发送用户历史、源码或数据库行，只发送模型生成且
+经过凭据脱敏的抽象问题。输出最长 16,000 字符，并通过 `hermes_skill_requested/completed/failed`
+事件和 `hermes_skill_result` Artifact 留痕；Artifact 的 `host_verified=false` 明确表示外部建议不是
+工程事实。服务不存在、模型未配置、超时或非零返回码都不会终止主流程，Claude 会收到脱敏失败
+说明并继续处理。
+
+首版不开放 Hermes 文件工具、Shell、业务数据库、Memory 同步、Skill 写入或状态控制。这个边界
+使后续可以替换为别的工程经验提供者，而无需改变 Agent 状态机和交付媒介。

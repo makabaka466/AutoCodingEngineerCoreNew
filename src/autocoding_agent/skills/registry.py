@@ -25,6 +25,7 @@ class SkillRegistry:
         capability_dir: str | None,
         database_schema: str = "No shared read-only database is configured for this task.",
         project: str | None = None,
+        hermes_catalog: str = "Hermes engineering skills are unavailable for this run.",
     ) -> str:
         selected_project = (
             f"The user selected the knowledge project {project!r}. Use only the selected project "
@@ -74,6 +75,8 @@ schema metadata for this task is:
 <database_schema>
 {database_schema}
 </database_schema>
+
+{hermes_catalog}
 
 For an ambiguous request, return needs_input and ask exactly one concise, highest-value question.
 After each answer, reassess ambiguity. Do not start a broad repository scan just to compensate for

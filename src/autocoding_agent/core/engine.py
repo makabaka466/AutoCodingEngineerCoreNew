@@ -18,6 +18,10 @@ from autocoding_agent.core.handlers import (
     InspectHandler,
     VerifyHandler,
 )
+from autocoding_agent.core.hermes_consultation import (
+    HermesConsultationCoordinator,
+    hermes_followup_message,
+)
 from autocoding_agent.core.models import (
     AgentDecision,
     AgentEvent,
@@ -60,6 +64,7 @@ from autocoding_agent.knowledge_rag.models import KnowledgeDomain
 from autocoding_agent.knowledge_rag.ports import KnowledgeRetriever
 from autocoding_agent.knowledge_rag.service import workspace_id_for
 from autocoding_agent.ports.database import DatabaseReader
+from autocoding_agent.ports.hermes_skills import HermesSkillService
 from autocoding_agent.ports.runtime import AgentRuntime, RuntimeInterruptedError
 from autocoding_agent.ports.session_store import SessionStore
 from autocoding_agent.skills import SkillRegistry
@@ -90,11 +95,15 @@ class AgentEngine:
         max_replan_rounds: int = 2,
         owner_id: str | None = None,
         knowledge_retriever: KnowledgeRetriever | None = None,
+        hermes_skills: HermesSkillService | None = None,
+        max_hermes_skill_rounds: int = 1,
     ) -> None:
         if max_query_rounds < 1 or max_query_rounds > 5:
             raise ValueError("max_query_rounds must be between 1 and 5")
         if max_replan_rounds < 1 or max_replan_rounds > 10:
             raise ValueError("max_replan_rounds must be between 1 and 10")
+        if max_hermes_skill_rounds < 1 or max_hermes_skill_rounds > 2:
+            raise ValueError("max_hermes_skill_rounds must be between 1 and 2")
         self.runtime = runtime
         self.sessions = sessions
         self.capabilities = capabilities
@@ -117,6 +126,8 @@ class AgentEngine:
         self.max_replan_rounds = max_replan_rounds
         self.owner_id = owner_id or str(uuid4())
         self.knowledge_retriever = knowledge_retriever
+        self.hermes = HermesConsultationCoordinator(hermes_skills, artifact_recorder)
+        self.max_hermes_skill_rounds = max_hermes_skill_rounds
 
     def start(
         self,
@@ -200,6 +211,7 @@ class AgentEngine:
         session.cycle_number += 1
         session.cycle_objective = message
         session.cycle_query_observation_start = len(session.query_observations)
+        session.cycle_hermes_observation_start = len(session.hermes_skill_observations)
         session.query_rounds = 0
         session.replan_rounds = 0
         session.status = None
@@ -621,6 +633,7 @@ class AgentEngine:
             command.id,
             progress_sink,
         )
+        hermes_skill_rounds = 0
 
         while True:
             existing_runtime_session_id = session.runtime_session_id
@@ -663,6 +676,7 @@ class AgentEngine:
                                 readable_capability_dir,
                                 database_schema,
                                 session.project,
+                                self.hermes.catalog_prompt(),
                             )
                             + (f"\n\n<retrieved_knowledge>\n{knowledge_context}\n"
                                "</retrieved_knowledge>" if knowledge_context else "")
@@ -742,21 +756,7 @@ class AgentEngine:
 
             decision = result.decision
             session.runtime_session_id = result.runtime_session_id
-            session.last_decision = decision
             session.last_usage = _merge_usage(session.last_usage, result.usage)
-            session.status = decision.status
-            session.pending_approval = decision.approval
-            session.messages.append(
-                ChatMessage(
-                    role=MessageRole.ASSISTANT,
-                    content=(
-                        "Agent formed a bounded read-only query plan. The host is executing it "
-                        "automatically; the user does not need to run SQL."
-                        if decision.status == AgentStatus.QUERY_REQUIRED
-                        else decision.message
-                    ),
-                )
-            )
             session.events.append(
                 AgentEvent(
                     type=EventType.RUNTIME_FINISHED,
@@ -770,6 +770,69 @@ class AgentEngine:
                 model=self.model,
                 runtime_session_id=result.runtime_session_id,
                 command_id=command.id,
+            )
+            if decision.status == AgentStatus.HERMES_SKILL_REQUIRED:
+                if hermes_skill_rounds >= self.max_hermes_skill_rounds:
+                    return self._fail(
+                        session,
+                        "The model repeatedly requested Hermes after the bounded consultation "
+                        "budget was exhausted.",
+                        command.id,
+                    )
+                request = decision.hermes_skill
+                if request is None:
+                    return self._fail(
+                        session,
+                        "The model requested Hermes without a structured skill request.",
+                        command.id,
+                    )
+                hermes_skill_rounds += 1
+                emit_progress(
+                    progress_sink,
+                    ProgressEvent.for_phase(
+                        ProgressWorkflow.DEVELOPMENT,
+                        ProgressPhase.CONSULTING_ENGINEERING_EXPERIENCE,
+                        task_id=session.id,
+                        detail=request.skill,
+                    ),
+                )
+                observation = self.hermes.consult(
+                    session,
+                    request,
+                    command_id=command.id,
+                    workflow=ProgressWorkflow.DEVELOPMENT.value,
+                )
+                session.messages.append(
+                    ChatMessage(
+                        role=MessageRole.SYSTEM,
+                        content=(
+                            f"Hermes skill {request.skill!r} was consulted through the host "
+                            "trust boundary; its candidate output was returned only to the "
+                            "primary Runtime for verification."
+                        ),
+                    )
+                )
+                pending_message = hermes_followup_message(observation)
+                session.last_decision = None
+                session.status = None
+                session.pending_approval = None
+                session.updated_at = utc_now()
+                self.sessions.save(session)
+                continue
+
+            session.last_decision = decision
+            session.status = decision.status
+            session.pending_approval = decision.approval
+            session.messages.append(
+                ChatMessage(
+                    role=MessageRole.ASSISTANT,
+                    content=(
+                        "Agent formed a bounded read-only query plan. The host is executing it "
+                        "automatically; the user does not need to run SQL."
+                        if decision.status == AgentStatus.QUERY_REQUIRED
+                        else decision.message
+                    ),
+                )
             )
             if self.artifact_recorder is not None:
                 try:
@@ -1269,6 +1332,8 @@ class AgentEngine:
             )
         if decision.status == AgentStatus.QUERY_REQUIRED and mode != AgentMode.INSPECT:
             raise PolicyViolation("Database queries are only available during inspect mode.")
+        if decision.status == AgentStatus.HERMES_SKILL_REQUIRED and mode != AgentMode.INSPECT:
+            raise PolicyViolation("Hermes skills are only available during inspect mode.")
         approval = decision.approval
         if (
             approval is not None
@@ -1438,6 +1503,9 @@ class AgentEngine:
             capability_document=session.capability_document,
             query_observations=session.query_observations[
                 session.cycle_query_observation_start :
+            ],
+            hermes_skill_observations=session.hermes_skill_observations[
+                session.cycle_hermes_observation_start :
             ],
             usage=session.last_usage,
             events=session.events,

@@ -7,6 +7,11 @@ import os
 from pathlib import Path, PureWindowsPath
 from uuid import uuid4
 
+from autocoding_agent.core.artifacts.recorder import ArtifactRecorder
+from autocoding_agent.core.hermes_consultation import (
+    HermesConsultationCoordinator,
+    hermes_followup_message,
+)
 from autocoding_agent.core.models import (
     AgentEvent,
     AgentMode,
@@ -55,6 +60,7 @@ from autocoding_agent.knowledge_rag.models import KnowledgeDomain
 from autocoding_agent.knowledge_rag.ports import KnowledgeRetriever
 from autocoding_agent.knowledge_rag.service import workspace_id_for
 from autocoding_agent.ports.database import DatabaseReader
+from autocoding_agent.ports.hermes_skills import HermesSkillService
 from autocoding_agent.ports.structured_runtime import StructuredRuntime
 
 _READ_TOOLS = ["Read", "Glob", "Grep"]
@@ -75,9 +81,14 @@ class IncidentEngine:
         state_machine: AgentStateMachine | None = None,
         owner_id: str | None = None,
         knowledge_retriever: KnowledgeRetriever | None = None,
+        hermes_skills: HermesSkillService | None = None,
+        artifact_recorder: ArtifactRecorder | None = None,
+        max_hermes_skill_rounds: int = 1,
     ) -> None:
         if max_query_rounds < 1 or max_query_rounds > 5:
             raise ValueError("max_query_rounds must be between 1 and 5")
+        if max_hermes_skill_rounds < 1 or max_hermes_skill_rounds > 2:
+            raise ValueError("max_hermes_skill_rounds must be between 1 and 2")
         self.runtime = runtime
         self.sessions = sessions
         self.database = database
@@ -88,6 +99,9 @@ class IncidentEngine:
         self.state_machine = state_machine or AgentStateMachine()
         self.owner_id = owner_id or str(uuid4())
         self.knowledge_retriever = knowledge_retriever
+        self.artifact_recorder = artifact_recorder
+        self.hermes = HermesConsultationCoordinator(hermes_skills, artifact_recorder)
+        self.max_hermes_skill_rounds = max_hermes_skill_rounds
 
     def start(
         self,
@@ -188,6 +202,7 @@ class IncidentEngine:
         session.cycle_number += 1
         session.cycle_objective = message
         session.cycle_query_observation_start = len(session.query_observations)
+        session.cycle_hermes_observation_start = len(session.hermes_skill_observations)
         session.query_rounds = 0
         session.status = None
         session.last_decision = None
@@ -374,6 +389,7 @@ class IncidentEngine:
             command.id,
             progress_sink,
         )
+        hermes_skill_rounds = 0
 
         while True:
             session.updated_at = utc_now()
@@ -425,19 +441,7 @@ class IncidentEngine:
                 runtime_session_id=session.runtime_session_id,
             )
 
-            session.last_decision = decision
             session.last_usage = _merge_usage(session.last_usage, usage)
-            session.status = decision.status
-            session.messages.append(
-                ChatMessage(
-                    role=MessageRole.ASSISTANT,
-                    content=(
-                        "Agent 已形成最小只读查询计划，正在自动核对数据库证据。"
-                        if decision.status == IncidentStatus.QUERY_REQUIRED
-                        else decision.message
-                    ),
-                )
-            )
             session.updated_at = utc_now()
             session.events.append(
                 AgentEvent(
@@ -465,6 +469,66 @@ class IncidentEngine:
                             else []
                         ),
                     },
+                )
+            )
+            if decision.status == IncidentStatus.HERMES_SKILL_REQUIRED:
+                if hermes_skill_rounds >= self.max_hermes_skill_rounds:
+                    return self._fail(
+                        session,
+                        "The model repeatedly requested Hermes after the bounded consultation "
+                        "budget was exhausted.",
+                        command,
+                    )
+                request = decision.hermes_skill
+                if request is None:
+                    return self._fail(
+                        session,
+                        "The model requested Hermes without a structured skill request.",
+                        command,
+                    )
+                hermes_skill_rounds += 1
+                emit_progress(
+                    progress_sink,
+                    ProgressEvent.for_phase(
+                        ProgressWorkflow.INCIDENT,
+                        ProgressPhase.CONSULTING_ENGINEERING_EXPERIENCE,
+                        task_id=session.id,
+                        detail=request.skill,
+                    ),
+                )
+                observation = self.hermes.consult(
+                    session,
+                    request,
+                    command_id=command.id,
+                    workflow=ProgressWorkflow.INCIDENT.value,
+                )
+                session.messages.append(
+                    ChatMessage(
+                        role=MessageRole.SYSTEM,
+                        content=(
+                            f"Hermes skill {request.skill!r} was consulted through the host "
+                            "trust boundary; its candidate output was returned only to the "
+                            "primary Runtime for verification."
+                        ),
+                    )
+                )
+                pending_message = hermes_followup_message(observation)
+                session.last_decision = None
+                session.status = None
+                session.updated_at = utc_now()
+                self.sessions.save(session)
+                continue
+
+            session.last_decision = decision
+            session.status = decision.status
+            session.messages.append(
+                ChatMessage(
+                    role=MessageRole.ASSISTANT,
+                    content=(
+                        "Agent 已形成最小只读查询计划，正在自动核对数据库证据。"
+                        if decision.status == IncidentStatus.QUERY_REQUIRED
+                        else decision.message
+                    ),
                 )
             )
             self._transition_for_decision(session, decision, command.id)
@@ -946,6 +1010,7 @@ class IncidentEngine:
                 str(capability_dir) if capability_dir else None,
                 session.project,
                 knowledge_context,
+                self.hermes.catalog_prompt(),
             ),
             tools=list(_READ_TOOLS),
             allowed_tools=list(_READ_TOOLS),
@@ -1179,9 +1244,13 @@ class IncidentEngine:
             query_observations=session.query_observations[
                 session.cycle_query_observation_start :
             ],
+            hermes_skill_observations=session.hermes_skill_observations[
+                session.cycle_hermes_observation_start :
+            ],
             capability_document=session.capability_document,
             usage=session.last_usage,
             events=session.events,
+            artifacts=session.artifacts,
         )
 
 
@@ -1190,6 +1259,7 @@ def _system_prompt(
     capability_dir: str | None,
     project: str | None = None,
     knowledge_context: str = "",
+    hermes_catalog: str = "Hermes engineering skills are unavailable for this run.",
 ) -> str:
     selected_project = (
         f"The user selected the knowledge project {project!r}. Use only its Markdown linked from "
@@ -1221,6 +1291,8 @@ Available database schema metadata for the current configured connection:
 <database_schema>
 {database_schema}
 </database_schema>
+
+{hermes_catalog}
 
 Return only the structured result required by the supplied JSON Schema. Keep the user-facing
 message concise Markdown.{retrieved_note}

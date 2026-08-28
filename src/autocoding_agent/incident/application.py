@@ -6,9 +6,14 @@ from pathlib import Path
 from uuid import uuid4
 
 from autocoding_agent.adapters.claude_code import ClaudeCodeRuntime
+from autocoding_agent.adapters.hermes_skills import build_configured_hermes_service
 from autocoding_agent.adapters.sqlite_database import SQLiteDatabaseReader
 from autocoding_agent.adapters.sqlite_incident_store import SQLiteIncidentStore
+from autocoding_agent.adapters.task_artifact_store import TaskArtifactStore
+from autocoding_agent.adapters.workspace_snapshot import GitWorkspaceObserver
 from autocoding_agent.config import Settings, get_settings
+from autocoding_agent.core.artifacts.models import ArtifactRecord
+from autocoding_agent.core.artifacts.recorder import ArtifactRecorder
 from autocoding_agent.core.models import AgentEvent, MessageAttachment
 from autocoding_agent.core.progress import ProgressSink
 from autocoding_agent.core.recovery.models import RecoveryAction, RecoveryScanResult
@@ -22,6 +27,7 @@ from autocoding_agent.knowledge_rag.ports import KnowledgeRetriever
 from autocoding_agent.knowledge_rag.service import build_configured_rag_service
 from autocoding_agent.observability import configure_file_logging
 from autocoding_agent.ports.database import DatabaseReader
+from autocoding_agent.ports.hermes_skills import HermesSkillService
 from autocoding_agent.ports.structured_runtime import StructuredRuntime
 from autocoding_agent.workspace_knowledge import PROJECT_KNOWLEDGE_ROOT
 
@@ -108,6 +114,9 @@ class IncidentApplication:
     def events(self, session_id: str) -> list[AgentEvent]:
         return self._engine.get_session(session_id).events
 
+    def artifacts(self, session_id: str) -> list[ArtifactRecord]:
+        return self._engine.get_session(session_id).artifacts
+
     def runs(self, session_id: str) -> list[RuntimeRunRecord]:
         return self._engine.get_session(session_id).runs
 
@@ -119,12 +128,17 @@ def build_incident_application(
     sqlite_path: str | Path | None = None,
     database_reference: str | None = None,
     knowledge_retriever: KnowledgeRetriever | None = None,
+    hermes_skills: HermesSkillService | None = None,
 ) -> IncidentApplication:
     configured = settings or get_settings()
     configured.data_dir.mkdir(parents=True, exist_ok=True)
     log_path = configure_file_logging(configured.data_dir)
     sessions = SQLiteIncidentStore(configured.data_dir)
     state_machine = AgentStateMachine()
+    artifact_recorder = ArtifactRecorder(
+        TaskArtifactStore(configured.data_dir),
+        GitWorkspaceObserver(),
+    )
     owner_id = str(uuid4())
     recovery_scan = IncidentRecoveryManager(sessions, state_machine).reconcile(
         current_owner_id=owner_id,
@@ -159,5 +173,12 @@ def build_incident_application(
             if knowledge_retriever is not None
             else build_configured_rag_service(configured)
         ),
+        hermes_skills=(
+            hermes_skills
+            if hermes_skills is not None
+            else build_configured_hermes_service(configured)
+        ),
+        artifact_recorder=artifact_recorder,
+        max_hermes_skill_rounds=configured.hermes_skill_max_rounds,
     )
     return IncidentApplication(engine, log_path, recovery_scan)

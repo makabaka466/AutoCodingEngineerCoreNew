@@ -118,6 +118,10 @@ class DecisionRecorder:
             return RiskLevel.HIGH
         if decision.approval is not None and decision.approval.scope == ApprovalScope.MODIFY:
             return RiskLevel.HIGH
-        if decision.status in {AgentStatus.APPROVAL_REQUIRED, AgentStatus.QUERY_REQUIRED}:
+        if decision.status in {
+            AgentStatus.APPROVAL_REQUIRED,
+            AgentStatus.QUERY_REQUIRED,
+            AgentStatus.HERMES_SKILL_REQUIRED,
+        }:
             return RiskLevel.MEDIUM
         return RiskLevel.LOW

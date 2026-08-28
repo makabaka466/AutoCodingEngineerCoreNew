@@ -1,6 +1,6 @@
 # AutoCodingEngineerCoreNew 项目开发与工程经验
 
-> 文档基线：2026-08-27，项目版本 `0.6.3`。本文以当前代码为准，并明确区分“已实现”、
+> 文档基线：2026-08-28，项目版本 `0.7.0`。本文以当前代码为准，并明确区分“已实现”、
 > “当前限制”和“后续规划”。当前 Agent 已具备状态机、追加事件、运行记录、决策审计、
 > 任务产物、保守恢复，以及按会话持续沉淀开发/异常能力知识的 Runtime 内核。
 
@@ -88,6 +88,7 @@ AutoCodingEngineerCoreNew 的硬编码业务。MES 的目录结构、页面定�
 - 开发、异常各自独立的 Capability 文档；
 - 人工选择的 Markdown 分块、FTS5 + Voyage/模拟向量混合检索、分领域 Agent 注入与检索审计；
 - 对话优先、图片补充、标题/路径联合判断和有界页面映射的异常调查规则；
+- 双流程瞬时进度投影，以及可选 Hermes 工程经验 Skill 的只读咨询、审计和失败降级；
 - 本地脱敏日志、确定性测试和版本回退规则。
 
 尚未接入外部向量数据库、跨工作区工程经验治理、自动异常修复、钉钉接入、流式 Token 展示和
@@ -1231,7 +1232,9 @@ FTS 精确词检索 ─┐
 - `v0.6.0`：人工管理、Markdown Chunk、FTS5 + 模拟向量 + RRF、开发/异常注入和引用事件；
 - `v0.6.1`：Voyage 配置/测试、正式 REST Adapter、OS 密钥、索引隔离和手动重建；
 - `v0.6.2`：异常流程页面名称前置、截图标题识别、项目映射分层和有界候选验证；
-- `v0.6.3（当前）`：对话先于图片、标题/路径联合入口、候选与截图冲突澄清；
+- `v0.6.3`：对话先于图片、标题/路径联合入口、候选与截图冲突澄清；
+- `v0.6.4`：双流程实时进度投影与持久状态分层；
+- `v0.7.0（当前）`：Hermes Skill 只读工程经验端口、双流程回灌、事件/Artifact 和失败降级；
 - 下一检索迭代：外部 VectorStore、健康检查、批量迁移和真实检索评测集；
 - 治理迭代：统一 Engineering Knowledge/Candidate 模型，把 Capability、异常与失败日志转为候选；
 - 质量迭代：脱敏、去重、冲突检测、陈旧标记、人工审核与基于证据的晋级；
@@ -2331,3 +2334,65 @@ Engine 在准备上下文、检索 RAG、分析图片、定位页面、查询数
 面向长任务的 Agent UI 应把 durable state、runtime event 和 presentation progress 分开：状态机
 负责正确性，事件负责审计，进度投影负责交互。UI 可以丢失进度事件，却不能因此改变或误判任务
 结果；同样，模型可以建议下一步，却不能直接声明宿主尚未执行的阶段事实。
+
+## 31. Hermes Skill 只读工程经验接入（v0.7.0）
+
+### 31.1 背景与目标
+
+项目需要复用 Hermes 已有的工程 Skill，但直接把完整 Hermes Agent 嵌入 ACE 会引入第二套会话、
+Memory、工具、权限和恢复系统，破坏当前清晰的状态机边界。第一版目标因此不是“让两个 Agent 互相
+接管”，而是把 Hermes 定位为一个可选、只读、可替换的工程经验提供者：Claude 仍理解任务和验证
+证据，Hermes 只回答一个抽象工程问题。
+
+### 31.2 设计思路
+
+语义判断与确定性安全继续分层。Claude 根据当前任务判断是否值得咨询，并从动态目录选择精确
+Skill；Python 宿主不使用关键词规则决定 Skill，但强制分类白名单、路径边界、调用次数、超时、
+隐藏控制台、凭据脱敏和输出上限。Hermes 返回内容一律标注为候选经验，不能替代当前源码、数据库
+证据或用户意图。
+
+### 31.3 核心实现
+
+- `core/hermes.py` 定义 Skill 摘要、结构化请求、结果、Observation、目录提示和边界脱敏；
+- `ports/hermes_skills.py` 定义可替换 `HermesSkillService`；
+- `adapters/hermes_skills.py` 从 `HERMES_HOME` 动态发现 Skill，并以 `ignore-rules + web toolset` 调用
+  Hermes CLI；
+- `HermesConsultationCoordinator` 被开发和异常 Engine 共用，统一产生 Event、Artifact 和回灌
+  文本；
+- `AgentDecision`/`IncidentDecision` 新增内部 `hermes_skill_required`，但不新增 TaskState；
+- UI 使用 `consulting_engineering_experience` 瞬时阶段显示“正在咨询工程经验”；
+- 开发与异常 Session 都保存 Observation，异常流程也复用 TaskArtifactStore 保存外部建议。
+
+### 31.4 技术难点与解决方案
+
+1. **避免形成双主控。** Hermes 不持有 ACE 会话、不转换状态、不批准变更。一次咨询完成后结果回到
+   同一 Claude session，最终决定仍由主 Runtime 给出。
+2. **避免项目数据无边界外发。** 宿主不自动拼接用户历史、源码、工作区或数据库结果，只发送模型
+   生成的抽象问题与原因，并再次做常见凭据脱敏和长度限制。
+3. **防止 Skill 路径注入。** 只扫描允许分类下的一层目录，要求安全 slug、frontmatter 名称与目录
+   一致、解析路径仍位于根目录；未知名称在启动子进程前拒绝。
+4. **外部 Agent 失败不能拖垮主流程。** 未安装、未配置模型、超时、非零退出和空输出都转换为
+   failed Observation，再由 Claude 使用原有代码/RAG/SQL 能力继续。
+5. **外部建议与事实必须分离。** Artifact 标记 `host_verified=false`，回灌文本明确要求核验；Event
+   只记录 Skill、耗时和 Artifact ID，不复制完整问题或输出。
+6. **避免 Agent 循环。** Hermes 单次最多 4 个工具循环，单个用户命令默认只有一次咨询预算；预算耗尽后提示 Claude 不再请求，
+   若仍重复请求则按协议违例结束，保证执行有界。
+
+### 31.5 技术选型与决策记录
+
+- ADR-082：Hermes 作为 `HermesSkillService` 外部能力端口，不作为第二个 Runtime 主控；
+- ADR-083：首版只允许 inspect 阶段显式选择一个已发现 Skill，implement/verify 禁止请求；
+- ADR-084：CLI 使用中立 cwd、`--ignore-rules`、`--toolsets web`、隐藏窗口、超时和输出上限；
+  不使用会同时忽略用户模型/provider 配置的 `--safe-mode`；
+- ADR-085：不自动发送会话、源码和数据库结果，只发送脱敏后的抽象工程问题；
+- ADR-086：Hermes 结果属于 untrusted candidate evidence，必须由 Claude 结合当前证据复核；
+- ADR-087：成功与失败都进入 Event/Artifact，服务不可用时主流程自动降级；
+- ADR-088：首版不接入 Hermes Memory、完整 Runtime、Skill 写入、SQL、Shell 或修改权限。
+
+### 31.6 当前边界与后续方向
+
+本版已从本机 `HERMES_HOME` 识别允许分类 Skill，但 Hermes 模型尚未配置，因此发布验证只覆盖目录
+发现、命令构造、脱敏、超时、Fake Service 双流程闭环和失败降级，不执行真实模型调用。配置 Hermes
+模型后应使用一个无敏感数据的固定问题完成 live smoke test，并检查 Event、Artifact 和 Claude 二次
+核验结果。后续可增加 UI 配置与健康检查、按 Skill 质量评测和人工反馈，但仍不应默认共享两套
+Memory 或授予 Hermes 项目写权限。

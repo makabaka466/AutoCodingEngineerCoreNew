@@ -20,6 +20,7 @@ class ArtifactType(StrEnum):
     CHANGES_PATCH = "changes_patch"
     TEST_RESULT = "test_result"
     RECOVERY_REPORT = "recovery_report"
+    HERMES_SKILL_RESULT = "hermes_skill_result"
     FINAL_REPORT = "final_report"
 
 

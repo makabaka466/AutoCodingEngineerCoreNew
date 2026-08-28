@@ -30,6 +30,7 @@ _DEFAULT_SUFFIX = {
     ArtifactType.CHANGES_PATCH: ".patch",
     ArtifactType.TEST_RESULT: ".json",
     ArtifactType.RECOVERY_REPORT: ".json",
+    ArtifactType.HERMES_SKILL_RESULT: ".json",
     ArtifactType.FINAL_REPORT: ".md",
 }
 

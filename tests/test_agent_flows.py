@@ -14,6 +14,11 @@ from autocoding_agent.adapters.json_session_store import JsonSessionStore
 from autocoding_agent.adapters.sqlite_task_store import SQLiteTaskStore
 from autocoding_agent.application import AgentApplication, build_application
 from autocoding_agent.config import Settings
+from autocoding_agent.core.hermes import (
+    HermesSkillRequest,
+    HermesSkillResult,
+    HermesSkillSummary,
+)
 from autocoding_agent.core.models import (
     AgentDecision,
     AgentMode,
@@ -71,6 +76,33 @@ class FakeDatabase:
             columns=["id", "status"],
             rows=[{"id": 42, "status": "stuck"}],
             returned_rows=1,
+        )
+
+
+class FakeHermesSkills:
+    def __init__(self, *, fail: bool = False) -> None:
+        self.fail = fail
+        self.requests: list[HermesSkillRequest] = []
+
+    def available_skills(self) -> list[HermesSkillSummary]:
+        return [
+            HermesSkillSummary(
+                name="debug-method",
+                category="software-development",
+                description="Trace causal evidence before proposing a fix.",
+            )
+        ]
+
+    def invoke(self, request: HermesSkillRequest) -> HermesSkillResult:
+        self.requests.append(request)
+        if self.fail:
+            raise RuntimeError("Hermes model is not configured. token=provider-secret")
+        return HermesSkillResult(
+            skill=request.skill,
+            category="software-development",
+            question=request.question,
+            output="Use a timeline, isolate the first divergent state, then verify the fix.",
+            duration_ms=12,
         )
 
 
@@ -805,3 +837,85 @@ def test_non_completed_outcomes_do_not_write_capabilities(
     assert "No completed-task capabilities yet." in (
         workspace_memory / "CAPABILITIES.md"
     ).read_text(encoding="utf-8")
+
+
+def test_development_flow_consults_hermes_once_and_archives_result(tmp_path: Path) -> None:
+    workspace = tmp_path / "repo-hermes"
+    workspace.mkdir()
+    state = tmp_path / "state-hermes"
+    runtime = ScriptedRuntime(
+        AgentDecision(
+            status=AgentStatus.HERMES_SKILL_REQUIRED,
+            message="A reusable failure-analysis method would improve this investigation.",
+            reason="The code spans multiple asynchronous states.",
+            hermes_skill=HermesSkillRequest(
+                skill="debug-method",
+                question="How should an asynchronous state divergence be diagnosed?",
+                reason="Need a reusable causal-debugging method.",
+            ),
+        ),
+        _completed("Validated the likely fault using current repository evidence."),
+    )
+    hermes = FakeHermesSkills()
+    progress = []
+    app = build_application(
+        settings=_settings(state),
+        runtime=runtime,
+        hermes_skills=hermes,
+    )
+
+    outcome = app.start(
+        workspace,
+        "Diagnose the asynchronous state mismatch.",
+        progress_sink=progress.append,
+    )
+    session = app.get_session(outcome.session_id)
+
+    assert outcome.status == AgentStatus.COMPLETED
+    assert len(hermes.requests) == 1
+    assert len(runtime.turns) == 2
+    assert "debug-method [software-development]" in runtime.turns[0].system_prompt
+    assert "untrusted candidate engineering guidance" in runtime.turns[1].user_message
+    assert "isolate the first divergent state" in runtime.turns[1].user_message
+    assert [item.type for item in session.events].count(EventType.HERMES_SKILL_REQUESTED) == 1
+    assert EventType.HERMES_SKILL_COMPLETED in [item.type for item in session.events]
+    assert len(session.hermes_skill_observations) == 1
+    assert session.hermes_skill_observations[0].artifact_id
+    assert any(item.type.value == "hermes_skill_result" for item in session.artifacts)
+    assert ProgressPhase.CONSULTING_ENGINEERING_EXPERIENCE in [
+        item.phase for item in progress
+    ]
+
+
+def test_development_flow_continues_when_hermes_is_unavailable(tmp_path: Path) -> None:
+    workspace = tmp_path / "repo-hermes-failure"
+    workspace.mkdir()
+    runtime = ScriptedRuntime(
+        AgentDecision(
+            status=AgentStatus.HERMES_SKILL_REQUIRED,
+            message="Consult external engineering experience.",
+            hermes_skill=HermesSkillRequest(
+                skill="debug-method",
+                question="How should this failure be investigated?",
+                reason="Need a reusable method.",
+            ),
+        ),
+        _completed("Continued without Hermes and completed from repository evidence."),
+    )
+    hermes = FakeHermesSkills(fail=True)
+    app = build_application(
+        settings=_settings(tmp_path / "state-hermes-failure"),
+        runtime=runtime,
+        hermes_skills=hermes,
+    )
+
+    outcome = app.start(workspace, "Diagnose the failure.")
+    session = app.get_session(outcome.session_id)
+
+    assert outcome.status == AgentStatus.COMPLETED
+    assert "could not be consulted" in runtime.turns[1].user_message
+    assert "provider-secret" not in runtime.turns[1].user_message
+    assert EventType.HERMES_SKILL_FAILED in [item.type for item in session.events]
+    assert session.hermes_skill_observations[0].error == (
+        "Hermes model is not configured. token=[REDACTED]"
+    )

@@ -13,6 +13,14 @@ from autocoding_agent.adapters.sqlite_database import (
     ReadOnlyQueryError,
     SQLiteDatabaseReader,
 )
+from autocoding_agent.adapters.task_artifact_store import TaskArtifactStore
+from autocoding_agent.adapters.workspace_snapshot import GitWorkspaceObserver
+from autocoding_agent.core.artifacts.recorder import ArtifactRecorder
+from autocoding_agent.core.hermes import (
+    HermesSkillRequest,
+    HermesSkillResult,
+    HermesSkillSummary,
+)
 from autocoding_agent.core.models import (
     AgentUsage,
     EventType,
@@ -72,6 +80,30 @@ class FakeDatabase:
             columns=["id", "status"],
             rows=[{"id": 42, "status": "stuck"}],
             returned_rows=1,
+        )
+
+
+class FakeHermesSkills:
+    def __init__(self) -> None:
+        self.requests: list[HermesSkillRequest] = []
+
+    def available_skills(self) -> list[HermesSkillSummary]:
+        return [
+            HermesSkillSummary(
+                name="debug-method",
+                category="software-development",
+                description="Trace causal evidence before proposing a fix.",
+            )
+        ]
+
+    def invoke(self, request: HermesSkillRequest) -> HermesSkillResult:
+        self.requests.append(request)
+        return HermesSkillResult(
+            skill=request.skill,
+            category="software-development",
+            question=request.question,
+            output="Separate page identity, code origin, and data evidence before diagnosis.",
+            duration_ms=8,
         )
 
 
@@ -655,3 +687,61 @@ def test_incident_contract_requires_question_query_and_completed_diagnosis() -> 
             message="Done",
             page=_page(),
         )
+
+
+def test_incident_flow_consults_hermes_and_keeps_external_guidance_untrusted(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "incident-hermes-workspace"
+    workspace.mkdir()
+    data_dir = tmp_path / "incident-hermes-data"
+    runtime = ScriptedStructuredRuntime(
+        [
+            IncidentDecision(
+                status=IncidentStatus.HERMES_SKILL_REQUIRED,
+                message="A reusable diagnostic method would help structure the evidence.",
+                hermes_skill=HermesSkillRequest(
+                    skill="debug-method",
+                    question="How should page, code, and data evidence be separated?",
+                    reason="Need a reusable incident-analysis method.",
+                ),
+            ),
+            IncidentDecision(
+                status=IncidentStatus.COMPLETED,
+                message="The page and failing code path were verified.",
+                page=_page(),
+                diagnosis="The API maps a missing order state to the wrong page message.",
+            ),
+        ]
+    )
+    hermes = FakeHermesSkills()
+    progress = []
+    engine = IncidentEngine(
+        runtime,
+        JsonIncidentStore(data_dir),
+        None,
+        hermes_skills=hermes,
+        artifact_recorder=ArtifactRecorder(
+            TaskArtifactStore(data_dir),
+            GitWorkspaceObserver(),
+        ),
+    )
+
+    outcome = engine.start(
+        workspace,
+        "The Order details page shows the wrong error.",
+        progress_sink=progress.append,
+    )
+    session = engine.get_session(outcome.session_id)
+
+    assert outcome.status == IncidentStatus.COMPLETED
+    assert len(hermes.requests) == 1
+    assert len(runtime.turns) == 2
+    assert "debug-method [software-development]" in runtime.turns[0].system_prompt
+    assert "untrusted candidate engineering guidance" in runtime.turns[1].user_message
+    assert EventType.HERMES_SKILL_COMPLETED in [item.type for item in session.events]
+    assert session.hermes_skill_observations[0].artifact_id
+    assert any(item.type.value == "hermes_skill_result" for item in outcome.artifacts)
+    assert ProgressPhase.CONSULTING_ENGINEERING_EXPERIENCE in [
+        item.phase for item in progress
+    ]

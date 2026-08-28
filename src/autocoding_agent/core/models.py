@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field, StringConstraints, model_validator
 
 from autocoding_agent.core.artifacts.models import ArtifactRecord
 from autocoding_agent.core.audit.models import DecisionRecord, RiskLevel
+from autocoding_agent.core.hermes import HermesSkillObservation, HermesSkillRequest
 from autocoding_agent.core.runtime.models import RuntimeRunRecord
 from autocoding_agent.core.state_machine.models import CommandReceipt, TaskState
 from autocoding_agent.database_models import DataQuery, QueryObservation
@@ -25,6 +26,7 @@ def utc_now() -> datetime:
 class AgentStatus(StrEnum):
     NEEDS_INPUT = "needs_input"
     QUERY_REQUIRED = "query_required"
+    HERMES_SKILL_REQUIRED = "hermes_skill_required"
     APPROVAL_REQUIRED = "approval_required"
     COMPLETED = "completed"
     FAILED = "failed"
@@ -91,6 +93,9 @@ class EventType(StrEnum):
     DATABASE_QUERY_FAILED = "database_query_failed"
     KNOWLEDGE_RETRIEVED = "knowledge_retrieved"
     KNOWLEDGE_RETRIEVAL_FAILED = "knowledge_retrieval_failed"
+    HERMES_SKILL_REQUESTED = "hermes_skill_requested"
+    HERMES_SKILL_COMPLETED = "hermes_skill_completed"
+    HERMES_SKILL_FAILED = "hermes_skill_failed"
     TASK_REOPENED = "task_reopened"
 
 
@@ -176,6 +181,7 @@ class AgentDecision(BaseModel):
     test_summary: str | None = None
     capability: CapabilityDraft | None = None
     queries: list[DataQuery] = Field(default_factory=list, max_length=5)
+    hermes_skill: HermesSkillRequest | None = None
 
     @model_validator(mode="after")
     def validate_status_payload(self) -> AgentDecision:
@@ -187,6 +193,14 @@ class AgentDecision(BaseModel):
             raise ValueError("queries are required when status is query_required")
         if self.status != AgentStatus.QUERY_REQUIRED and self.queries:
             raise ValueError("queries are only valid when status is query_required")
+        if self.status == AgentStatus.HERMES_SKILL_REQUIRED and self.hermes_skill is None:
+            raise ValueError(
+                "hermes_skill is required when status is hermes_skill_required"
+            )
+        if self.status != AgentStatus.HERMES_SKILL_REQUIRED and self.hermes_skill is not None:
+            raise ValueError(
+                "hermes_skill is only valid when status is hermes_skill_required"
+            )
         return self
 
 
@@ -235,11 +249,13 @@ class AgentSession(BaseModel):
     capability_document: str | None = None
     database_reference: str | None = None
     query_observations: list[QueryObservation] = Field(default_factory=list)
+    hermes_skill_observations: list[HermesSkillObservation] = Field(default_factory=list)
     query_rounds: int = 0
     replan_rounds: int = 0
     cycle_number: int = Field(default=1, ge=1)
     cycle_objective: str | None = None
     cycle_query_observation_start: int = Field(default=0, ge=0)
+    cycle_hermes_observation_start: int = Field(default=0, ge=0)
     messages: list[ChatMessage] = Field(default_factory=list)
     events: list[AgentEvent] = Field(default_factory=list)
     decision_records: list[DecisionRecord] = Field(default_factory=list)
@@ -289,6 +305,8 @@ class AgentSession(BaseModel):
     def validate_cycle_observation_offset(self) -> AgentSession:
         if self.cycle_query_observation_start > len(self.query_observations):
             raise ValueError("cycle query observation offset exceeds stored observations")
+        if self.cycle_hermes_observation_start > len(self.hermes_skill_observations):
+            raise ValueError("cycle Hermes observation offset exceeds stored observations")
         return self
 
 
@@ -327,5 +345,6 @@ class AgentOutcome(BaseModel):
     test_summary: str | None = None
     capability_document: str | None = None
     query_observations: list[QueryObservation] = Field(default_factory=list)
+    hermes_skill_observations: list[HermesSkillObservation] = Field(default_factory=list)
     usage: AgentUsage = Field(default_factory=AgentUsage)
     events: list[AgentEvent] = Field(default_factory=list)

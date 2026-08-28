@@ -9,6 +9,8 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field, StringConstraints, model_validator
 
+from autocoding_agent.core.artifacts.models import ArtifactRecord
+from autocoding_agent.core.hermes import HermesSkillObservation, HermesSkillRequest
 from autocoding_agent.core.models import AgentEvent, AgentUsage, ChatMessage, utc_now
 from autocoding_agent.core.runtime.models import RuntimeRunRecord
 from autocoding_agent.core.state_machine.models import CommandReceipt, TaskState
@@ -32,6 +34,7 @@ NonEmptyText = Annotated[str, StringConstraints(strip_whitespace=True, min_lengt
 class IncidentStatus(StrEnum):
     NEEDS_INPUT = "needs_input"
     QUERY_REQUIRED = "query_required"
+    HERMES_SKILL_REQUIRED = "hermes_skill_required"
     COMPLETED = "completed"
     FAILED = "failed"
 
@@ -64,6 +67,7 @@ class IncidentDecision(BaseModel):
     recommended_actions: list[NonEmptyText] = Field(default_factory=list)
     confidence: float | None = Field(default=None, ge=0, le=1)
     automation_candidate: bool = False
+    hermes_skill: HermesSkillRequest | None = None
 
     @model_validator(mode="after")
     def validate_status_payload(self) -> IncidentDecision:
@@ -74,6 +78,14 @@ class IncidentDecision(BaseModel):
                 raise ValueError("queries are required when status is query_required")
         elif self.queries:
             raise ValueError("queries are only valid when status is query_required")
+        if self.status == IncidentStatus.HERMES_SKILL_REQUIRED and self.hermes_skill is None:
+            raise ValueError(
+                "hermes_skill is required when status is hermes_skill_required"
+            )
+        if self.status != IncidentStatus.HERMES_SKILL_REQUIRED and self.hermes_skill is not None:
+            raise ValueError(
+                "hermes_skill is only valid when status is hermes_skill_required"
+            )
         if self.status == IncidentStatus.COMPLETED:
             if self.page is None:
                 raise ValueError("page is required when incident investigation is completed")
@@ -105,12 +117,15 @@ class IncidentSession(BaseModel):
     last_usage: AgentUsage = Field(default_factory=AgentUsage)
     messages: list[ChatMessage] = Field(default_factory=list)
     query_observations: list[QueryObservation] = Field(default_factory=list)
+    hermes_skill_observations: list[HermesSkillObservation] = Field(default_factory=list)
     query_rounds: int = 0
     cycle_number: int = Field(default=1, ge=1)
     cycle_objective: str | None = None
     cycle_query_observation_start: int = Field(default=0, ge=0)
+    cycle_hermes_observation_start: int = Field(default=0, ge=0)
     capability_document: str | None = None
     events: list[AgentEvent] = Field(default_factory=list)
+    artifacts: list[ArtifactRecord] = Field(default_factory=list)
     runs: list[RuntimeRunRecord] = Field(default_factory=list)
     command_receipts: list[CommandReceipt] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=utc_now)
@@ -142,6 +157,8 @@ class IncidentSession(BaseModel):
     def validate_cycle_observation_offset(self) -> IncidentSession:
         if self.cycle_query_observation_start > len(self.query_observations):
             raise ValueError("cycle query observation offset exceeds stored observations")
+        if self.cycle_hermes_observation_start > len(self.hermes_skill_observations):
+            raise ValueError("cycle Hermes observation offset exceeds stored observations")
         return self
 
 
@@ -160,6 +177,8 @@ class IncidentOutcome(BaseModel):
     confidence: float | None = None
     automation_candidate: bool = False
     query_observations: list[QueryObservation] = Field(default_factory=list)
+    hermes_skill_observations: list[HermesSkillObservation] = Field(default_factory=list)
     capability_document: str | None = None
     usage: AgentUsage = Field(default_factory=AgentUsage)
     events: list[AgentEvent] = Field(default_factory=list)
+    artifacts: list[ArtifactRecord] = Field(default_factory=list)

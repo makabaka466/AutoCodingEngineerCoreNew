@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "auto-coding-engineer-core-new"
-version = "0.6.4"
+version = "0.7.0"
 description = "A platform-independent software-development agent powered by Claude Code."
 requires-python = ">=3.12"
 dependencies = [

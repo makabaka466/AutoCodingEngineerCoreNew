@@ -7,6 +7,7 @@ from uuid import uuid4
 
 from autocoding_agent.adapters.capability_store import CapabilityStore
 from autocoding_agent.adapters.claude_code import ClaudeCodeRuntime
+from autocoding_agent.adapters.hermes_skills import build_configured_hermes_service
 from autocoding_agent.adapters.sqlite_task_store import SQLiteTaskStore
 from autocoding_agent.adapters.task_artifact_store import TaskArtifactStore
 from autocoding_agent.adapters.workspace_snapshot import GitWorkspaceObserver
@@ -26,6 +27,7 @@ from autocoding_agent.knowledge_rag.ports import KnowledgeRetriever
 from autocoding_agent.knowledge_rag.service import build_configured_rag_service
 from autocoding_agent.observability import configure_file_logging
 from autocoding_agent.ports.database import DatabaseReader
+from autocoding_agent.ports.hermes_skills import HermesSkillService
 from autocoding_agent.ports.runtime import AgentRuntime
 from autocoding_agent.skills import SkillRegistry
 from autocoding_agent.workspace_knowledge import PROJECT_KNOWLEDGE_ROOT
@@ -150,6 +152,7 @@ def build_application(
     database: DatabaseReader | None = None,
     database_reference: str | None = None,
     knowledge_retriever: KnowledgeRetriever | None = None,
+    hermes_skills: HermesSkillService | None = None,
 ) -> AgentApplication:
     configured = settings or get_settings()
     configured.data_dir.mkdir(parents=True, exist_ok=True)
@@ -191,5 +194,11 @@ def build_application(
             if knowledge_retriever is not None
             else build_configured_rag_service(configured)
         ),
+        hermes_skills=(
+            hermes_skills
+            if hermes_skills is not None
+            else build_configured_hermes_service(configured)
+        ),
+        max_hermes_skill_rounds=configured.hermes_skill_max_rounds,
     )
     return AgentApplication(engine, log_path, recovery_scan)
