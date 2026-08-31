@@ -553,6 +553,7 @@ def test_observed_runtime_blocks_repository_wide_glob(tmp_path: Path) -> None:
 
     assert activities[-1].kind == RuntimeEventKind.POLICY_BLOCKED
     assert activities[-1].tool_name == "Glob"
+    assert activities[-1].data["pattern"] == "**/*"
     assert "禁止通配整个项目" in activities[-1].data["reason"]
 
 

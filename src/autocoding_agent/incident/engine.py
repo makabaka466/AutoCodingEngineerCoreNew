@@ -69,7 +69,8 @@ from autocoding_agent.ports.database import DatabaseReader
 from autocoding_agent.ports.hermes_skills import HermesSkillService
 from autocoding_agent.ports.structured_runtime import StructuredRuntime
 
-_READ_TOOLS = ["Read", "Glob", "Grep"]
+_PAGE_IDENTITY_TOOLS = ["Read"]
+_SOURCE_INVESTIGATION_TOOLS = ["Read", "Glob", "Grep"]
 
 
 class IncidentEngine:
@@ -1112,6 +1113,12 @@ class IncidentEngine:
         if previous_runtime_session_id is None:
             session.runtime_session_id = session.id
             self.sessions.save(session)
+        source_search_enabled = _source_search_enabled(session)
+        tools = (
+            _SOURCE_INVESTIGATION_TOOLS
+            if source_search_enabled
+            else _PAGE_IDENTITY_TOOLS
+        )
         turn = RuntimeTurn(
             session_id=session.id,
             runtime_session_id=previous_runtime_session_id,
@@ -1125,9 +1132,10 @@ class IncidentEngine:
                 session.project,
                 knowledge_context,
                 self.hermes.catalog_prompt(),
+                source_search_enabled,
             ),
-            tools=list(_READ_TOOLS),
-            allowed_tools=list(_READ_TOOLS),
+            tools=list(tools),
+            allowed_tools=list(tools),
             capability_dir=str(capability_dir) if capability_dir else None,
             additional_dirs=attachment_dirs or [],
         )
@@ -1374,6 +1382,7 @@ def _system_prompt(
     project: str | None = None,
     knowledge_context: str = "",
     hermes_catalog: str = "Hermes engineering skills are unavailable for this run.",
+    source_search_enabled: bool = False,
 ) -> str:
     selected_project = (
         f"The user selected the knowledge project {project!r}. Use only its Markdown linked from "
@@ -1395,11 +1404,21 @@ def _system_prompt(
         else ""
     )
     workflow_rules = load_incident_workflow_rules()
+    source_search_note = (
+        "The host has returned at least one bounded page-mapping candidate for this cycle. "
+        "Read, Glob, and Grep are available now. Verify an exact candidate path before tracing "
+        "related code; the mapping row is still only a clue."
+        if source_search_enabled
+        else "Source search is currently locked. Only Read is exposed for exact user-provided "
+        "files and host-authorized images or capability documents. If the conversation provides "
+        "a page title but not an exact source path, request a page_lookup database query first; "
+        "do not attempt repository discovery in this turn."
+    )
     return f"""{workflow_rules}
 
 ## Runtime context
 
-This Runtime exposes only Read, Glob, and Grep tools. {capability_note}
+{source_search_note} {capability_note}
 
 {BOUNDED_SEARCH_RULES}
 
@@ -1413,6 +1432,23 @@ Available database schema metadata for the current configured connection:
 Return only the structured result required by the supplied JSON Schema. Keep the user-facing
 message concise Markdown.{retrieved_note}
 """
+
+
+def _source_search_enabled(session: IncidentSession) -> bool:
+    """Unlock native source search only after current-cycle page evidence exists."""
+
+    observations = session.query_observations[session.cycle_query_observation_start :]
+    return any(
+        observation.status == QueryObservationStatus.SUCCEEDED
+        and (
+            (
+                observation.stage == IncidentQueryStage.PAGE_LOOKUP.value
+                and observation.returned_rows > 0
+            )
+            or observation.stage == IncidentQueryStage.BUSINESS_DATA.value
+        )
+        for observation in observations
+    )
 
 
 def _merge_usage(current: AgentUsage, new: AgentUsage) -> AgentUsage:

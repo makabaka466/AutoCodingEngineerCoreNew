@@ -247,15 +247,21 @@ class ClaudeCodeRuntime:
                     continue
                 if envelope.get("type") == "result":
                     result_envelope = envelope
-                violation = _search_policy_violation(envelope, search_guard)
-                if violation is not None:
+                blocked_search = _search_policy_violation(envelope, search_guard)
+                if blocked_search is not None:
+                    violation, blocked_input = blocked_search
+                    audit_data = _safe_tool_data(
+                        violation.tool_name,
+                        blocked_input,
+                        turn.workspace,
+                    )
                     event_sink(
                         RuntimeActivity(
                             run_id=run_id,
                             kind=RuntimeEventKind.POLICY_BLOCKED,
                             summary=f"ACE blocked an over-broad {violation.tool_name} search.",
                             tool_name=violation.tool_name,
-                            data={"reason": violation.reason},
+                            data={**audit_data, "reason": violation.reason},
                         )
                     )
                     logger.warning(
@@ -798,7 +804,7 @@ def _stream_activities(
 def _search_policy_violation(
     envelope: dict[str, Any],
     guard: BoundedSearchGuard,
-) -> SearchPolicyViolation | None:
+) -> tuple[SearchPolicyViolation, Any] | None:
     if envelope.get("type") != "assistant":
         return None
     message = envelope.get("message")
@@ -813,7 +819,7 @@ def _search_policy_violation(
             block.get("input"),
         )
         if violation is not None:
-            return violation
+            return violation, block.get("input")
     return None
 
 

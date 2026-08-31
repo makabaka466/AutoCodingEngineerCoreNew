@@ -17,8 +17,8 @@ MAX_GREP_RESULTS = 100
 
 BOUNDED_SEARCH_RULES = f"""## Bounded source search
 
-Native Read, Glob, and Grep are available, but source discovery must remain evidence-led and
-small. The model decides what evidence is relevant; the host enforces only the outer boundary.
+When the current Runtime exposes Read, Glob, or Grep, source discovery must remain evidence-led
+and small. The model decides what evidence is relevant; the host enforces only the outer boundary.
 
 - Read a known workspace-relative file directly. If a database mapping returns a namespace,
   class, route, or relative URL, derive an exact filename first (for example

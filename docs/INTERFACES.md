@@ -1,6 +1,6 @@
 # AutoCoding Engineer 接口与数据契约
 
-本文记录当前 `0.7.5` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
+本文记录当前 `0.7.6` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
 Runtime、持久化和状态契约。
 设计动机和运行流程见[架构说明](ARCHITECTURE.md)。
 
@@ -517,6 +517,11 @@ Runner/Popen 时跳过本机路径恢复，保留可替换 Runtime 的确定性�
 `glob/type` 和 `head_limit=1..100`；显式搜索路径必须位于 workspace、能力目录或附件目录。
 违反策略会产生 `RuntimeEventKind.POLICY_BLOCKED`，审计中只保存工具名、脱敏后的范围信息和阻断
 原因，不保存源码正文。
+
+异常 `RuntimeTurn` 的工具列表按页面定位证据动态生成：当前 cycle 尚无成功且非空的
+`page_lookup` observation 时为 `Read`；有候选后为 `Read,Glob,Grep`。成功但 0 行的精确页面查询
+不会解锁源码搜索，模型应继续有界模糊页面查询。`policy_blocked` 活动会同时保存脱敏后的
+`pattern/path/glob/type/output_mode/head_limit`，方便区分工具边界问题和业务调查问题。
 
 ```json
 {

@@ -479,6 +479,11 @@ def test_agent_resolves_page_with_host_executed_sql_before_page_is_known(
     assert outcome.status == IncidentStatus.COMPLETED
     assert database.queries == [menu_query]
     assert len(runtime.turns) == 2
+    assert runtime.turns[0].tools == ["Read"]
+    assert runtime.turns[0].allowed_tools == ["Read"]
+    assert "Source search is currently locked" in runtime.turns[0].system_prompt
+    assert runtime.turns[1].tools == ["Read", "Glob", "Grep"]
+    assert "page-mapping candidate" in runtime.turns[1].system_prompt
     assert "Never print SQL as an instruction to the user" in runtime.turns[0].system_prompt
     observation = outcome.query_observations[0]
     assert observation.sql_fingerprint is not None
@@ -587,6 +592,12 @@ def test_page_lookup_budget_does_not_consume_business_query_budget(
     assert saved.page_query_rounds == 2
     assert saved.business_query_rounds == 1
     assert saved.query_repair_rounds == 0
+    assert [turn.tools for turn in runtime.turns] == [
+        ["Read"],
+        ["Read"],
+        ["Read", "Glob", "Grep"],
+        ["Read", "Glob", "Grep"],
+    ]
     assert [item.stage for item in outcome.query_observations] == [
         IncidentQueryStage.PAGE_LOOKUP.value,
         IncidentQueryStage.PAGE_LOOKUP.value,
