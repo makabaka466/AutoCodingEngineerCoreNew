@@ -21,7 +21,24 @@ from autocoding_agent.adapters.capability_store import (
     session_index_records,
     sync_knowledge_documents,
 )
-from autocoding_agent.incident.models import IncidentDecision, IncidentSession
+from autocoding_agent.incident.models import (
+    IncidentDecision,
+    IncidentSession,
+    QueryObservation,
+    QueryObservationStatus,
+)
+
+
+def _query_observation_summary(item: QueryObservation) -> str:
+    stage = item.stage or "unspecified"
+    if item.status == QueryObservationStatus.FAILED:
+        return f"[{stage}] {item.query_name}: failed ({item.error or 'unknown error'})"
+    summary = f"[{stage}] {item.query_name}: {item.returned_rows} rows"
+    if item.truncated:
+        summary += ", truncated"
+    if item.redacted_columns:
+        summary += f", redacted columns: {', '.join(item.redacted_columns)}"
+    return summary
 
 
 class IncidentCapabilityStore:
@@ -196,13 +213,7 @@ class IncidentCapabilityStore:
             for item in decision.findings
         ]
         observations = [
-            f"{item.query_name}: {item.returned_rows} rows"
-            + (", truncated" if item.truncated else "")
-            + (
-                f", redacted columns: {', '.join(item.redacted_columns)}"
-                if item.redacted_columns
-                else ""
-            )
+            _query_observation_summary(item)
             for item in session.query_observations[session.cycle_query_observation_start :]
         ]
 
@@ -270,13 +281,7 @@ class IncidentCapabilityStore:
             for item in decision.findings
         ]
         observations = [
-            f"{item.query_name}: {item.returned_rows} rows"
-            + (", truncated" if item.truncated else "")
-            + (
-                f", redacted columns: {', '.join(item.redacted_columns)}"
-                if item.redacted_columns
-                else ""
-            )
+            _query_observation_summary(item)
             for item in session.query_observations[session.cycle_query_observation_start :]
         ]
 

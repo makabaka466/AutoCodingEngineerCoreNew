@@ -32,6 +32,10 @@ from autocoding_agent.core.progress import (
 )
 from autocoding_agent.core.recovery.models import RecoveryAction
 from autocoding_agent.core.state_machine.models import TaskState
+from autocoding_agent.database_models import (
+    QueryObservation,
+    QueryObservationStatus,
+)
 from autocoding_agent.embedding_setup import EmbeddingSetupService, EmbeddingSetupState
 from autocoding_agent.incident.application import (
     IncidentApplication,
@@ -98,6 +102,17 @@ COLORS = {
     "danger": "#DC2626",
     "danger_soft": "#FEF2F2",
 }
+
+
+def _format_query_observation(item: QueryObservation) -> str:
+    stage = {
+        "page_lookup": "页面定位",
+        "business_data": "业务数据",
+    }.get(item.stage or "", "数据查询")
+    if item.status == QueryObservationStatus.FAILED:
+        return f"• [{stage}] {item.query_name}: 失败 · {item.error or '未知错误'}"
+    suffix = "，已截断" if item.truncated else ""
+    return f"• [{stage}] {item.query_name}: {item.returned_rows} 行{suffix}"
 
 
 def _rounded_points(
@@ -1837,11 +1852,7 @@ class DesktopClient:
             ]
             if cycle_observations:
                 details.append("数据查询")
-                details.extend(
-                    f"• {item.query_name}: {item.returned_rows} 行"
-                    + ("，已截断" if item.truncated else "")
-                    for item in cycle_observations
-                )
+                details.extend(_format_query_observation(item) for item in cycle_observations)
             if session.capability_document:
                 details.append(f"能力文档\n{session.capability_document}")
             if details:
@@ -1913,11 +1924,7 @@ class DesktopClient:
             ]
             if cycle_observations:
                 details.append("数据查询")
-                details.extend(
-                    f"• {item.query_name}: {item.returned_rows} 行"
-                    + ("，已截断" if item.truncated else "")
-                    for item in cycle_observations
-                )
+                details.extend(_format_query_observation(item) for item in cycle_observations)
             if decision.recommended_actions:
                 details.append("建议动作")
                 details.extend(f"• {item}" for item in decision.recommended_actions)

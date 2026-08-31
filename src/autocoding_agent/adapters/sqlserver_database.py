@@ -237,7 +237,13 @@ def _bind_named_parameters(
             rendered.append(character)
             index += 1
             continue
-        if character == ":" and index + 1 < len(sql):
+        if character in {":", "@"} and index + 1 < len(sql):
+            # Preserve SQL Server system variables. Exact structured parameters are still
+            # converted to pyodbc `?`, so values are never interpolated into SQL text.
+            if character == "@" and sql[index + 1] == "@":
+                rendered.append("@@")
+                index += 2
+                continue
             match = re.match(r"[A-Za-z_][A-Za-z0-9_]*", sql[index + 1 :])
             if match:
                 name = match.group(0)

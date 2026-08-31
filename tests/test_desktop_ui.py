@@ -29,6 +29,7 @@ from autocoding_agent.core.progress import (
 )
 from autocoding_agent.core.recovery.models import RecoveryAction
 from autocoding_agent.core.state_machine.models import TaskState
+from autocoding_agent.database_models import QueryObservation, QueryObservationStatus
 from autocoding_agent.embedding_setup import (
     EmbeddingConnectionConfig,
     EmbeddingSetupState,
@@ -43,6 +44,7 @@ from autocoding_agent.interfaces.desktop_ui import (
     DesktopClient,
     FlowKind,
     RoundedButton,
+    _format_query_observation,
     format_approval_details,
     session_list_label,
 )
@@ -347,6 +349,28 @@ def test_session_list_label_is_compact_and_includes_status() -> None:
     assert "…" in label
     assert "已完成" in label
     assert "08-20" in label
+
+
+def test_query_observation_display_distinguishes_stage_and_failure() -> None:
+    success = QueryObservation(
+        query_name="resolve_menu",
+        purpose="Locate page.",
+        stage="page_lookup",
+        returned_rows=5,
+        truncated=True,
+    )
+    failure = QueryObservation(
+        query_name="load_upload_rows",
+        purpose="Inspect business data.",
+        status=QueryObservationStatus.FAILED,
+        stage="business_data",
+        error="Read-only query failed: invalid column",
+    )
+
+    assert _format_query_observation(success) == "• [页面定位] resolve_menu: 5 行，已截断"
+    assert _format_query_observation(failure) == (
+        "• [业务数据] load_upload_rows: 失败 · Read-only query failed: invalid column"
+    )
 
 
 def test_approval_details_show_before_after_plan_and_preview() -> None:

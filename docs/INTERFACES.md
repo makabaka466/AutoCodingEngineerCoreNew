@@ -1,6 +1,6 @@
 # AutoCoding Engineer 接口与数据契约
 
-本文记录当前 `0.7.3` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
+本文记录当前 `0.7.4` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
 Runtime、持久化和状态契约。
 设计动机和运行流程见[架构说明](ARCHITECTURE.md)。
 
@@ -814,7 +814,10 @@ Web 模式。
 | `AUTO_CODING_INCIDENT_SQLITE_PATH` | `None` | 可选的异常诊断 SQLite 文件路径；连接始终以只读模式打开 |
 | `AUTO_CODING_DATABASE_MAX_ROWS` | `100` | 两套流程每条查询的主机返回行数上限，范围 1–1000；模型契约最多请求 100 行 |
 | `AUTO_CODING_DATABASE_QUERY_TIMEOUT_SECONDS` | `60` | SQL Server/SQLite 单条查询超时，范围 1–60 秒 |
-| `AUTO_CODING_DATABASE_MAX_QUERY_ROUNDS` | `2` | 每个开发或异常会话最多自动查询轮次，范围 1–5 |
+| `AUTO_CODING_DATABASE_MAX_QUERY_ROUNDS` | `2` | 每个开发 cycle 最多自动查询轮次，范围 1–5 |
+| `AUTO_CODING_INCIDENT_MAX_PAGE_QUERY_ROUNDS` | `2` | 每个异常 cycle 最多成功页面定位查询轮次，范围 1–5 |
+| `AUTO_CODING_INCIDENT_MAX_BUSINESS_QUERY_ROUNDS` | `2` | 每个异常 cycle 最多成功业务数据查询轮次，范围 1–5 |
+| `AUTO_CODING_INCIDENT_MAX_QUERY_REPAIR_ROUNDS` | `1` | 每个异常 cycle 最多 SQL 纠错轮次，范围 0–3 |
 | `AUTO_CODING_AGENT_MAX_REPLAN_ROUNDS` | `2` | 验证失败后的最大重规划轮数，范围 1–10 |
 | `AUTO_CODING_RUNTIME_LEASE_SECONDS` | `30` | 启动恢复扫描使用的本地运行租约秒数，范围 5–3600 |
 | `AUTO_CODING_HERMES_SKILLS_ENABLED` | `true` | 是否自动发现并启用可选 Hermes Skill 服务 |
@@ -894,8 +897,9 @@ outcome = incidents.start(
 `IncidentStatus` 包含：
 
 - `needs_input`：问题或页面信息不足，`question` 必填；
-- `query_required`：需要页面映射或业务数据，至少一条 `queries` 必填；模型形成可信标题候选后
-  可按所选项目知识查询映射表，因而 `page` 可以暂时为空；可信路径则可直接读取，不要求查询；
+- `query_required`：需要页面映射或业务数据，`query_stage` 和至少一条 `queries` 必填；
+  `page_lookup` 可在页面未定位时查询映射，`business_data` 必须同时提供已验证的 `page`；可信路径
+  可直接读取，不要求查询；
 - `completed`：诊断结束，`page`、`diagnosis` 以及至少一个已验证的页面源码路径必填；
 - `failed`：Runtime、契约或数据库边界失败。
 
@@ -904,6 +908,7 @@ outcome = incidents.start(
 ```text
 status, message, question
 page: LocatedPage | None
+query_stage: page_lookup | business_data | None
 queries: list[DataQuery] (最多 5 条)
 diagnosis: str | None
 findings: list[IncidentFinding]
@@ -915,15 +920,19 @@ automation_candidate: bool
 `LocatedPage` 保存名称、可选 route、页面源码路径、相关后端路径和定位依据。所有源码路径必须
 是安全的工作区相对路径；映射表返回的 URL 在打开当前代码验证前不能直接写成最终源码事实。
 `DataQuery` 保存名称、用途、SQL、命名参数和 1–100 的请求行数，默认
-为 100；数据库适配器仍会应用更小的主机上限。结果数量未知时，开发与异常 Prompt 都要求模型
+为 100；参数契约优先使用 `:name`，参数字典键写不带前缀的 `name`。SQL Server 适配器还安全
+兼容 `@name`，统一转换成 ODBC `?` 后按出现顺序独立绑定，绝不插值。数据库适配器仍会应用更小的主机上限。结果数量未知时，开发与异常 Prompt 都要求模型
 先做 100 条有界采样并在 SQL 中使用适合方言的 `TOP`/`LIMIT`；已知少量结果时应使用更小限制。
 
-`IncidentOutcome.query_observations` 只包含查询名称、用途、SQL 指纹、参数名、返回行数、截断标记
-和脱敏列。SQL 参数值和原始业务行不会写入运行时数据库；结构化 SQL 只存在于当前模型决定和
+`IncidentOutcome.query_observations` 只包含查询名称、用途、阶段、成功/失败状态、脱敏错误、SQL
+指纹、参数名、返回行数、截断标记和脱敏列。SQL 参数值和原始业务行不会写入运行时数据库；结构化 SQL 只存在于当前模型决定和
 执行调用中，完成后的持久化审计使用指纹。
 `IncidentSession.database_reference` 保存该会话的无凭据数据源引用，例如
 `sqlserver://server:1433/database`；它不保存数据库账号、密码或业务数据。
-`IncidentSession` 与开发会话一样保存 `cycle_number/cycle_objective` 和当前轮查询审计起点；
+`IncidentSession` 与开发会话一样保存 `cycle_number/cycle_objective` 和当前轮查询审计起点；另外
+保存总尝试数 `query_rounds`、成功页面查询数 `page_query_rounds`、成功业务查询数
+`business_query_rounds` 和 SQL 失败纠错数 `query_repair_rounds`。四项在 completed 会话续聊进入
+新 cycle 时重置，但历史 Observation/Event 不清空；
 `IncidentOutcome` 只返回本 cycle 的查询摘要，Session/Event 继续保留全部历史审计。
 
 ### 11.3 `DatabaseReader`

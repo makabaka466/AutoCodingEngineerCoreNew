@@ -15,11 +15,17 @@ def test_database_settings_default_to_100_rows_and_60_seconds(
 ) -> None:
     monkeypatch.delenv("AUTO_CODING_DATABASE_MAX_ROWS", raising=False)
     monkeypatch.delenv("AUTO_CODING_DATABASE_QUERY_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.delenv("AUTO_CODING_INCIDENT_MAX_PAGE_QUERY_ROUNDS", raising=False)
+    monkeypatch.delenv("AUTO_CODING_INCIDENT_MAX_BUSINESS_QUERY_ROUNDS", raising=False)
+    monkeypatch.delenv("AUTO_CODING_INCIDENT_MAX_QUERY_REPAIR_ROUNDS", raising=False)
 
     settings = Settings(_env_file=None)
 
     assert settings.database_max_rows == 100
     assert settings.database_query_timeout_seconds == 60
+    assert settings.incident_max_page_query_rounds == 2
+    assert settings.incident_max_business_query_rounds == 2
+    assert settings.incident_max_query_repair_rounds == 1
 
 
 def test_sqlite_reader_enforces_shared_default_row_limit(tmp_path: Path) -> None:

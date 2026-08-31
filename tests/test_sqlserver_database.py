@@ -238,6 +238,33 @@ def test_sqlserver_parameter_binding_ignores_colons_inside_literals() -> None:
     )
 
 
+def test_sqlserver_reader_safely_accepts_colon_and_at_named_parameters() -> None:
+    connection = FakeConnection()
+    reader = SQLServerDatabaseReader(
+        _config(),
+        connector=lambda *_args, **_kwargs: connection,
+    )
+
+    reader.execute(
+        DataQuery(
+            name="compatible_parameters",
+            purpose="Accept SQL Server-style model output without interpolating values.",
+            sql=(
+                "SELECT @@ROWCOUNT, id FROM dbo.orders "
+                "WHERE id >= @minimum_id AND id <= :maximum_id "
+                "AND note = '@minimum_id'"
+            ),
+            parameters={"minimum_id": 1, "maximum_id": 9},
+        )
+    )
+
+    assert connection.cursor_value.executions[0] == (
+        "SELECT @@ROWCOUNT, id FROM dbo.orders "
+        "WHERE id >= ? AND id <= ? AND note = '@minimum_id'",
+        (1, 9),
+    )
+
+
 @pytest.mark.parametrize(
     "sql",
     [

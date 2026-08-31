@@ -159,7 +159,9 @@ def build_incident_application(
         runtime=runtime or ClaudeCodeRuntime(configured),
         sessions=sessions,
         database=selected_database,
-        max_query_rounds=configured.database_max_query_rounds,
+        max_page_query_rounds=configured.incident_max_page_query_rounds,
+        max_business_query_rounds=configured.incident_max_business_query_rounds,
+        max_query_repair_rounds=configured.incident_max_query_repair_rounds,
         database_reference=selected_reference,
         capabilities=IncidentCapabilityStore(
             configured.data_dir,

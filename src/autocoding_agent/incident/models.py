@@ -14,17 +14,24 @@ from autocoding_agent.core.hermes import HermesSkillObservation, HermesSkillRequ
 from autocoding_agent.core.models import AgentEvent, AgentUsage, ChatMessage, utc_now
 from autocoding_agent.core.runtime.models import RuntimeRunRecord
 from autocoding_agent.core.state_machine.models import CommandReceipt, TaskState
-from autocoding_agent.database_models import DataQuery, QueryObservation, QueryResult
+from autocoding_agent.database_models import (
+    DataQuery,
+    QueryObservation,
+    QueryObservationStatus,
+    QueryResult,
+)
 
 __all__ = [
     "DataQuery",
     "IncidentDecision",
     "IncidentFinding",
     "IncidentOutcome",
+    "IncidentQueryStage",
     "IncidentSession",
     "IncidentStatus",
     "LocatedPage",
     "QueryObservation",
+    "QueryObservationStatus",
     "QueryResult",
 ]
 
@@ -37,6 +44,13 @@ class IncidentStatus(StrEnum):
     HERMES_SKILL_REQUIRED = "hermes_skill_required"
     COMPLETED = "completed"
     FAILED = "failed"
+
+
+class IncidentQueryStage(StrEnum):
+    """Model-selected database purpose used only for deterministic host budgets."""
+
+    PAGE_LOOKUP = "page_lookup"
+    BUSINESS_DATA = "business_data"
 
 
 class LocatedPage(BaseModel):
@@ -61,6 +75,13 @@ class IncidentDecision(BaseModel):
     message: NonEmptyText
     question: NonEmptyText | None = None
     page: LocatedPage | None = None
+    query_stage: IncidentQueryStage | None = Field(
+        default=None,
+        description=(
+            "Required when status is query_required. Use page_lookup while resolving the "
+            "page/menu mapping; use business_data only after page source code is verified."
+        ),
+    )
     queries: list[DataQuery] = Field(default_factory=list, max_length=5)
     diagnosis: NonEmptyText | None = None
     findings: list[IncidentFinding] = Field(default_factory=list)
@@ -76,8 +97,16 @@ class IncidentDecision(BaseModel):
         if self.status == IncidentStatus.QUERY_REQUIRED:
             if not self.queries:
                 raise ValueError("queries are required when status is query_required")
+            if self.query_stage is None:
+                raise ValueError("query_stage is required when status is query_required")
+            if self.query_stage == IncidentQueryStage.BUSINESS_DATA and self.page is None:
+                raise ValueError(
+                    "page is required before requesting business_data queries"
+                )
         elif self.queries:
             raise ValueError("queries are only valid when status is query_required")
+        elif self.query_stage is not None:
+            raise ValueError("query_stage is only valid when status is query_required")
         if self.status == IncidentStatus.HERMES_SKILL_REQUIRED and self.hermes_skill is None:
             raise ValueError(
                 "hermes_skill is required when status is hermes_skill_required"
@@ -119,6 +148,9 @@ class IncidentSession(BaseModel):
     query_observations: list[QueryObservation] = Field(default_factory=list)
     hermes_skill_observations: list[HermesSkillObservation] = Field(default_factory=list)
     query_rounds: int = 0
+    page_query_rounds: int = Field(default=0, ge=0)
+    business_query_rounds: int = Field(default=0, ge=0)
+    query_repair_rounds: int = Field(default=0, ge=0)
     cycle_number: int = Field(default=1, ge=1)
     cycle_objective: str | None = None
     cycle_query_observation_start: int = Field(default=0, ge=0)
@@ -136,16 +168,31 @@ class IncidentSession(BaseModel):
     def infer_lifecycle_for_legacy_sessions(cls, data: Any) -> Any:
         """Load pre-runtime incident JSON without mutating the source file."""
 
-        if not isinstance(data, dict) or "task_state" in data:
+        if not isinstance(data, dict):
             return data
         restored = {**data}
-        status = str(restored.get("status") or "")
-        restored["task_state"] = {
-            IncidentStatus.NEEDS_INPUT.value: TaskState.WAITING_INPUT,
-            IncidentStatus.QUERY_REQUIRED.value: TaskState.QUERYING_DATA,
-            IncidentStatus.COMPLETED.value: TaskState.COMPLETED,
-            IncidentStatus.FAILED.value: TaskState.FAILED,
-        }.get(status, TaskState.CREATED)
+        if "task_state" not in restored:
+            status = str(restored.get("status") or "")
+            restored["task_state"] = {
+                IncidentStatus.NEEDS_INPUT.value: TaskState.WAITING_INPUT,
+                IncidentStatus.QUERY_REQUIRED.value: TaskState.QUERYING_DATA,
+                IncidentStatus.COMPLETED.value: TaskState.COMPLETED,
+                IncidentStatus.FAILED.value: TaskState.FAILED,
+            }.get(status, TaskState.CREATED)
+        last_decision = restored.get("last_decision")
+        if (
+            isinstance(last_decision, dict)
+            and str(last_decision.get("status") or "") == IncidentStatus.QUERY_REQUIRED.value
+            and "query_stage" not in last_decision
+        ):
+            restored["last_decision"] = {
+                **last_decision,
+                "query_stage": (
+                    IncidentQueryStage.BUSINESS_DATA.value
+                    if last_decision.get("page")
+                    else IncidentQueryStage.PAGE_LOOKUP.value
+                ),
+            }
         restored.setdefault("version", 0)
         restored.setdefault("revision", 0)
         restored.setdefault("events", [])

@@ -111,6 +111,9 @@ class Settings(BaseSettings):
         le=60,
     )
     database_max_query_rounds: int = Field(default=2, ge=1, le=5)
+    incident_max_page_query_rounds: int = Field(default=2, ge=1, le=5)
+    incident_max_business_query_rounds: int = Field(default=2, ge=1, le=5)
+    incident_max_query_repair_rounds: int = Field(default=1, ge=0, le=3)
     agent_max_replan_rounds: int = Field(default=2, ge=1, le=10)
     runtime_lease_seconds: int = Field(default=30, ge=5, le=3600)
 

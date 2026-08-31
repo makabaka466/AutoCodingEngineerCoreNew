@@ -34,8 +34,11 @@ from autocoding_agent.incident.engine import IncidentEngine
 from autocoding_agent.incident.models import (
     DataQuery,
     IncidentDecision,
+    IncidentQueryStage,
+    IncidentSession,
     IncidentStatus,
     LocatedPage,
+    QueryObservationStatus,
     QueryResult,
 )
 from autocoding_agent.knowledge_rag.models import (
@@ -238,6 +241,7 @@ def test_incident_flow_locates_page_queries_data_and_diagnoses(tmp_path: Path) -
                 status=IncidentStatus.QUERY_REQUIRED,
                 message="Located the order page; checking the reported order.",
                 page=_page(),
+                query_stage=IncidentQueryStage.BUSINESS_DATA,
                 queries=[query],
             ),
             IncidentDecision(
@@ -454,6 +458,7 @@ def test_agent_resolves_page_with_host_executed_sql_before_page_is_known(
             IncidentDecision(
                 status=IncidentStatus.QUERY_REQUIRED,
                 message="I will resolve the page through the configured menu mapping.",
+                query_stage=IncidentQueryStage.PAGE_LOOKUP,
                 queries=[menu_query],
             ),
             IncidentDecision(
@@ -483,6 +488,110 @@ def test_agent_resolves_page_with_host_executed_sql_before_page_is_known(
     )
     assert "良率上传%" not in persisted
     assert "SELECT NAME, URL" not in persisted
+
+
+def test_page_lookup_budget_does_not_consume_business_query_budget(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace-stage-budgets"
+    workspace.mkdir()
+    exact_query = DataQuery(
+        name="menu_exact",
+        purpose="Try the supplied page title first.",
+        sql="SELECT NAME, URL FROM Menu WHERE NAME = :name",
+        parameters={"name": "小米良率上传"},
+        max_rows=20,
+    )
+    fuzzy_query = DataQuery(
+        name="menu_fuzzy",
+        purpose="Find the closest bounded page candidate.",
+        sql="SELECT NAME, URL FROM Menu WHERE NAME LIKE :keyword",
+        parameters={"keyword": "%良率%"},
+        max_rows=20,
+    )
+    business_query = DataQuery(
+        name="yield_upload_rows",
+        purpose="Inspect the affected upload rows from verified code semantics.",
+        sql="SELECT id, status FROM orders WHERE id = :id",
+        parameters={"id": 42},
+    )
+    runtime = ScriptedStructuredRuntime(
+        [
+            IncidentDecision(
+                status=IncidentStatus.QUERY_REQUIRED,
+                message="Trying the exact page mapping.",
+                query_stage=IncidentQueryStage.PAGE_LOOKUP,
+                queries=[exact_query],
+            ),
+            IncidentDecision(
+                status=IncidentStatus.QUERY_REQUIRED,
+                message="Trying a bounded fuzzy page mapping.",
+                query_stage=IncidentQueryStage.PAGE_LOOKUP,
+                queries=[fuzzy_query],
+            ),
+            IncidentDecision(
+                status=IncidentStatus.QUERY_REQUIRED,
+                message="The page is verified; checking the affected business rows.",
+                page=_page(),
+                query_stage=IncidentQueryStage.BUSINESS_DATA,
+                queries=[business_query],
+            ),
+            IncidentDecision(
+                status=IncidentStatus.COMPLETED,
+                message="Diagnosis complete.",
+                page=_page(),
+                diagnosis="The affected row remains in the pending state.",
+            ),
+        ]
+    )
+
+    class StageDatabase(FakeDatabase):
+        def execute(self, query: DataQuery) -> QueryResult:
+            self.queries.append(query)
+            if query.name == "menu_exact":
+                return QueryResult(
+                    query_name=query.name,
+                    columns=["NAME", "URL"],
+                    rows=[],
+                    returned_rows=0,
+                )
+            if query.name == "menu_fuzzy":
+                return QueryResult(
+                    query_name=query.name,
+                    columns=["NAME", "URL"],
+                    rows=[
+                        {
+                            "NAME": "小米良率数据上传",
+                            "URL": "Ckhy.MES.Client.CKClient.CustomYieldUpLoad",
+                        }
+                    ],
+                    returned_rows=1,
+                )
+            return QueryResult(
+                query_name=query.name,
+                columns=["id", "status"],
+                rows=[{"id": 42, "status": "pending"}],
+                returned_rows=1,
+            )
+
+    database = StageDatabase()
+    store = JsonIncidentStore(tmp_path / "data-stage-budgets")
+    engine = IncidentEngine(runtime, store, database)
+
+    outcome = engine.start(workspace, "小米良率上传页面的数据不正确", "小米良率上传")
+
+    assert outcome.status == IncidentStatus.COMPLETED
+    assert database.queries == [exact_query, fuzzy_query, business_query]
+    saved = store.load(outcome.session_id)
+    assert saved.query_rounds == 3
+    assert saved.page_query_rounds == 2
+    assert saved.business_query_rounds == 1
+    assert saved.query_repair_rounds == 0
+    assert [item.stage for item in outcome.query_observations] == [
+        IncidentQueryStage.PAGE_LOOKUP.value,
+        IncidentQueryStage.PAGE_LOOKUP.value,
+        IncidentQueryStage.BUSINESS_DATA.value,
+    ]
 
 
 def test_incident_image_attachment_is_persisted_and_mounted_read_only(
@@ -553,12 +662,14 @@ def test_failed_sql_is_returned_to_agent_for_automatic_correction(tmp_path: Path
                 status=IncidentStatus.QUERY_REQUIRED,
                 message="Inspecting the affected order.",
                 page=_page(),
+                query_stage=IncidentQueryStage.BUSINESS_DATA,
                 queries=[invalid_query],
             ),
             IncidentDecision(
                 status=IncidentStatus.QUERY_REQUIRED,
                 message="Correcting the query from the sanitized database error.",
                 page=_page(),
+                query_stage=IncidentQueryStage.BUSINESS_DATA,
                 queries=[corrected_query],
             ),
             IncidentDecision(
@@ -583,7 +694,13 @@ def test_failed_sql_is_returned_to_agent_for_automatic_correction(tmp_path: Path
             )
 
     database = CorrectingDatabase()
-    engine = IncidentEngine(runtime, JsonIncidentStore(tmp_path / "data"), database)
+    engine = IncidentEngine(
+        runtime,
+        JsonIncidentStore(tmp_path / "data"),
+        database,
+        capabilities=IncidentCapabilityStore(tmp_path / "data"),
+        model="test-model",
+    )
 
     outcome = engine.start(workspace, "Order 42 is stuck", "/orders/42")
 
@@ -592,6 +709,18 @@ def test_failed_sql_is_returned_to_agent_for_automatic_correction(tmp_path: Path
     assert len(runtime.turns) == 3
     assert "Do not ask the user to run SQL" in runtime.turns[1].user_message
     assert any(event.type == EventType.DATABASE_QUERY_FAILED for event in outcome.events)
+    saved = engine.sessions.load(outcome.session_id)
+    assert saved.query_rounds == 2
+    assert saved.business_query_rounds == 1
+    assert saved.query_repair_rounds == 1
+    assert [item.status for item in outcome.query_observations] == [
+        QueryObservationStatus.FAILED,
+        QueryObservationStatus.SUCCEEDED,
+    ]
+    assert "invalid column missing" in (outcome.query_observations[0].error or "")
+    capability = Path(outcome.capability_document or "").read_text(encoding="utf-8")
+    assert "[business_data] bad_order_lookup: failed" in capability
+    assert "[business_data] order_lookup: 1 rows" in capability
 
 
 def test_query_request_without_database_becomes_durable_failure(tmp_path: Path) -> None:
@@ -603,6 +732,7 @@ def test_query_request_without_database_becomes_durable_failure(tmp_path: Path) 
                 status=IncidentStatus.QUERY_REQUIRED,
                 message="Need order data.",
                 page=_page(),
+                query_stage=IncidentQueryStage.BUSINESS_DATA,
                 queries=[
                     DataQuery(
                         name="order",
@@ -686,6 +816,59 @@ def test_incident_contract_requires_question_query_and_completed_diagnosis() -> 
             status=IncidentStatus.COMPLETED,
             message="Done",
             page=_page(),
+        )
+
+
+def test_legacy_query_decision_infers_stage_even_when_task_state_exists() -> None:
+    session = IncidentSession.model_validate(
+        {
+            "workspace": r"D:\legacy-workspace",
+            "problem": "Locate the page",
+            "task_state": TaskState.QUERYING_DATA.value,
+            "status": IncidentStatus.QUERY_REQUIRED.value,
+            "last_decision": {
+                "status": IncidentStatus.QUERY_REQUIRED.value,
+                "message": "Resolve the page mapping.",
+                "queries": [
+                    {
+                        "name": "menu",
+                        "purpose": "Locate page.",
+                        "sql": "SELECT NAME, URL FROM Menu WHERE NAME = :name",
+                        "parameters": {"name": "Orders"},
+                    }
+                ],
+            },
+        }
+    )
+
+    assert session.last_decision is not None
+    assert session.last_decision.query_stage == IncidentQueryStage.PAGE_LOOKUP
+    with pytest.raises(ValueError, match="query_stage is required"):
+        IncidentDecision(
+            status=IncidentStatus.QUERY_REQUIRED,
+            message="Need data",
+            queries=[
+                DataQuery(
+                    name="menu",
+                    purpose="Locate the page.",
+                    sql="SELECT NAME, URL FROM Menu WHERE NAME = :name",
+                    parameters={"name": "Orders"},
+                )
+            ],
+        )
+    with pytest.raises(ValueError, match="page is required"):
+        IncidentDecision(
+            status=IncidentStatus.QUERY_REQUIRED,
+            message="Need business data",
+            query_stage=IncidentQueryStage.BUSINESS_DATA,
+            queries=[
+                DataQuery(
+                    name="orders",
+                    purpose="Inspect state.",
+                    sql="SELECT id FROM orders WHERE id = :id",
+                    parameters={"id": 1},
+                )
+            ],
         )
 
 

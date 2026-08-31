@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import re
 from datetime import datetime, timezone
+from enum import StrEnum
 from typing import Annotated, Any
 
 from pydantic import BaseModel, Field, StringConstraints
@@ -22,8 +23,16 @@ class DataQuery(BaseModel):
 
     name: NonEmptyText
     purpose: NonEmptyText
-    sql: NonEmptyText
-    parameters: dict[str, QueryParameter] = Field(default_factory=dict)
+    sql: NonEmptyText = Field(
+        description=(
+            "Parameterized read-only SQL. Use :name placeholders; the SQL Server host also "
+            "accepts @name defensively and binds values without string interpolation."
+        )
+    )
+    parameters: dict[str, QueryParameter] = Field(
+        default_factory=dict,
+        description="Values keyed by placeholder name, without ':' or '@'.",
+    )
     max_rows: int = Field(default=DEFAULT_QUERY_MAX_ROWS, ge=1, le=DEFAULT_QUERY_MAX_ROWS)
 
 
@@ -38,16 +47,24 @@ class QueryResult(BaseModel):
     redacted_columns: list[str] = Field(default_factory=list)
 
 
+class QueryObservationStatus(StrEnum):
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
+
 class QueryObservation(BaseModel):
     """Persisted audit metadata; raw database rows are intentionally excluded."""
 
     query_name: str
     purpose: str
-    returned_rows: int
-    truncated: bool
+    status: QueryObservationStatus = QueryObservationStatus.SUCCEEDED
+    stage: str | None = None
+    returned_rows: int = Field(default=0, ge=0)
+    truncated: bool = False
     redacted_columns: list[str] = Field(default_factory=list)
     sql_fingerprint: str | None = None
     parameter_names: list[str] = Field(default_factory=list)
+    error: str | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
