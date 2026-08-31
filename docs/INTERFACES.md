@@ -1,6 +1,6 @@
 # AutoCoding Engineer 接口与数据契约
 
-本文记录当前 `0.7.9` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
+本文记录当前 `0.7.10` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
 Runtime、持久化和状态契约。
 设计动机和运行流程见[架构说明](ARCHITECTURE.md)。
 
@@ -1177,3 +1177,29 @@ hermes chat --query-file - --toolsets web --skills <exact-name>
 Runtime 决策后计数归零。`MAX_SEARCH_REPAIR_ROUNDS=1` 因而约束的是一次连续违规链，而不是包含
 多轮页面查询、源码调查和业务数据查询的整个命令。不可纠正阻断以及同一链的第二次阻断仍直接
 进入失败状态。
+
+## 16. 异常附件发送与完成响应
+
+`IncidentAttachmentStore.prepare_for_send(attachment)` 只接受该 Store 隔离根目录中与附件 ID
+严格匹配的 `incident-screenshot.png`。它验证 PNG 内容、尺寸与 10 MiB 上限，并返回包含当前绝对
+路径和实际 `size_bytes` 的新 `MessageAttachment`；不会修改用户项目或原始剪贴板内容。桌面端在
+每次新建或继续异常对话前调用该方法，验证失败时保留待发附件并在状态栏提示重新粘贴。
+
+`IncidentOutcome.message` 和完成轮次的最终 Assistant 消息由宿主渲染为：
+
+```text
+结论
+<一句话结论>
+
+为什么出现这个异常
+<证据支持的因果说明>
+
+解决方法
+1. <具体修复或验证动作>
+
+结论置信度
+<百分比或模型未量化>
+```
+
+结构化字段 `diagnosis`、`recommended_actions` 和 `confidence` 仍分别保留，供 API、能力文档与审计
+使用。桌面元数据区域同步使用“为什么出现这个异常”和“解决方法”标签。

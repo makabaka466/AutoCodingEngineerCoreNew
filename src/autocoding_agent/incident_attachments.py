@@ -98,3 +98,62 @@ class IncidentAttachmentStore:
             media_type="image/png",
             size_bytes=size,
         )
+
+    def prepare_for_send(self, attachment: MessageAttachment) -> MessageAttachment:
+        """Revalidate an owned screenshot and refresh harmless stale file metadata.
+
+        Clipboard and image-provider implementations can finish updating file metadata after the
+        initial capture. The Engine intentionally keeps strict size validation, so the desktop
+        boundary reseals the current valid PNG immediately before handing it to the Engine.
+        """
+
+        try:
+            from PIL import Image, UnidentifiedImageError
+        except ImportError as exc:
+            raise IncidentAttachmentError(
+                "图片粘贴组件未安装，请重新运行启动脚本安装 Pillow。"
+            ) from exc
+
+        root = self.root.resolve()
+        try:
+            path = Path(attachment.path).expanduser().resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise IncidentAttachmentError(
+                f"异常截图已不可用，请移除后重新粘贴：{attachment.name}"
+            ) from exc
+        expected = (root / attachment.id / "incident-screenshot.png").resolve()
+        if path != expected or not path.is_relative_to(root) or not path.is_file():
+            raise IncidentAttachmentError(
+                f"异常截图不在 ACE 的隔离附件目录中：{attachment.name}"
+            )
+        size = path.stat().st_size
+        if size < 1 or size > MAX_ATTACHMENT_BYTES:
+            raise IncidentAttachmentError(
+                f"异常截图为空或超过 10 MiB，请重新粘贴：{attachment.name}"
+            )
+        try:
+            with Image.open(path) as image:
+                width, height = image.size
+                if width < 1 or height < 1 or width * height > MAX_ATTACHMENT_PIXELS:
+                    raise IncidentAttachmentError(
+                        f"异常截图尺寸无效或过大：{attachment.name}"
+                    )
+                if image.format != "PNG":
+                    raise IncidentAttachmentError(
+                        f"异常截图内容不是有效 PNG：{attachment.name}"
+                    )
+                image.verify()
+        except IncidentAttachmentError:
+            raise
+        except (OSError, UnidentifiedImageError) as exc:
+            raise IncidentAttachmentError(
+                f"异常截图已损坏，请移除后重新粘贴：{attachment.name}"
+            ) from exc
+        return attachment.model_copy(
+            update={
+                "path": str(path),
+                "name": path.name,
+                "media_type": "image/png",
+                "size_bytes": size,
+            }
+        )

@@ -282,6 +282,10 @@ def test_incident_flow_locates_page_queries_data_and_diagnoses(tmp_path: Path) -
     assert outcome.task_state == TaskState.COMPLETED
     assert outcome.page == _page()
     assert outcome.diagnosis == "Order 42 remains in the stuck state."
+    assert "结论\nThe order is stuck before fulfillment." in outcome.message
+    assert "为什么出现这个异常\nOrder 42 remains in the stuck state." in outcome.message
+    assert "解决方法\n1. Inspect the fulfillment event consumer." in outcome.message
+    assert "结论置信度\n90%" in outcome.message
     assert outcome.query_observations[0].returned_rows == 1
     assert database.queries == [query]
     assert len(runtime.turns) == 2

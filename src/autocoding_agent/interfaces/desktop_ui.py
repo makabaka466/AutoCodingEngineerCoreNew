@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import logging
 import os
 import queue
 import threading
@@ -67,6 +68,8 @@ from autocoding_agent.workspace_knowledge import (
     KnowledgeDomain,
     MarkdownKnowledgeService,
 )
+
+logger = logging.getLogger("autocoding_agent.desktop")
 
 COLORS = {
     "window": "#EEF3FA",
@@ -1935,7 +1938,7 @@ class DesktopClient:
                     details.append("关联代码")
                     details.extend(f"• {item}" for item in decision.page.related_paths)
             if decision.diagnosis:
-                details.append(f"诊断\n{decision.diagnosis}")
+                details.append(f"为什么出现这个异常\n{decision.diagnosis}")
             if decision.findings:
                 details.append("发现")
                 details.extend(f"• {item.summary}" for item in decision.findings)
@@ -1946,7 +1949,7 @@ class DesktopClient:
                 details.append("数据查询")
                 details.extend(_format_query_observation(item) for item in cycle_observations)
             if decision.recommended_actions:
-                details.append("建议动作")
+                details.append("解决方法")
                 details.extend(f"• {item}" for item in decision.recommended_actions)
             if decision.confidence is not None:
                 details.append(f"置信度\n{decision.confidence:.0%}")
@@ -2270,6 +2273,19 @@ class DesktopClient:
             return
         message = self.prompt_input.get("1.0", "end-1c").strip()
         attachments = list(self._pending_attachments)
+        if self.flow == FlowKind.INCIDENT and attachments:
+            try:
+                attachments = [
+                    self.attachment_store.prepare_for_send(item) for item in attachments
+                ]
+            except IncidentAttachmentError as exc:
+                logger.warning(
+                    "incident_attachment_prepare_failed session_id=%s error=%s",
+                    self.session_id,
+                    exc,
+                )
+                self.status_var.set(str(exc))
+                return
         if not message and self.flow == FlowKind.INCIDENT and attachments:
             message = "请根据粘贴的异常界面截图定位并诊断问题。"
         if not message:
@@ -2536,6 +2552,11 @@ class DesktopClient:
             try:
                 self._result_queue.put(("success", operation()))
             except Exception as exc:
+                logger.exception(
+                    "desktop_operation_failed flow=%s session_id=%s",
+                    self.flow.value,
+                    self.session_id,
+                )
                 self._result_queue.put(("error", exc))
 
         threading.Thread(target=worker, name="agent-turn", daemon=True).start()

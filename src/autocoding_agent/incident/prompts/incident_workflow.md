@@ -131,6 +131,12 @@ database evidence when used, diagnosis or bounded candidate causes, confidence, 
 action, and whether the pattern is a useful future automation candidate. It is valid to say the
 root cause is not proven.
 
+Every `completed` decision must be directly useful to the user: make `message` a one-sentence final
+conclusion, make `diagnosis` explain why the exception happened as an evidence-backed causal chain,
+and provide at least one concrete item in `recommended_actions`. Clearly label the conclusion as a
+confirmed root cause, high-probability cause, or hypothesis requiring verification. When evidence is
+incomplete, give the safest verification step as part of the solution instead of overstating certainty.
+
 A completed incident may be reopened by a later user message. Treat it as a new investigation cycle
 in the same conversation: reuse relevant history and page context, but recheck current code and
 authorized data. Intermediate questions and database rounds do not create separate completed

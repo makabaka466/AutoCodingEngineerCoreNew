@@ -630,7 +630,7 @@ class IncidentEngine:
                     content=(
                         "Agent 已形成最小只读查询计划，正在自动核对数据库证据。"
                         if decision.status == IncidentStatus.QUERY_REQUIRED
-                        else decision.message
+                        else _user_facing_decision_message(decision)
                     ),
                 )
             )
@@ -1485,7 +1485,7 @@ class IncidentEngine:
             status=session.status,
             task_state=session.task_state,
             cycle_number=session.cycle_number,
-            message=decision.message,
+            message=_user_facing_decision_message(decision),
             question=decision.question,
             page=decision.page,
             diagnosis=decision.diagnosis,
@@ -1562,6 +1562,28 @@ Available database schema metadata for the current configured connection:
 Return only the structured result required by the supplied JSON Schema. Keep the user-facing
 message concise Markdown.{retrieved_note}
 """
+
+
+def _user_facing_decision_message(decision: IncidentDecision) -> str:
+    """Guarantee a complete, readable conclusion for every completed investigation."""
+
+    if decision.status != IncidentStatus.COMPLETED:
+        return decision.message
+    recommended_actions = decision.recommended_actions or [
+        "当前结论未包含可安全执行的修改方案；请补充缺失的运行证据后继续诊断。"
+    ]
+    actions = "\n".join(
+        f"{index}. {action}" for index, action in enumerate(recommended_actions, 1)
+    )
+    confidence = (
+        f"{decision.confidence:.0%}" if decision.confidence is not None else "模型未量化"
+    )
+    return (
+        f"结论\n{decision.message}\n\n"
+        f"为什么出现这个异常\n{decision.diagnosis}\n\n"
+        f"解决方法\n{actions}\n\n"
+        f"结论置信度\n{confidence}"
+    )
 
 
 def _source_search_enabled(session: IncidentSession) -> bool:

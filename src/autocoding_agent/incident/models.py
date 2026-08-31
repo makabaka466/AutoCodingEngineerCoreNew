@@ -72,7 +72,12 @@ class IncidentDecision(BaseModel):
     """One model decision in the incident investigation state machine."""
 
     status: IncidentStatus
-    message: NonEmptyText
+    message: NonEmptyText = Field(
+        description=(
+            "Concise user-facing summary. For completed decisions, state the final conclusion "
+            "in one sentence; put the causal explanation in diagnosis."
+        )
+    )
     question: NonEmptyText | None = None
     page: LocatedPage | None = Field(
         default=None,
@@ -89,9 +94,21 @@ class IncidentDecision(BaseModel):
         ),
     )
     queries: list[DataQuery] = Field(default_factory=list, max_length=5)
-    diagnosis: NonEmptyText | None = None
+    diagnosis: NonEmptyText | None = Field(
+        default=None,
+        description=(
+            "Why the incident happened, including the evidence-backed causal chain and an "
+            "explicit certainty level when the root cause is not fully proven."
+        ),
+    )
     findings: list[IncidentFinding] = Field(default_factory=list)
-    recommended_actions: list[NonEmptyText] = Field(default_factory=list)
+    recommended_actions: list[NonEmptyText] = Field(
+        default_factory=list,
+        description=(
+            "Concrete solutions or safe verification steps. At least one is required when the "
+            "incident is completed."
+        ),
+    )
     confidence: float | None = Field(default=None, ge=0, le=1)
     automation_candidate: bool = False
     hermes_skill: HermesSkillRequest | None = None

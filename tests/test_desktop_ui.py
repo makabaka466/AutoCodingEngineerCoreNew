@@ -941,6 +941,9 @@ def test_incident_screenshot_paste_attaches_image_and_allows_image_only_send(
         def capture_clipboard_image(self) -> MessageAttachment:
             return attachment
 
+        def prepare_for_send(self, candidate: MessageAttachment) -> MessageAttachment:
+            return candidate
+
     incident_application = FakeIncidentApplication()
     client = DesktopClient(
         root,
