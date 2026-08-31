@@ -765,6 +765,80 @@ def test_incident_flow_stops_after_one_source_search_policy_correction(
     ) == 1
 
 
+def test_incident_flow_allows_one_correction_in_each_successful_stage(
+    tmp_path: Path,
+) -> None:
+    query = DataQuery(
+        name="upload_log_rows",
+        purpose="Inspect bounded upload-log evidence.",
+        sql="SELECT id, status FROM orders WHERE id = :id",
+        parameters={"id": 42},
+    )
+
+    class TwoStageRecoveringRuntime:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def run_structured(
+            self,
+            turn: RuntimeTurn,
+            response_model: type[IncidentDecision],
+        ) -> StructuredRuntimeResult[IncidentDecision]:
+            assert response_model is IncidentDecision
+            self.calls += 1
+            if self.calls in {1, 3}:
+                raise RuntimePolicyBlockedError(
+                    "blocked Grep",
+                    policy="bounded_source_search",
+                    operation="Grep",
+                    reason=(
+                        "Grep 必须设置 1..100 的 head_limit"
+                        if self.calls == 1
+                        else "目录级 Grep 必须提供 glob 或 type 文件过滤器"
+                    ),
+                    retryable=True,
+                )
+            if self.calls == 2:
+                return StructuredRuntimeResult(
+                    output=IncidentDecision(
+                        status=IncidentStatus.QUERY_REQUIRED,
+                        message="The page is verified; checking the affected log rows.",
+                        page=_page(),
+                        query_stage=IncidentQueryStage.BUSINESS_DATA,
+                        queries=[query],
+                    ),
+                    runtime_session_id=turn.session_id,
+                    usage=AgentUsage(input_tokens=10, output_tokens=5, turns=1),
+                )
+            return StructuredRuntimeResult(
+                output=IncidentDecision(
+                    status=IncidentStatus.COMPLETED,
+                    message="Diagnosis complete after both bounded corrections.",
+                    page=_page(),
+                    diagnosis="The code and bounded log row explain the symptom.",
+                ),
+                runtime_session_id=turn.session_id,
+                usage=AgentUsage(input_tokens=10, output_tokens=5, turns=1),
+            )
+
+    workspace = tmp_path / "workspace-multi-stage-search-repair"
+    workspace.mkdir()
+    runtime = TwoStageRecoveringRuntime()
+    database = FakeDatabase()
+    store = JsonIncidentStore(tmp_path / "data-multi-stage-search-repair")
+    engine = IncidentEngine(runtime, store, database)
+
+    outcome = engine.start(workspace, "The upload page does not save a log")
+
+    assert outcome.status == IncidentStatus.COMPLETED
+    assert runtime.calls == 4
+    assert database.queries == [query]
+    saved = store.load(outcome.session_id)
+    assert sum(
+        event.type == EventType.POLICY_REPAIR_REQUESTED for event in saved.events
+    ) == 2
+
+
 def test_incident_image_attachment_is_persisted_and_mounted_read_only(
     tmp_path: Path,
 ) -> None:

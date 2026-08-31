@@ -1,6 +1,6 @@
 # AutoCoding Engineer 接口与数据契约
 
-本文记录当前 `0.7.8` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
+本文记录当前 `0.7.9` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
 Runtime、持久化和状态契约。
 设计动机和运行流程见[架构说明](ARCHITECTURE.md)。
 
@@ -1169,3 +1169,11 @@ hermes chat --query-file - --toolsets web --skills <exact-name>
 调用失败不把任务置为 failed；Engine 把脱敏错误回给 Claude，要求依靠当前代码、RAG 和授权数据
 继续。只有模型在本命令预算耗尽后仍重复请求 Hermes，才作为结构化协议违例结束该命令，避免
 无限 Agent 循环。
+
+## 15. 搜索策略纠正周期
+
+开发与异常 Engine 在只读调查中维护 `consecutive_search_repair_rounds`。收到可纠正的
+`RuntimePolicyBlockedError` 后写入 `policy_repair_requested` 并重试；收到任意通过结构校验的
+Runtime 决策后计数归零。`MAX_SEARCH_REPAIR_ROUNDS=1` 因而约束的是一次连续违规链，而不是包含
+多轮页面查询、源码调查和业务数据查询的整个命令。不可纠正阻断以及同一链的第二次阻断仍直接
+进入失败状态。

@@ -642,7 +642,7 @@ class AgentEngine:
             progress_sink,
         )
         hermes_skill_rounds = 0
-        search_repair_rounds = 0
+        consecutive_search_repair_rounds = 0
 
         while True:
             existing_runtime_session_id = session.runtime_session_id
@@ -723,9 +723,9 @@ class AgentEngine:
                     isinstance(exc, RuntimePolicyBlockedError)
                     and mode == AgentMode.INSPECT
                     and exc.retryable
-                    and search_repair_rounds < MAX_SEARCH_REPAIR_ROUNDS
+                    and consecutive_search_repair_rounds < MAX_SEARCH_REPAIR_ROUNDS
                 ):
-                    search_repair_rounds += 1
+                    consecutive_search_repair_rounds += 1
                     session.events.append(
                         AgentEvent(
                             type=EventType.POLICY_REPAIR_REQUESTED,
@@ -739,7 +739,7 @@ class AgentEngine:
                                 "policy": exc.policy,
                                 "operation": exc.operation,
                                 "reason": exc.reason,
-                                "repair_round": search_repair_rounds,
+                                "repair_round": consecutive_search_repair_rounds,
                                 "workflow": "development",
                             },
                         )
@@ -771,6 +771,10 @@ class AgentEngine:
                         command.id,
                     )
                 return self._fail(session, str(exc), command.id)
+
+            # A validated Runtime decision ends the previous correction chain. A later,
+            # independent inspect turn may receive its own single bounded correction.
+            consecutive_search_repair_rounds = 0
 
             self._finish_runtime_run(
                 session,

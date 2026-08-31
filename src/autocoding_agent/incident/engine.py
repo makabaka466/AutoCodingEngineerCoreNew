@@ -414,7 +414,7 @@ class IncidentEngine:
             progress_sink,
         )
         hermes_skill_rounds = 0
-        search_repair_rounds = 0
+        consecutive_search_repair_rounds = 0
 
         while True:
             session.updated_at = utc_now()
@@ -455,10 +455,13 @@ class IncidentEngine:
                     str(exc),
                     command.id,
                 )
-                if not exc.retryable or search_repair_rounds >= MAX_SEARCH_REPAIR_ROUNDS:
+                if (
+                    not exc.retryable
+                    or consecutive_search_repair_rounds >= MAX_SEARCH_REPAIR_ROUNDS
+                ):
                     self.sessions.save(session)
                     return self._fail(session, str(exc), command)
-                search_repair_rounds += 1
+                consecutive_search_repair_rounds += 1
                 session.events.append(
                     AgentEvent(
                         type=EventType.POLICY_REPAIR_REQUESTED,
@@ -470,7 +473,7 @@ class IncidentEngine:
                             "policy": exc.policy,
                             "operation": exc.operation,
                             "reason": exc.reason,
-                            "repair_round": search_repair_rounds,
+                            "repair_round": consecutive_search_repair_rounds,
                             "workflow": "incident",
                         },
                     )
@@ -498,6 +501,10 @@ class IncidentEngine:
                 )
                 self.sessions.save(session)
                 return self._fail(session, str(exc), command)
+
+            # A validated Runtime decision ends the previous correction chain. A later,
+            # independent model turn may receive its own single bounded correction.
+            consecutive_search_repair_rounds = 0
 
             if decision.page is not None and decision.page.source_paths:
                 session.located_page = decision.page
