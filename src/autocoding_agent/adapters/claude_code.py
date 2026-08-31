@@ -23,12 +23,34 @@ from autocoding_agent.config import Settings, resolve_claude_command
 from autocoding_agent.core.models import AgentDecision, AgentUsage, RuntimeResult, RuntimeTurn
 from autocoding_agent.core.runtime.models import RuntimeActivity, RuntimeEventKind
 from autocoding_agent.core.search_policy import BoundedSearchGuard, SearchPolicyViolation
-from autocoding_agent.ports.runtime import RuntimeEventSink, RuntimeInterruptedError
+from autocoding_agent.ports.runtime import (
+    RuntimeEventSink,
+    RuntimeInterruptedError,
+    RuntimePolicyBlockedError,
+)
 from autocoding_agent.ports.structured_runtime import StructuredRuntimeResult
 
 
 class ClaudeCodeError(RuntimeError):
     """A recoverable, user-facing runtime failure."""
+
+
+class ClaudeCodeSearchPolicyError(ClaudeCodeError, RuntimePolicyBlockedError):
+    """A native source-search call was blocked before ACE accepted its result."""
+
+    def __init__(self, violation: SearchPolicyViolation) -> None:
+        message = (
+            "ACE 已阻止范围过大的源码搜索。"
+            f"{violation.reason}。请缩小到明确文件名、类名或候选子目录后重试。"
+        )
+        RuntimePolicyBlockedError.__init__(
+            self,
+            message,
+            policy="bounded_source_search",
+            operation=violation.tool_name,
+            reason=violation.reason,
+            retryable=violation.retryable,
+        )
 
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
@@ -272,10 +294,7 @@ class ClaudeCodeRuntime:
                         violation.reason,
                     )
                     self._terminate_process(process)
-                    raise ClaudeCodeError(
-                        "ACE 已阻止范围过大的源码搜索。"
-                        f"{violation.reason}。请缩小到明确文件名、类名或候选子目录后重试。"
-                    )
+                    raise ClaudeCodeSearchPolicyError(violation)
                 for activity in _stream_activities(
                     envelope,
                     run_id=run_id,

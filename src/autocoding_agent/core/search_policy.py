@@ -14,6 +14,7 @@ from typing import Any
 
 MAX_SEARCH_CALLS_PER_TURN = 8
 MAX_GREP_RESULTS = 100
+MAX_SEARCH_REPAIR_ROUNDS = 1
 
 BOUNDED_SEARCH_RULES = f"""## Bounded source search
 
@@ -42,6 +43,7 @@ class SearchPolicyViolation:
 
     tool_name: str
     reason: str
+    retryable: bool = False
 
 
 class BoundedSearchGuard:
@@ -97,6 +99,7 @@ class BoundedSearchGuard:
             return self._violation(
                 tool_name,
                 "禁止通配整个项目；请根据类名、文件名、路由或已知子目录缩小范围",
+                retryable=True,
             )
         return None
 
@@ -121,6 +124,7 @@ class BoundedSearchGuard:
             return self._violation(
                 tool_name,
                 f"Grep 必须设置 1..{MAX_GREP_RESULTS} 的 head_limit",
+                retryable=True,
             )
 
         exact_file = self._resolved_path(path_value).is_file() if path_value else False
@@ -131,6 +135,7 @@ class BoundedSearchGuard:
             return self._violation(
                 tool_name,
                 "目录级 Grep 必须提供 glob 或 type 文件过滤器",
+                retryable=True,
             )
         return None
 
@@ -145,8 +150,30 @@ class BoundedSearchGuard:
         return candidate.resolve()
 
     @staticmethod
-    def _violation(tool_name: str, reason: str) -> SearchPolicyViolation:
-        return SearchPolicyViolation(tool_name=tool_name, reason=reason)
+    def _violation(
+        tool_name: str,
+        reason: str,
+        *,
+        retryable: bool = False,
+    ) -> SearchPolicyViolation:
+        return SearchPolicyViolation(
+            tool_name=tool_name,
+            reason=reason,
+            retryable=retryable,
+        )
+
+
+def search_policy_repair_prompt(operation: str, reason: str) -> str:
+    """Return one bounded correction request without echoing raw tool arguments."""
+
+    return (
+        f"The host blocked your previous {operation} source-search call and accepted no results. "
+        f"Sanitized reason: {reason}. Correct the smallest search call yourself; do not ask the "
+        "user to search. Keep the verified page/file evidence and do not widen the scope. For a "
+        "directory Grep, include a language-appropriate glob or type plus head_limit 1..100; "
+        "prefer an exact known file whenever possible. Continue the same investigation after the "
+        "corrected read-only search."
+    )
 
 
 def _normalized_glob(pattern: str) -> str:

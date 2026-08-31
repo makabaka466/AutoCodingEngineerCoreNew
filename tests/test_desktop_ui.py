@@ -806,6 +806,9 @@ def test_light_theme_and_configured_workspace_keep_composer_compact(
     assert client.transcript.bind("<Button-3>")
     client._select_all_transcript()
     assert client.transcript.tag_ranges("sel")
+    tags = list(client.transcript.tag_names())
+    assert tags.index("sel") > tags.index("assistant_message")
+    assert tags.index("sel") > tags.index("user_message")
     assert client.status_badge.cget("highlightthickness") == 1
     assert COLORS["progress_accent"] == "#667EEA"
     assert client.activity_frame.cget("background") == COLORS["progress_accent_soft"]

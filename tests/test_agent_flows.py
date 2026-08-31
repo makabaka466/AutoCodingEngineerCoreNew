@@ -42,6 +42,7 @@ from autocoding_agent.knowledge_rag.models import (
     KnowledgeRetrievalResult,
     KnowledgeSourceType,
 )
+from autocoding_agent.ports.runtime import RuntimePolicyBlockedError
 
 
 class ScriptedRuntime:
@@ -700,6 +701,44 @@ def test_first_turn_failure_preserves_preallocated_runtime_session(tmp_path: Pat
 
     assert outcome.status == AgentStatus.FAILED
     assert session.runtime_session_id == session.id
+
+
+def test_development_inspect_retries_one_correctable_source_search_block(
+    tmp_path: Path,
+) -> None:
+    class RecoveringRuntime:
+        def __init__(self) -> None:
+            self.turns: list[RuntimeTurn] = []
+
+        def run(self, turn: RuntimeTurn) -> RuntimeResult:
+            self.turns.append(turn)
+            if len(self.turns) == 1:
+                raise RuntimePolicyBlockedError(
+                    "blocked Grep",
+                    policy="bounded_source_search",
+                    operation="Grep",
+                    reason="目录级 Grep 必须提供 glob 或 type 文件过滤器",
+                    retryable=True,
+                )
+            return RuntimeResult(
+                decision=_completed("Completed after a corrected narrow search."),
+                runtime_session_id=turn.session_id,
+            )
+
+    workspace = tmp_path / "repo-search-repair"
+    workspace.mkdir()
+    runtime = RecoveringRuntime()
+    app = build_application(settings=_settings(tmp_path / "state-search-repair"), runtime=runtime)
+
+    outcome = app.start(workspace, "Inspect the upload-log code path.")
+
+    assert outcome.status == AgentStatus.COMPLETED
+    assert len(runtime.turns) == 2
+    assert "include a language-appropriate glob or type" in runtime.turns[1].user_message
+    session = app.get_session(outcome.session_id)
+    assert any(
+        event.type == EventType.POLICY_REPAIR_REQUESTED for event in session.events
+    )
 
 
 def test_completed_capability_is_idempotent_and_redacts_sensitive_data(tmp_path: Path) -> None:

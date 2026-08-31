@@ -1121,6 +1121,9 @@ class DesktopClient:
             spacing1=9,
             spacing3=9,
         )
+        # Role tags paint card backgrounds. Keep Tk's special selection tag above them so
+        # selected message bodies are as visible as selected sender headings.
+        self.transcript.tag_raise("sel")
         self.transcript.configure(state="disabled")
         self.transcript.bind("<Button-1>", self._focus_transcript, add="+")
         self.transcript.bind("<Control-c>", self._copy_selected_transcript)

@@ -13,6 +13,25 @@ class RuntimeInterruptedError(RuntimeError):
     """The host intentionally interrupted an active Runtime process."""
 
 
+class RuntimePolicyBlockedError(RuntimeError):
+    """A Runtime operation was stopped at a host policy boundary."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        policy: str,
+        operation: str,
+        reason: str,
+        retryable: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.policy = policy
+        self.operation = operation
+        self.reason = reason
+        self.retryable = retryable
+
+
 class AgentRuntime(Protocol):
     def run(self, turn: RuntimeTurn) -> RuntimeResult:
         """Execute one model turn and return a validated decision."""

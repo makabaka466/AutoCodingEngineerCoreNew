@@ -22,6 +22,7 @@ from autocoding_agent.config import Settings
 from autocoding_agent.core.models import AgentMode, RuntimeTurn
 from autocoding_agent.core.runtime.models import RuntimeEventKind
 from autocoding_agent.incident.models import IncidentDecision, IncidentStatus
+from autocoding_agent.ports.runtime import RuntimePolicyBlockedError
 
 
 def _settings(tmp_path: Path, **overrides: object) -> Settings:
@@ -548,9 +549,12 @@ def test_observed_runtime_blocks_repository_wide_glob(tmp_path: Path) -> None:
     runtime = ClaudeCodeRuntime(_settings(tmp_path), popen_factory=popen_factory)
     activities = []
 
-    with pytest.raises(ClaudeCodeError, match="范围过大的源码搜索"):
+    with pytest.raises(ClaudeCodeError, match="范围过大的源码搜索") as error:
         runtime.run_observed(_turn(tmp_path), "run-broad-glob", activities.append)
 
+    assert isinstance(error.value, RuntimePolicyBlockedError)
+    assert error.value.retryable is True
+    assert error.value.operation == "Glob"
     assert activities[-1].kind == RuntimeEventKind.POLICY_BLOCKED
     assert activities[-1].tool_name == "Glob"
     assert activities[-1].data["pattern"] == "**/*"

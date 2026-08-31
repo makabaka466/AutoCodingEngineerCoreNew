@@ -1,6 +1,6 @@
 # AutoCoding Engineer 接口与数据契约
 
-本文记录当前 `0.7.7` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
+本文记录当前 `0.7.8` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
 Runtime、持久化和状态契约。
 设计动机和运行流程见[架构说明](ARCHITECTURE.md)。
 
@@ -130,7 +130,8 @@ def build_application(
 - `EventType`：除任务、状态、输入、审批、完成、失败、能力和数据库事件外，还包括
   `runtime_started/activity/completed/failed/interrupted`、`tool_started/finished`、
   `code_modified`、`test_executed`、`verification_failed`、`recovery_required`、
-  `decision_recorded/repaired`、`artifact_recorded/failed`、`task_reopened`。
+  `decision_recorded/repaired`、`policy_repair_requested`、`artifact_recorded/failed`、
+  `task_reopened`。
 - `RecoveryAction`：`read_only_inspect`、`replan`、`cancel`。
 
 ## 3. 结构化模型契约
@@ -516,7 +517,10 @@ Runner/Popen 时跳过本机路径恢复，保留可替换 Runtime 的确定性�
 调用：单轮组合预算为 8 次；Glob 不接受通配整个仓库或递归全扩展模式；目录级 Grep 必须设置
 `glob/type` 和 `head_limit=1..100`；显式搜索路径必须位于 workspace、能力目录或附件目录。
 违反策略会产生 `RuntimeEventKind.POLICY_BLOCKED`，审计中只保存工具名、脱敏后的范围信息和阻断
-原因，不保存源码正文。
+原因，不保存源码正文。`RuntimePolicyBlockedError` 还携带 policy、operation、脱敏 reason 和是否
+允许纠正；inspect Engine 对可纠正错误最多自动重试一次，并产生 `policy_repair_requested`。修正
+轮次仍复用同一 Runtime Session；不可纠正错误和第二次违规保持终止行为。implement/verify 不自动
+重试，因为中断时可能存在副作用不确定性。
 
 异常 `RuntimeTurn` 的工具列表按页面定位证据动态生成：当前 cycle 尚无成功且非空的
 `page_lookup` observation 时为 `Read`；有候选后为 `Read,Glob,Grep`。成功但 0 行的精确页面查询
@@ -749,7 +753,8 @@ autocoding-agent-client
 - 统一系统配置和本地滚动日志目录快捷入口；
 - 新任务、持久化聊天记录及同一 session 的多轮补充；
 - 对话记录整体保持只读但允许鼠标选取；支持 `Ctrl+C` 复制、`Ctrl+A` 全选，以及右键
-  `复制所选文本` / `全选对话`，选区不会因打开右键菜单而丢失；
+  `复制所选文本` / `全选对话`，选区不会因打开右键菜单而丢失；选择标签位于消息正文背景之上，
+  标题和正文都会显示相同的紫蓝色高亮；
 - `approval_required` 的完整修改方案、当前/目标状态、影响、验证计划、预览，以及批准或调整；
 - `recovery_required` 的只读检查、重新规划和取消恢复卡，并显示当前 TaskState；
 - evidence、changed files、测试摘要和能力文档路径；

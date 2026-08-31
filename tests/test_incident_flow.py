@@ -47,6 +47,7 @@ from autocoding_agent.knowledge_rag.models import (
     KnowledgeRetrievalResult,
     KnowledgeSourceType,
 )
+from autocoding_agent.ports.runtime import RuntimePolicyBlockedError
 from autocoding_agent.ports.structured_runtime import StructuredRuntimeResult
 
 
@@ -670,6 +671,98 @@ def test_incident_flow_restores_verified_page_when_model_omits_it(
         IncidentQueryStage.BUSINESS_DATA.value,
         IncidentQueryStage.BUSINESS_DATA.value,
     ]
+
+
+def test_incident_flow_retries_one_correctable_source_search_policy_block(
+    tmp_path: Path,
+) -> None:
+    class RecoveringRuntime:
+        def __init__(self) -> None:
+            self.turns: list[RuntimeTurn] = []
+
+        def run_structured(
+            self,
+            turn: RuntimeTurn,
+            response_model: type[IncidentDecision],
+        ) -> StructuredRuntimeResult[IncidentDecision]:
+            assert response_model is IncidentDecision
+            self.turns.append(turn)
+            if len(self.turns) == 1:
+                raise RuntimePolicyBlockedError(
+                    "blocked Grep",
+                    policy="bounded_source_search",
+                    operation="Grep",
+                    reason="目录级 Grep 必须提供 glob 或 type 文件过滤器",
+                    retryable=True,
+                )
+            return StructuredRuntimeResult(
+                output=IncidentDecision(
+                    status=IncidentStatus.COMPLETED,
+                    message="Diagnosis complete after the corrected narrow search.",
+                    page=_page(),
+                    diagnosis="The verified code path explains the missing log.",
+                ),
+                runtime_session_id=turn.session_id,
+                usage=AgentUsage(input_tokens=10, output_tokens=5, turns=1),
+            )
+
+    workspace = tmp_path / "workspace-search-repair"
+    workspace.mkdir()
+    runtime = RecoveringRuntime()
+    store = JsonIncidentStore(tmp_path / "data-search-repair")
+    engine = IncidentEngine(runtime, store, None)
+
+    outcome = engine.start(workspace, "The upload page does not save a log")
+
+    assert outcome.status == IncidentStatus.COMPLETED
+    assert len(runtime.turns) == 2
+    assert runtime.turns[1].runtime_session_id == outcome.session_id
+    assert "include a language-appropriate glob or type" in runtime.turns[1].user_message
+    saved = store.load(outcome.session_id)
+    repair_events = [
+        event for event in saved.events if event.type == EventType.POLICY_REPAIR_REQUESTED
+    ]
+    assert len(repair_events) == 1
+    assert repair_events[0].data["operation"] == "Grep"
+    assert any("正在自动要求 Agent 缩小范围" in item.content for item in saved.messages)
+
+
+def test_incident_flow_stops_after_one_source_search_policy_correction(
+    tmp_path: Path,
+) -> None:
+    class RepeatedlyBlockedRuntime:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def run_structured(
+            self,
+            turn: RuntimeTurn,
+            response_model: type[IncidentDecision],
+        ) -> StructuredRuntimeResult[IncidentDecision]:
+            assert response_model is IncidentDecision
+            self.calls += 1
+            raise RuntimePolicyBlockedError(
+                "blocked Grep",
+                policy="bounded_source_search",
+                operation="Grep",
+                reason="目录级 Grep 必须提供 glob 或 type 文件过滤器",
+                retryable=True,
+            )
+
+    workspace = tmp_path / "workspace-search-repair-limit"
+    workspace.mkdir()
+    runtime = RepeatedlyBlockedRuntime()
+    store = JsonIncidentStore(tmp_path / "data-search-repair-limit")
+    engine = IncidentEngine(runtime, store, None)
+
+    outcome = engine.start(workspace, "The upload page does not save a log")
+
+    assert outcome.status == IncidentStatus.FAILED
+    assert runtime.calls == 2
+    saved = store.load(outcome.session_id)
+    assert sum(
+        event.type == EventType.POLICY_REPAIR_REQUESTED for event in saved.events
+    ) == 1
 
 
 def test_incident_image_attachment_is_persisted_and_mounted_read_only(

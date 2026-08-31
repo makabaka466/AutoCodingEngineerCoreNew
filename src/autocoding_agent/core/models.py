@@ -82,6 +82,7 @@ class EventType(StrEnum):
     RECOVERY_REQUIRED = "recovery_required"
     DECISION_RECORDED = "decision_recorded"
     DECISION_REPAIRED = "decision_repaired"
+    POLICY_REPAIR_REQUESTED = "policy_repair_requested"
     ARTIFACT_RECORDED = "artifact_recorded"
     ARTIFACT_FAILED = "artifact_failed"
     INPUT_REQUIRED = "input_required"

@@ -54,6 +54,8 @@ def test_grep_requires_bounded_output_and_file_scope(tmp_path: Path) -> None:
 
     assert no_limit is not None and "head_limit" in no_limit.reason
     assert no_filter is not None and "glob 或 type" in no_filter.reason
+    assert no_limit.retryable is True
+    assert no_filter.retryable is True
     assert allowed is None
 
 
@@ -92,6 +94,7 @@ def test_search_path_cannot_escape_authorized_roots(tmp_path: Path) -> None:
 
     assert violation is not None
     assert "超出项目" in violation.reason
+    assert violation.retryable is False
 
 
 def test_combined_search_call_budget_is_enforced(tmp_path: Path) -> None:

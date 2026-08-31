@@ -52,6 +52,10 @@ from autocoding_agent.core.runtime.models import (
     RuntimeEventKind,
     RuntimeRunRecord,
 )
+from autocoding_agent.core.search_policy import (
+    MAX_SEARCH_REPAIR_ROUNDS,
+    search_policy_repair_prompt,
+)
 from autocoding_agent.core.state_machine.machine import AgentStateMachine
 from autocoding_agent.core.state_machine.models import (
     AgentCommand,
@@ -65,7 +69,11 @@ from autocoding_agent.knowledge_rag.ports import KnowledgeRetriever
 from autocoding_agent.knowledge_rag.service import workspace_id_for
 from autocoding_agent.ports.database import DatabaseReader
 from autocoding_agent.ports.hermes_skills import HermesSkillService
-from autocoding_agent.ports.runtime import AgentRuntime, RuntimeInterruptedError
+from autocoding_agent.ports.runtime import (
+    AgentRuntime,
+    RuntimeInterruptedError,
+    RuntimePolicyBlockedError,
+)
 from autocoding_agent.ports.session_store import SessionStore
 from autocoding_agent.skills import SkillRegistry
 
@@ -634,6 +642,7 @@ class AgentEngine:
             progress_sink,
         )
         hermes_skill_rounds = 0
+        search_repair_rounds = 0
 
         while True:
             existing_runtime_session_id = session.runtime_session_id
@@ -710,6 +719,48 @@ class AgentEngine:
                     command.id,
                 )
                 self.sessions.save(session)
+                if (
+                    isinstance(exc, RuntimePolicyBlockedError)
+                    and mode == AgentMode.INSPECT
+                    and exc.retryable
+                    and search_repair_rounds < MAX_SEARCH_REPAIR_ROUNDS
+                ):
+                    search_repair_rounds += 1
+                    session.events.append(
+                        AgentEvent(
+                            type=EventType.POLICY_REPAIR_REQUESTED,
+                            message=(
+                                "Requested one bounded correction after a blocked source search."
+                            ),
+                            actor="host",
+                            command_id=command.id,
+                            correlation_id=run.id,
+                            data={
+                                "policy": exc.policy,
+                                "operation": exc.operation,
+                                "reason": exc.reason,
+                                "repair_round": search_repair_rounds,
+                                "workflow": "development",
+                            },
+                        )
+                    )
+                    session.messages.append(
+                        ChatMessage(
+                            role=MessageRole.SYSTEM,
+                            content=(
+                                "ACE blocked one out-of-policy source search and accepted no "
+                                "results; it is asking the Agent to retry with a narrower "
+                                "read-only search."
+                            ),
+                        )
+                    )
+                    pending_message = search_policy_repair_prompt(
+                        exc.operation,
+                        exc.reason,
+                    )
+                    session.updated_at = utc_now()
+                    self.sessions.save(session)
+                    continue
                 if mode == AgentMode.IMPLEMENT:
                     self._try_record_post_implementation(session, command.id)
                 if mode in {AgentMode.IMPLEMENT, AgentMode.VERIFY}:
