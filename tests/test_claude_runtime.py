@@ -260,6 +260,70 @@ def test_runtime_invocation_uses_workspace_timeout_and_utf8(tmp_path: Path) -> N
         assert startupinfo.dwFlags & subprocess.STARTF_USESHOWWINDOW
 
 
+def test_real_runtime_recovers_a_stale_configured_command(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recovered = tmp_path / ("claude.exe" if os.name == "nt" else "claude")
+    recovered.touch()
+    runtime = ClaudeCodeRuntime(_settings(tmp_path, claude_command="C:/stale/claude.exe"))
+    monkeypatch.setattr(
+        "autocoding_agent.adapters.claude_code.resolve_claude_command",
+        lambda _configured: str(recovered),
+    )
+    turn = _turn(tmp_path)
+
+    prepared = runtime._prepare_launch_command(
+        [runtime.settings.claude_command, "--version"],
+        turn,
+        validate=True,
+    )
+
+    assert prepared == [str(recovered), "--version"]
+
+
+def test_real_runtime_reports_missing_workspace_separately(tmp_path: Path) -> None:
+    runtime = ClaudeCodeRuntime(_settings(tmp_path, claude_command=sys.executable))
+    turn = _turn(tmp_path)
+    Path(turn.workspace).rmdir()
+
+    with pytest.raises(ClaudeCodeError, match="项目目录不存在或不可访问"):
+        runtime._prepare_launch_command(
+            [runtime.settings.claude_command, "--version"],
+            turn,
+            validate=True,
+        )
+
+
+def test_real_runtime_reports_missing_executable_separately(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    missing = tmp_path / "missing-claude.exe"
+    runtime = ClaudeCodeRuntime(_settings(tmp_path, claude_command=str(missing)))
+    monkeypatch.setattr(
+        "autocoding_agent.adapters.claude_code.resolve_claude_command",
+        lambda _configured: str(missing),
+    )
+
+    with pytest.raises(ClaudeCodeError, match="Claude Code 程序不存在或不可访问"):
+        runtime._prepare_launch_command(
+            [runtime.settings.claude_command, "--version"],
+            _turn(tmp_path),
+            validate=True,
+        )
+
+
+def test_runtime_reports_other_process_start_errors(tmp_path: Path) -> None:
+    def runner(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        raise OSError("access denied")
+
+    runtime = ClaudeCodeRuntime(_settings(tmp_path), runner=runner)
+
+    with pytest.raises(ClaudeCodeError, match="Claude Code 进程启动失败：access denied"):
+        runtime.run(_turn(tmp_path))
+
+
 def test_runtime_error_redacts_provider_credentials(tmp_path: Path) -> None:
     secret = "sk-1234567890abcdefghijkl"
 

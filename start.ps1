@@ -30,7 +30,8 @@ if ($LASTEXITCODE -ne 0) {
     throw "AutoCoding Engineer requires Python 3.12 or newer."
 }
 
-# Import user variables so configuration changes work without reopening the terminal.
+# The configuration page persists these values for the Windows user. Always refresh the
+# launcher process from that source so a long-lived Explorer/terminal cannot pass stale values.
 $environmentNames = @(
     "ANTHROPIC_BASE_URL",
     "ANTHROPIC_AUTH_TOKEN",
@@ -40,12 +41,9 @@ $environmentNames = @(
     "AUTO_CODING_CLAUDE_MODEL"
 )
 foreach ($name in $environmentNames) {
-    $currentValue = [Environment]::GetEnvironmentVariable($name, "Process")
-    if ([string]::IsNullOrWhiteSpace($currentValue)) {
-        $userValue = [Environment]::GetEnvironmentVariable($name, "User")
-        if (-not [string]::IsNullOrWhiteSpace($userValue)) {
-            [Environment]::SetEnvironmentVariable($name, $userValue, "Process")
-        }
+    $userValue = [Environment]::GetEnvironmentVariable($name, "User")
+    if (-not [string]::IsNullOrWhiteSpace($userValue)) {
+        [Environment]::SetEnvironmentVariable($name, $userValue, "Process")
     }
 }
 

@@ -1,6 +1,6 @@
 # AutoCoding Engineer 架构说明
 
-本文描述当前 `0.7.1` 代码已经实现的架构。数据字段、公共方法和命令行参数见
+本文描述当前 `0.7.2` 代码已经实现的架构。数据字段、公共方法和命令行参数见
 [接口与数据契约](INTERFACES.md)。
 
 ## 1. 项目目标
@@ -563,6 +563,13 @@ staged/unstaged diff 和未跟踪路径，但不会自动读取未跟踪文件�
 `observability.configure_file_logging()` 在组合应用时创建
 `<data_dir>/logs/autocoding-agent.log`。日志采用 2 MB `RotatingFileHandler`，默认保留 5 份；
 开发与异常流程共享同一日志文件，便于按 session ID 串联追溯。
+
+Windows 配置页把 Claude 路径和模型配置保存到用户环境。`start.ps1` 每次启动都用非空用户值
+刷新当前进程，避免长时间运行的 Explorer 或终端遗留旧值。真实 `ClaudeCodeRuntime` 在启动
+子进程前再次通过 `resolve_claude_command()` 校验当前值，并按用户配置、兼容变量、PATH 和已知
+真实安装位置有界回退；测试注入的 Fake Runner/Popen 不做机器路径校验。预检分别验证工作区和
+可执行文件，日志保存最终选择的 command/workspace，使“程序不存在”“项目目录不存在”和其他
+Windows 进程启动失败不再被合并成同一个误导性错误。
 
 ## 10. 接口独立性
 

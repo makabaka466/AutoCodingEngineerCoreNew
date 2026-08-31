@@ -16,7 +16,7 @@ from typing import Any, TypeVar
 from pydantic import BaseModel, ValidationError
 
 from autocoding_agent.adapters.process_options import hidden_window_options
-from autocoding_agent.config import Settings
+from autocoding_agent.config import Settings, resolve_claude_command
 from autocoding_agent.core.models import AgentDecision, AgentUsage, RuntimeResult, RuntimeTurn
 from autocoding_agent.core.runtime.models import RuntimeActivity, RuntimeEventKind
 from autocoding_agent.ports.runtime import RuntimeEventSink, RuntimeInterruptedError
@@ -45,6 +45,8 @@ class ClaudeCodeRuntime:
         self.settings = settings
         self._runner = runner
         self._popen_factory = popen_factory
+        self._uses_default_runner = runner is subprocess.run
+        self._uses_default_popen = popen_factory is subprocess.Popen
         self._active: dict[str, subprocess.Popen[str]] = {}
         self._interrupted: set[str] = set()
         self._active_lock = threading.Lock()
@@ -82,14 +84,22 @@ class ClaudeCodeRuntime:
         """Run any structured contract through stream-json with live activity events."""
 
         command = self.build_command(turn, response_model, stream=True)
+        command = self._prepare_launch_command(
+            command,
+            turn,
+            validate=self._uses_default_popen,
+        )
         started_at = time.monotonic()
         logger.info(
-            "observed_turn_started session_id=%s run_id=%s mode=%s model=%s resumed=%s",
+            "observed_turn_started session_id=%s run_id=%s mode=%s model=%s resumed=%s "
+            "command=%s workspace=%s",
             turn.session_id,
             run_id,
             turn.mode.value,
             self.settings.claude_model,
             bool(turn.runtime_session_id),
+            command[0],
+            turn.workspace,
         )
         try:
             process = self._popen_factory(
@@ -103,12 +113,27 @@ class ClaudeCodeRuntime:
                 **hidden_window_options(),
             )
         except FileNotFoundError as exc:
-            raise ClaudeCodeError(
-                "Claude Code executable was not found. Set AUTO_CODING_CLAUDE_COMMAND "
-                "to the real claude.exe path."
-            ) from exc
+            logger.error(
+                "observed_turn_failed session_id=%s run_id=%s "
+                "reason=runtime_launch_target_not_found command=%s workspace=%s",
+                turn.session_id,
+                run_id,
+                command[0],
+                turn.workspace,
+            )
+            raise self._launch_not_found_error(command[0], turn.workspace, exc) from exc
         except OSError as exc:
-            raise ClaudeCodeError(f"Claude Code could not start: {_redact(str(exc))}") from exc
+            detail = _log_safe_detail(_redact(str(exc)))
+            logger.error(
+                "observed_turn_failed session_id=%s run_id=%s reason=runtime_os_error "
+                "command=%s workspace=%s detail=%s",
+                turn.session_id,
+                run_id,
+                command[0],
+                turn.workspace,
+                detail,
+            )
+            raise ClaudeCodeError(f"Claude Code 进程启动失败：{detail}") from exc
 
         if process.stdout is None or process.stderr is None:
             self._terminate_process(process)
@@ -231,13 +256,19 @@ class ClaudeCodeRuntime:
         """Run Claude Code with any project-owned Pydantic output contract."""
 
         command = self.build_command(turn, response_model)
+        command = self._prepare_launch_command(
+            command,
+            turn,
+            validate=self._uses_default_runner,
+        )
         started_at = time.monotonic()
         logger.info(
-            "turn_started session_id=%s mode=%s model=%s resumed=%s workspace=%s",
+            "turn_started session_id=%s mode=%s model=%s resumed=%s command=%s workspace=%s",
             turn.session_id,
             turn.mode.value,
             self.settings.claude_model,
             bool(turn.runtime_session_id),
+            command[0],
             turn.workspace,
         )
         try:
@@ -254,14 +285,26 @@ class ClaudeCodeRuntime:
             )
         except FileNotFoundError as exc:
             logger.error(
-                "turn_failed session_id=%s reason=runtime_not_found elapsed_ms=%d",
+                "turn_failed session_id=%s reason=runtime_launch_target_not_found "
+                "command=%s workspace=%s elapsed_ms=%d",
                 turn.session_id,
+                command[0],
+                turn.workspace,
                 _elapsed_ms(started_at),
             )
-            raise ClaudeCodeError(
-                "Claude Code executable was not found. Set AUTO_CODING_CLAUDE_COMMAND "
-                "to the real claude.exe path."
-            ) from exc
+            raise self._launch_not_found_error(command[0], turn.workspace, exc) from exc
+        except OSError as exc:
+            detail = _log_safe_detail(_redact(str(exc)))
+            logger.error(
+                "turn_failed session_id=%s reason=runtime_os_error command=%s workspace=%s "
+                "elapsed_ms=%d detail=%s",
+                turn.session_id,
+                command[0],
+                turn.workspace,
+                _elapsed_ms(started_at),
+                detail,
+            )
+            raise ClaudeCodeError(f"Claude Code 进程启动失败：{detail}") from exc
         except subprocess.TimeoutExpired as exc:
             logger.warning(
                 "turn_timeout session_id=%s mode=%s timeout_seconds=%d elapsed_ms=%d",
@@ -419,6 +462,79 @@ class ClaudeCodeRuntime:
             command.extend(["--session-id", turn.session_id])
         command.append(turn.user_message)
         return command
+
+    def _prepare_launch_command(
+        self,
+        command: list[str],
+        turn: RuntimeTurn,
+        *,
+        validate: bool,
+    ) -> list[str]:
+        """Recover stale executable settings and validate real process launch targets."""
+
+        if not validate:
+            return command
+        configured = command[0]
+        resolved = resolve_claude_command(configured)
+        if resolved != configured:
+            logger.warning(
+                "runtime_command_recovered configured=%s resolved=%s",
+                configured,
+                resolved,
+            )
+        prepared = [resolved, *command[1:]]
+        workspace = Path(turn.workspace).expanduser()
+        if not workspace.is_dir():
+            error = ClaudeCodeError(
+                f"项目目录不存在或不可访问：{workspace}。请在系统配置中重新选择项目目录。"
+            )
+            logger.error(
+                "runtime_launch_preflight_failed reason=workspace_not_found command=%s "
+                "workspace=%s",
+                resolved,
+                workspace,
+            )
+            raise error
+        executable = Path(resolved).expanduser()
+        if not executable.is_file():
+            error = ClaudeCodeError(
+                f"Claude Code 程序不存在或不可访问：{resolved}。"
+                "请在系统配置中重新选择真实的 claude.exe。"
+            )
+            logger.error(
+                "runtime_launch_preflight_failed reason=runtime_not_found command=%s "
+                "workspace=%s",
+                resolved,
+                workspace,
+            )
+            raise error
+        return prepared
+
+    @staticmethod
+    def _launch_not_found_error(
+        command: str,
+        workspace: str,
+        cause: FileNotFoundError,
+    ) -> ClaudeCodeError:
+        """Differentiate an invalid executable from an invalid subprocess working directory."""
+
+        workspace_path = Path(workspace).expanduser()
+        if not workspace_path.is_dir():
+            return ClaudeCodeError(
+                f"项目目录不存在或不可访问：{workspace_path}。"
+                "请在系统配置中重新选择项目目录。"
+            )
+        executable = Path(command).expanduser()
+        if not executable.is_file():
+            return ClaudeCodeError(
+                f"Claude Code 程序不存在或不可访问：{command}。"
+                "请在系统配置中重新选择真实的 claude.exe。"
+            )
+        detail = " ".join(str(cause).split())[:500]
+        return ClaudeCodeError(
+            "Claude Code 进程启动失败，但程序和项目目录均存在。"
+            f"系统错误：{detail or 'FileNotFoundError'}"
+        )
 
     def _was_interrupted(self, run_id: str) -> bool:
         with self._active_lock:

@@ -19,23 +19,7 @@ from autocoding_agent.database_models import (
 def _default_claude_command() -> str:
     """Prefer a directly executable Claude binary, especially on Windows."""
 
-    candidates = [
-        os.getenv("AUTO_CODING_CLAUDE_COMMAND"),
-        os.getenv("AUTO_TASK_AGENT_CLAUDE_CODE_COMMAND"),
-        shutil.which("claude.exe"),
-        shutil.which("claude"),
-        r"D:\claude\node_modules\@anthropic-ai\claude-code\bin\claude.exe",
-    ]
-    for candidate in candidates:
-        if not candidate:
-            continue
-        path = Path(candidate).expanduser()
-        if not path.is_file():
-            continue
-        if os.name == "nt" and path.suffix.casefold() not in {".exe", ".com"}:
-            continue
-        return str(path.resolve())
-    return "claude"
+    return resolve_claude_command(None)
 
 
 def _windows_user_environment(name: str) -> str | None:
@@ -51,6 +35,31 @@ def _windows_user_environment(name: str) -> str | None:
             return str(value) if value else None
     except OSError:
         return None
+
+
+def resolve_claude_command(configured: str | None) -> str:
+    """Resolve a runnable Claude binary even when a parent process has a stale value."""
+
+    candidates = [
+        configured,
+        os.getenv("AUTO_CODING_CLAUDE_COMMAND"),
+        _windows_user_environment("AUTO_CODING_CLAUDE_COMMAND"),
+        os.getenv("AUTO_TASK_AGENT_CLAUDE_CODE_COMMAND"),
+        _windows_user_environment("AUTO_TASK_AGENT_CLAUDE_CODE_COMMAND"),
+        shutil.which("claude.exe"),
+        shutil.which("claude"),
+        r"D:\claude\node_modules\@anthropic-ai\claude-code\bin\claude.exe",
+    ]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        path = Path(candidate).expanduser()
+        if not path.is_file():
+            continue
+        if os.name == "nt" and path.suffix.casefold() not in {".exe", ".com"}:
+            continue
+        return str(path.resolve())
+    return (configured or "claude").strip() or "claude"
 
 
 def _default_hermes_home() -> Path:

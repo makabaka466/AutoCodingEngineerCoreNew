@@ -1,6 +1,6 @@
 # AutoCodingEngineerCoreNew 项目开发与工程经验
 
-> 文档基线：2026-08-28，项目版本 `0.7.1`。本文以当前代码为准，并明确区分“已实现”、
+> 文档基线：2026-08-31，项目版本 `0.7.2`。本文以当前代码为准，并明确区分“已实现”、
 > “当前限制”和“后续规划”。当前 Agent 已具备状态机、追加事件、运行记录、决策审计、
 > 任务产物、保守恢复，以及按会话持续沉淀开发/异常能力知识的 Runtime 内核。
 
@@ -1235,7 +1235,8 @@ FTS 精确词检索 ─┐
 - `v0.6.3`：对话先于图片、标题/路径联合入口、候选与截图冲突澄清；
 - `v0.6.4`：双流程实时进度投影与持久状态分层；
 - `v0.7.0`：Hermes Skill 只读工程经验端口、双流程回灌、事件/Artifact 和失败降级；
-- `v0.7.1（当前）`：ACE 到 Hermes 的 DeepSeek provider 安全桥接、独立 Flash 模型和真实联调；
+- `v0.7.1`：ACE 到 Hermes 的 DeepSeek provider 安全桥接、独立 Flash 模型和真实联调；
+- `v0.7.2（当前）`：Claude启动配置刷新、失效路径恢复、启动目标预检和明确错误分类；
 - 下一检索迭代：外部 VectorStore、健康检查、批量迁移和真实检索评测集；
 - 治理迭代：统一 Engineering Knowledge/Candidate 模型，把 Capability、异常与失败日志转为候选；
 - 质量迭代：脱敏、去重、冲突检测、陈旧标记、人工审核与基于证据的晋级；
@@ -2460,3 +2461,46 @@ ACE 的 `ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_API_KEY` 临时映射成 Hermes 按目
 应在配置页增加可见的 Hermes 路由选择和目标主机确认，而不是放宽现有凭据校验。Hermes Skill 的
 建议仍是 `host_verified=false` 候选证据；模型共享不改变每轮一次、只读 Web toolset、无代码/SQL
 权限和主流程失败降级等边界。
+
+## 33. Claude启动配置恢复与错误分类（v0.7.2）
+
+### 33.1 问题背景与实际证据
+
+异常对话在配置页明确检测到Claude Code后，Runtime仍立即返回“executable was not found”。本地
+日志证明配置检测成功运行了真实`claude.exe --version`，但异常run在进程创建阶段失败。进一步
+核对确认真实exe、Session工作区、同一Python和隐藏窗口参数都正常；把失效进程环境变量与有效
+Windows用户变量组合后，稳定复现“配置检测选择有效回退路径、Pydantic Settings却接受旧进程值”
+的分叉。因此问题不在MES项目或模型接口，而在Windows父子进程配置来源不同。
+
+### 33.2 根因
+
+配置页把值保存到Windows用户环境，同时更新当前配置进程；但Explorer、终端等长生命周期父进程
+可能仍持有旧的非空`AUTO_CODING_CLAUDE_COMMAND`。旧`start.ps1`只在进程变量为空时导入用户值，
+因此旧值会继续传给新客户端。模型检测器会跳过不存在的旧文件并找到真实exe，`Settings`的环境
+绑定却直接接受旧字符串。Runtime又把`subprocess`的所有`FileNotFoundError`统一描述为exe缺失，
+无法区分命令和cwd，放大了误导。
+
+### 33.3 解决方案与边界
+
+- 双击启动脚本始终用非空Windows用户配置刷新生成模型相关进程变量；
+- `resolve_claude_command()`按显式值、当前/用户兼容配置、PATH和已知安装位置选择第一个可直接
+  执行的文件，Windows继续拒绝`.cmd/.ps1` shim；
+- 真实Runtime在每轮启动前重新解析命令，恢复动作写安全日志；Fake Runner/Popen不做本机验证；
+- 预检分别验证workspace和exe，`FileNotFoundError`兜底也再次分类，其他系统错误保留裁剪详情；
+- 日志增加最终command/workspace，不记录Prompt、API Key或模型响应。
+
+### 33.4 可复用工程经验与决策
+
+1. **配置检测与执行必须使用同一解析语义。** “配置页显示可用”不能只证明探测器成功，执行适配器
+   必须对最终命令做同等校验。
+2. **持久环境与进程环境会漂移。** Windows用户变量更新不会自动刷新已有Explorer和终端；双击
+   启动器应明确谁是配置真相源，并在进程边界同步。
+3. **不要把底层异常过早压成单一文案。** `FileNotFoundError`既可能来自exe，也可能来自cwd；在
+   转换为用户错误前必须检查两端事实。
+4. **恢复不应削弱测试可替换性。** 机器路径预检只作用于真实process适配器，注入Runner仍能使用
+   虚拟命令测试协议。
+
+- ADR-095：桌面配置页保存的Windows用户环境是双击启动时的模型配置真相源；
+- ADR-096：真实Runtime允许从失效旧路径回退到已验证真实exe，并记录最终选择；
+- ADR-097：Runtime启动错误按workspace、executable和其他OS错误分类，不再统一报告程序缺失；
+- ADR-098：路径恢复与预检不作用于测试注入Runner/Popen，保持端口可替换。

@@ -1,6 +1,6 @@
 # AutoCoding Engineer 接口与数据契约
 
-本文记录当前 `0.7.1` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
+本文记录当前 `0.7.2` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
 Runtime、持久化和状态契约。
 设计动机和运行流程见[架构说明](ARCHITECTURE.md)。
 
@@ -503,7 +503,9 @@ claude -p
 最终 `result` 行包含以下 JSON envelope；通用 `run_structured()` 兼容路径仍可直接读取最终 JSON：
 
 Windows 运行时还会传入隐藏 `STARTUPINFO` 和 `CREATE_NO_WINDOW`，避免每轮 Claude Code 调用
-弹出控制台。Runtime 日志只记录调用元数据、usage 和脱敏错误，不记录完整 prompt。
+弹出控制台。真实进程启动前会恢复失效的旧命令配置，并分别预检 `command[0]` 与
+`RuntimeTurn.workspace`；最终采用的命令和工作区进入日志，完整 prompt 仍不会记录。注入测试
+Runner/Popen 时跳过本机路径恢复，保留可替换 Runtime 的确定性测试边界。
 
 ```json
 {
@@ -800,7 +802,7 @@ Web 模式。
 
 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `AUTO_CODING_CLAUDE_COMMAND` | 自动发现，最终回退 `claude` | Claude Code 可执行命令或真实 exe 路径；Windows 会忽略不能由 `subprocess` 直接执行的 cmd/ps1 shim |
+| `AUTO_CODING_CLAUDE_COMMAND` | 自动发现，最终回退 `claude` | Claude Code 可执行命令或真实 exe 路径；Windows 启动脚本用最新用户值刷新进程，Runtime 会跳过失效路径并忽略不能由 `subprocess` 直接执行的 cmd/ps1 shim |
 | `AUTO_CODING_CLAUDE_MODEL` | `deepseek-v4-pro` | 传给 Claude Code 的模型名 |
 | `AUTO_CODING_CLAUDE_TIMEOUT_SECONDS` | `600` | 单轮超时，最小 10 秒 |
 | `AUTO_CODING_MAX_BUDGET_USD` | `None` | 可选单轮 Claude Code 预算参数，必须大于 0 |

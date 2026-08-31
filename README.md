@@ -137,6 +137,11 @@ Claude Code”“Embedding”“SQL Server”“项目路径”“MD 能力配�
 流程创建新任务时使用的代码根目录；MD 页按流程和二级路径管理可编辑知识，点击添加会创建路径
 及其同名 Markdown。生成模型 Key、Embedding Key 与数据库密码都不会回填显示。
 
+双击启动时，脚本会使用配置页保存在 Windows 用户环境中的最新模型配置刷新当前进程，避免
+Explorer 或旧终端把过期的 `AUTO_CODING_CLAUDE_COMMAND` 传给客户端。Runtime 启动前还会重新
+解析真实可执行文件并分别检查 Claude 路径与项目目录；失效旧路径可自动恢复时会写入脱敏日志，
+无法恢复时则明确提示应重新选择 `claude.exe` 还是项目目录。
+
 当前默认值适用于 DeepSeek Anthropic 兼容接口：
 
 ```dotenv
@@ -287,7 +292,7 @@ D:\python\python.exe -m autocoding_agent.interfaces.desktop_ui
 ```
 
 桌面客户端左下角的“打开本地日志”可直接打开目录。日志按 2 MB 轮转并保留 5 份历史文件，
-记录会话 ID、模式、模型、工作区、开始/完成、耗时、Token 数量、超时和脱敏后的 Runtime
+记录会话 ID、模式、模型、最终采用的 Claude 路径、工作区、开始/完成、耗时、Token 数量、超时和脱敏后的 Runtime
 错误。日志不会记录完整用户问题、系统提示词、API Key 或数据库查询结果。Windows 调用
 Claude Code 时使用隐藏窗口参数，每次问答不会再弹出控制台。
 
