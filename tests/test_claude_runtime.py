@@ -12,7 +12,12 @@ from pathlib import Path
 
 import pytest
 
-from autocoding_agent.adapters.claude_code import ClaudeCodeError, ClaudeCodeRuntime
+from autocoding_agent.adapters.claude_code import (
+    ClaudeCodeError,
+    ClaudeCodeRuntime,
+    _command_line_chars,
+    _validate_command_line_length,
+)
 from autocoding_agent.config import Settings
 from autocoding_agent.core.models import AgentMode, RuntimeTurn
 from autocoding_agent.core.runtime.models import RuntimeEventKind
@@ -57,29 +62,33 @@ def _option_value(command: list[str], option: str) -> str:
 def test_build_command_contains_structured_contract_and_new_session_id(tmp_path: Path) -> None:
     runtime = ClaudeCodeRuntime(_settings(tmp_path))
     turn = _turn(tmp_path)
+    prompt_file = tmp_path / "system-prompt.md"
+    prompt_file.write_text(turn.system_prompt, encoding="utf-8")
 
-    command = runtime.build_command(turn)
+    command = runtime.build_command(turn, system_prompt_file=prompt_file)
 
     assert command[0] == "D:/claude/claude.exe"
-    assert command[-1] == "Inspect upload behavior."
+    assert turn.user_message not in command
     assert "--bare" in command
     assert "--no-chrome" in command
     assert "--strict-mcp-config" in command
     assert _option_value(command, "--mcp-config") == '{"mcpServers":{}}'
     assert _option_value(command, "--setting-sources") == ""
     assert _option_value(command, "--output-format") == "json"
+    assert _option_value(command, "--input-format") == "text"
     assert _option_value(command, "--model") == "deepseek-test"
     assert _option_value(command, "--permission-mode") == "dontAsk"
     assert _option_value(command, "--tools") == "Read,Glob,Grep"
     allowed_tools = command[
-        command.index("--allowedTools") + 1 : command.index("--append-system-prompt")
+        command.index("--allowedTools") + 1 : command.index("--append-system-prompt-file")
     ]
     assert allowed_tools == [
         "Read",
         "Glob",
         "Grep",
     ]
-    assert _option_value(command, "--append-system-prompt") == "SYSTEM PROMPT"
+    assert "--append-system-prompt" not in command
+    assert _option_value(command, "--append-system-prompt-file") == str(prompt_file)
     assert _option_value(command, "--add-dir") == turn.capability_dir
     assert _option_value(command, "--max-budget-usd") == "1.25"
     assert _option_value(command, "--session-id") == turn.session_id
@@ -100,8 +109,10 @@ def test_build_command_contains_structured_contract_and_new_session_id(tmp_path:
 def test_build_command_resumes_exact_runtime_session(tmp_path: Path) -> None:
     runtime = ClaudeCodeRuntime(_settings(tmp_path, max_budget_usd=None))
     turn = _turn(tmp_path, runtime_session_id="claude-runtime-session")
+    prompt_file = tmp_path / "system-prompt.md"
+    prompt_file.write_text(turn.system_prompt, encoding="utf-8")
 
-    command = runtime.build_command(turn)
+    command = runtime.build_command(turn, system_prompt_file=prompt_file)
 
     assert _option_value(command, "--resume") == "claude-runtime-session"
     assert "--session-id" not in command
@@ -116,8 +127,10 @@ def test_build_command_mounts_capability_and_isolated_attachment_directories(
     first = tmp_path / "attachments" / "one"
     second = tmp_path / "attachments" / "two"
     turn.additional_dirs = [str(first), str(second), str(first)]
+    prompt_file = tmp_path / "system-prompt.md"
+    prompt_file.write_text(turn.system_prompt, encoding="utf-8")
 
-    command = runtime.build_command(turn)
+    command = runtime.build_command(turn, system_prompt_file=prompt_file)
     mounted = [
         command[index + 1]
         for index, item in enumerate(command)
@@ -132,6 +145,7 @@ def test_generic_structured_runtime_uses_incident_schema(tmp_path: Path) -> None
 
     def runner(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         captured["command"] = command
+        captured.update(kwargs)
         return subprocess.CompletedProcess(
             command,
             0,
@@ -156,6 +170,8 @@ def test_generic_structured_runtime_uses_incident_schema(tmp_path: Path) -> None
     assert result.runtime_session_id == "runtime-incident"
     command = captured["command"]
     assert isinstance(command, list)
+    assert captured["input"] == "Inspect upload behavior."
+    assert "Inspect upload behavior." not in command
     schema = json.loads(_option_value(command, "--json-schema"))
     assert "queries" in schema["properties"]
     assert "diagnosis" in schema["properties"]
@@ -251,6 +267,7 @@ def test_runtime_invocation_uses_workspace_timeout_and_utf8(tmp_path: Path) -> N
         runtime.run(_turn(tmp_path))
 
     assert captured["cwd"] == _turn(tmp_path).workspace
+    assert captured["input"] == "Inspect upload behavior."
     assert captured["timeout"] == 45
     assert captured["encoding"] == "utf-8"
     if os.name == "nt":
@@ -258,6 +275,50 @@ def test_runtime_invocation_uses_workspace_timeout_and_utf8(tmp_path: Path) -> N
         startupinfo = captured["startupinfo"]
         assert isinstance(startupinfo, subprocess.STARTUPINFO)
         assert startupinfo.dwFlags & subprocess.STARTF_USESHOWWINDOW
+
+
+def test_large_system_prompt_uses_temporary_file_and_stays_out_of_argv(
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, object] = {}
+    turn = _turn(tmp_path)
+    turn.system_prompt = "DATABASE_SCHEMA\n" + ("column_name nvarchar(200)\n" * 4_000)
+
+    def runner(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        prompt_path = Path(_option_value(command, "--append-system-prompt-file"))
+        captured["prompt_path"] = prompt_path
+        captured["command_chars"] = _command_line_chars(command)
+        assert prompt_path.read_text(encoding="utf-8") == turn.system_prompt
+        assert turn.system_prompt not in command
+        assert turn.user_message not in command
+        assert kwargs["input"] == turn.user_message
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=json.dumps(
+                {
+                    "session_id": "runtime-large-prompt",
+                    "structured_output": {"status": "completed", "message": "Done."},
+                }
+            ),
+            stderr="",
+        )
+
+    runtime = ClaudeCodeRuntime(_settings(tmp_path), runner=runner)
+
+    result = runtime.run(turn)
+
+    assert result.runtime_session_id == "runtime-large-prompt"
+    assert int(captured["command_chars"]) < 32_767
+    prompt_path = captured["prompt_path"]
+    assert isinstance(prompt_path, Path)
+    assert not prompt_path.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows CreateProcess limit only")
+def test_windows_command_line_preflight_rejects_oversized_residual_arguments() -> None:
+    with pytest.raises(ClaudeCodeError, match="Windows 命令行长度限制"):
+        _validate_command_line_length(["claude.exe", "x" * 32_767])
 
 
 def test_real_runtime_recovers_a_stale_configured_command(
@@ -389,6 +450,11 @@ def test_observed_runtime_parses_sanitized_tool_lifecycle(tmp_path: Path) -> Non
 
     def popen_factory(command: list[str], **kwargs: object) -> subprocess.Popen[str]:
         captured["command"] = command
+        captured["prompt_path"] = Path(
+            _option_value(command, "--append-system-prompt-file")
+        )
+        captured["stdin"] = kwargs.get("stdin")
+        assert captured["prompt_path"].read_text(encoding="utf-8") == "SYSTEM PROMPT"
         return subprocess.Popen([sys.executable, "-c", script], **kwargs)
 
     runtime = ClaudeCodeRuntime(_settings(tmp_path), popen_factory=popen_factory)
@@ -410,6 +476,10 @@ def test_observed_runtime_parses_sanitized_tool_lifecycle(tmp_path: Path) -> Non
     assert _option_value(command, "--output-format") == "stream-json"
     assert "--verbose" in command
     assert "--include-hook-events" in command
+    assert captured["stdin"] == subprocess.PIPE
+    prompt_path = captured["prompt_path"]
+    assert isinstance(prompt_path, Path)
+    assert not prompt_path.exists()
 
 
 def test_observed_runtime_supports_incident_structured_contract(tmp_path: Path) -> None:

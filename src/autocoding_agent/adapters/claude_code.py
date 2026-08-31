@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import subprocess
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from queue import Empty, Queue
+from tempfile import TemporaryDirectory
 from typing import Any, TypeVar
 
 from pydantic import BaseModel, ValidationError
@@ -31,6 +34,7 @@ Runner = Callable[..., subprocess.CompletedProcess[str]]
 PopenFactory = Callable[..., subprocess.Popen[str]]
 StructuredOutputT = TypeVar("StructuredOutputT", bound=BaseModel)
 logger = logging.getLogger("autocoding_agent.runtime.claude_code")
+_WINDOWS_COMMAND_LINE_LIMIT = 32_767
 
 
 class ClaudeCodeRuntime:
@@ -83,12 +87,30 @@ class ClaudeCodeRuntime:
     ) -> StructuredRuntimeResult[StructuredOutputT]:
         """Run any structured contract through stream-json with live activity events."""
 
-        command = self.build_command(turn, response_model, stream=True)
-        command = self._prepare_launch_command(
-            command,
+        with self._launch_invocation(
             turn,
+            response_model,
+            stream=True,
             validate=self._uses_default_popen,
-        )
+        ) as command:
+            return self._execute_structured_observed(
+                command,
+                turn,
+                response_model,
+                run_id,
+                event_sink,
+            )
+
+    def _execute_structured_observed(
+        self,
+        command: list[str],
+        turn: RuntimeTurn,
+        response_model: type[StructuredOutputT],
+        run_id: str,
+        event_sink: RuntimeEventSink,
+    ) -> StructuredRuntimeResult[StructuredOutputT]:
+        """Execute one prepared streaming invocation while its prompt file remains alive."""
+
         started_at = time.monotonic()
         logger.info(
             "observed_turn_started session_id=%s run_id=%s mode=%s model=%s resumed=%s "
@@ -105,6 +127,7 @@ class ClaudeCodeRuntime:
             process = self._popen_factory(
                 command,
                 cwd=turn.workspace,
+                stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -135,7 +158,7 @@ class ClaudeCodeRuntime:
             )
             raise ClaudeCodeError(f"Claude Code 进程启动失败：{detail}") from exc
 
-        if process.stdout is None or process.stderr is None:
+        if process.stdin is None or process.stdout is None or process.stderr is None:
             self._terminate_process(process)
             raise ClaudeCodeError("Claude Code streaming pipes were not created.")
         with self._active_lock:
@@ -144,6 +167,19 @@ class ClaudeCodeRuntime:
 
         line_queue: Queue[str | None] = Queue()
         stderr_chunks: list[str] = []
+
+        def write_stdin() -> None:
+            assert process.stdin is not None
+            try:
+                process.stdin.write(turn.user_message)
+            except (BrokenPipeError, OSError):
+                # The process error/result envelope remains the authoritative failure signal.
+                pass
+            finally:
+                try:
+                    process.stdin.close()
+                except OSError:
+                    pass
 
         def read_stdout() -> None:
             assert process.stdout is not None
@@ -155,8 +191,10 @@ class ClaudeCodeRuntime:
             assert process.stderr is not None
             stderr_chunks.append(process.stderr.read())
 
+        stdin_thread = threading.Thread(target=write_stdin, daemon=True)
         stdout_thread = threading.Thread(target=read_stdout, daemon=True)
         stderr_thread = threading.Thread(target=read_stderr, daemon=True)
+        stdin_thread.start()
         stdout_thread.start()
         stderr_thread.start()
         deadline = started_at + self.settings.claude_timeout_seconds
@@ -235,6 +273,7 @@ class ClaudeCodeRuntime:
         finally:
             if process.poll() is None:
                 self._terminate_process(process)
+            stdin_thread.join(timeout=1)
             with self._active_lock:
                 self._active.pop(run_id, None)
                 self._interrupted.discard(run_id)
@@ -255,12 +294,21 @@ class ClaudeCodeRuntime:
     ) -> StructuredRuntimeResult[StructuredOutputT]:
         """Run Claude Code with any project-owned Pydantic output contract."""
 
-        command = self.build_command(turn, response_model)
-        command = self._prepare_launch_command(
-            command,
+        with self._launch_invocation(
             turn,
+            response_model,
             validate=self._uses_default_runner,
-        )
+        ) as command:
+            return self._execute_structured(command, turn, response_model)
+
+    def _execute_structured(
+        self,
+        command: list[str],
+        turn: RuntimeTurn,
+        response_model: type[StructuredOutputT],
+    ) -> StructuredRuntimeResult[StructuredOutputT]:
+        """Execute one prepared JSON invocation while its prompt file remains alive."""
+
         started_at = time.monotonic()
         logger.info(
             "turn_started session_id=%s mode=%s model=%s resumed=%s command=%s workspace=%s",
@@ -275,6 +323,7 @@ class ClaudeCodeRuntime:
             completed = self._runner(
                 command,
                 cwd=turn.workspace,
+                input=turn.user_message,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -417,8 +466,12 @@ class ClaudeCodeRuntime:
         turn: RuntimeTurn,
         response_model: type[BaseModel] = AgentDecision,
         *,
+        system_prompt_file: str | Path,
         stream: bool = False,
     ) -> list[str]:
+        prompt_path = Path(system_prompt_file)
+        if not prompt_path.is_file():
+            raise ValueError(f"System prompt file does not exist: {prompt_path}")
         schema = json.dumps(response_model.model_json_schema(), ensure_ascii=False)
         command = [
             self.settings.claude_command,
@@ -432,6 +485,8 @@ class ClaudeCodeRuntime:
             "",
             "--output-format",
             "stream-json" if stream else "json",
+            "--input-format",
+            "text",
             "--model",
             self.settings.claude_model,
             "--permission-mode",
@@ -440,8 +495,8 @@ class ClaudeCodeRuntime:
             ",".join(turn.tools),
             "--allowedTools",
             *turn.allowed_tools,
-            "--append-system-prompt",
-            turn.system_prompt,
+            "--append-system-prompt-file",
+            str(prompt_path),
             "--json-schema",
             schema,
         ]
@@ -460,8 +515,43 @@ class ClaudeCodeRuntime:
             command.extend(["--resume", turn.runtime_session_id])
         else:
             command.extend(["--session-id", turn.session_id])
-        command.append(turn.user_message)
         return command
+
+    @contextmanager
+    def _launch_invocation(
+        self,
+        turn: RuntimeTurn,
+        response_model: type[BaseModel],
+        *,
+        stream: bool = False,
+        validate: bool,
+    ) -> Iterator[list[str]]:
+        """Keep large prompts out of argv and remove the temporary file after the run."""
+
+        with TemporaryDirectory(prefix="ace-claude-") as prompt_dir:
+            prompt_path = Path(prompt_dir) / "system-prompt.md"
+            prompt_path.write_text(turn.system_prompt, encoding="utf-8")
+            command = self.build_command(
+                turn,
+                response_model,
+                system_prompt_file=prompt_path,
+                stream=stream,
+            )
+            command = self._prepare_launch_command(command, turn, validate=validate)
+            command_chars = _command_line_chars(command)
+            schema_chars = len(command[command.index("--json-schema") + 1])
+            logger.info(
+                "runtime_input_prepared session_id=%s transport=prompt_file+stdin "
+                "command_chars=%d system_prompt_chars=%d user_message_chars=%d "
+                "json_schema_chars=%d",
+                turn.session_id,
+                command_chars,
+                len(turn.system_prompt),
+                len(turn.user_message),
+                schema_chars,
+            )
+            _validate_command_line_length(command, command_chars)
+            yield command
 
     def _prepare_launch_command(
         self,
@@ -717,6 +807,32 @@ def _optional_int(value: Any) -> int | None:
 
 def _optional_float(value: Any) -> float | None:
     return float(value) if value is not None else None
+
+
+def _command_line_chars(command: list[str]) -> int:
+    """Return the Windows CreateProcess command-line size without exposing its content."""
+
+    return len(subprocess.list2cmdline(command))
+
+
+def _validate_command_line_length(command: list[str], command_chars: int | None = None) -> None:
+    """Fail before CreateProcess when the remaining argv still exceeds Windows limits."""
+
+    if os.name != "nt":
+        return
+    measured = command_chars if command_chars is not None else _command_line_chars(command)
+    if measured < _WINDOWS_COMMAND_LINE_LIMIT:
+        return
+    logger.error(
+        "runtime_launch_preflight_failed reason=command_line_too_long command_chars=%d "
+        "limit=%d",
+        measured,
+        _WINDOWS_COMMAND_LINE_LIMIT,
+    )
+    raise ClaudeCodeError(
+        "Claude Code 启动参数仍超过 Windows 命令行长度限制。"
+        "请减少挂载目录或升级 Runtime 传输配置。"
+    )
 
 
 def _elapsed_ms(started_at: float) -> int:

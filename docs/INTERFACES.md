@@ -1,6 +1,6 @@
 # AutoCoding Engineer 接口与数据契约
 
-本文记录当前 `0.7.2` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
+本文记录当前 `0.7.3` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
 Runtime、持久化和状态契约。
 设计动机和运行流程见[架构说明](ARCHITECTURE.md)。
 
@@ -485,27 +485,31 @@ claude -p
   --mcp-config '{"mcpServers":{}}'
   --setting-sources ''
   --output-format stream-json
+  --input-format text
   --include-hook-events
   --model <configured-model>
   --permission-mode <permission-mode>
   --tools <comma-separated-tools>
   --allowedTools <one or more allowed tool patterns>
-  --append-system-prompt <bundled skills and boundaries>
+  --append-system-prompt-file <per-turn UTF-8 temporary file>
   --json-schema <AgentDecision JSON Schema>
   [--add-dir <workspace capability directory，仅 inspect>]
   [--add-dir <validated incident attachment directory> ...]
   [--max-budget-usd <amount>]
   (--session-id <application session id> | --resume <runtime session id>)
-  <user message>
 ```
 
-子进程工作目录固定为 `RuntimeTurn.workspace`。开发可观测路径要求 stdout 是逐行 stream-json，
+`RuntimeTurn.user_message` 不进入命令数组，而是通过 stdin 发送。临时文件包含本轮完整系统提示词，
+只在子进程存活期间存在，正常完成、失败或超时后都会清理。子进程工作目录固定为
+`RuntimeTurn.workspace`。开发可观测路径要求 stdout 是逐行 stream-json，
 最终 `result` 行包含以下 JSON envelope；通用 `run_structured()` 兼容路径仍可直接读取最终 JSON：
 
 Windows 运行时还会传入隐藏 `STARTUPINFO` 和 `CREATE_NO_WINDOW`，避免每轮 Claude Code 调用
 弹出控制台。真实进程启动前会恢复失效的旧命令配置，并分别预检 `command[0]` 与
 `RuntimeTurn.workspace`；最终采用的命令和工作区进入日志，完整 prompt 仍不会记录。注入测试
-Runner/Popen 时跳过本机路径恢复，保留可替换 Runtime 的确定性测试边界。
+Runner/Popen 时跳过本机路径恢复，保留可替换 Runtime 的确定性测试边界。每次调用还会记录
+`command_chars`、系统提示词/用户消息/JSON Schema 的字符数，并在 Windows `CreateProcess` 前
+拒绝仍达到 32,767 字符的剩余参数；日志不包含这些输入的正文。
 
 ```json
 {

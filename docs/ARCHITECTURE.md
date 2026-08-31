@@ -1,6 +1,6 @@
 # AutoCoding Engineer 架构说明
 
-本文描述当前 `0.7.2` 代码已经实现的架构。数据字段、公共方法和命令行参数见
+本文描述当前 `0.7.3` 代码已经实现的架构。数据字段、公共方法和命令行参数见
 [接口与数据契约](INTERFACES.md)。
 
 ## 1. 项目目标
@@ -399,6 +399,12 @@ Windows 子进程同时设置 `CREATE_NO_WINDOW` 和隐藏 `STARTUPINFO`，因�
 子进程不会在桌面问答时新建控制台窗口。每轮调用通过 `autocoding_agent` logger 记录开始、
 结束、会话 ID、模式、耗时、usage、超时或脱敏错误；不会把命令数组、用户消息、系统提示词
 或结构化业务结果写入日志。
+
+Runtime 不再把大段系统提示词和用户消息放入 Windows 进程参数。系统提示词写入当前调用独占的
+UTF-8 临时文件，通过 `--append-system-prompt-file` 传入；用户消息通过 stdin 传入，临时目录在
+成功、超时和异常路径结束后统一清理。命令行只保留固定选项、短路径、工具白名单和有界 JSON
+Schema；启动前使用 Windows 相同的参数转义方式计算最终字符数，若剩余参数仍达到 32,767 字符则
+在 `CreateProcess` 前给出明确错误。日志只保存各组成部分的字符数和传输方式，不保存正文。
 
 桌面入口在创建应用组合根之前显示统一的 `SystemSettingsDialog`，其中生成模型页调用
 `ClaudeModelSetupService`。服务只接受真实可执行文件，

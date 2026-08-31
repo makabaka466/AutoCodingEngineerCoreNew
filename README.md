@@ -296,6 +296,10 @@ D:\python\python.exe -m autocoding_agent.interfaces.desktop_ui
 错误。日志不会记录完整用户问题、系统提示词、API Key 或数据库查询结果。Windows 调用
 Claude Code 时使用隐藏窗口参数，每次问答不会再弹出控制台。
 
+较大的系统提示词（包括异常流程需要的数据库结构）通过每轮独立的临时 UTF-8 文件交给 Claude
+Code，用户消息通过 stdin 发送，不再占用 Windows 命令行长度。临时文件在调用结束后清理；日志
+只记录命令行、提示词和 Schema 的字符数，用于定位容量问题，不记录正文。
+
 ## 备用 Web UI
 
 原 Streamlit 页面继续作为备用入口，不再默认启动：
