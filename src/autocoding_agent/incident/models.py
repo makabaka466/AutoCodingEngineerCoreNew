@@ -74,7 +74,13 @@ class IncidentDecision(BaseModel):
     status: IncidentStatus
     message: NonEmptyText
     question: NonEmptyText | None = None
-    page: LocatedPage | None = None
+    page: LocatedPage | None = Field(
+        default=None,
+        description=(
+            "Required for business_data and completed decisions. Repeat the verified page "
+            "identity and workspace-relative source paths on every such decision."
+        ),
+    )
     query_stage: IncidentQueryStage | None = Field(
         default=None,
         description=(
@@ -99,10 +105,6 @@ class IncidentDecision(BaseModel):
                 raise ValueError("queries are required when status is query_required")
             if self.query_stage is None:
                 raise ValueError("query_stage is required when status is query_required")
-            if self.query_stage == IncidentQueryStage.BUSINESS_DATA and self.page is None:
-                raise ValueError(
-                    "page is required before requesting business_data queries"
-                )
         elif self.queries:
             raise ValueError("queries are only valid when status is query_required")
         elif self.query_stage is not None:
@@ -116,13 +118,6 @@ class IncidentDecision(BaseModel):
                 "hermes_skill is only valid when status is hermes_skill_required"
             )
         if self.status == IncidentStatus.COMPLETED:
-            if self.page is None:
-                raise ValueError("page is required when incident investigation is completed")
-            if not self.page.source_paths:
-                raise ValueError(
-                    "at least one verified source path is required when incident investigation "
-                    "is completed"
-                )
             if self.diagnosis is None:
                 raise ValueError("diagnosis is required when incident investigation is completed")
         return self
@@ -143,6 +138,7 @@ class IncidentSession(BaseModel):
     runtime_session_id: str | None = None
     status: IncidentStatus | None = None
     last_decision: IncidentDecision | None = None
+    located_page: LocatedPage | None = None
     last_usage: AgentUsage = Field(default_factory=AgentUsage)
     messages: list[ChatMessage] = Field(default_factory=list)
     query_observations: list[QueryObservation] = Field(default_factory=list)

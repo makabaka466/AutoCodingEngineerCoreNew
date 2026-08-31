@@ -187,17 +187,18 @@ def test_incident_prompt_uses_dialogue_then_image_for_page_identity(
 
 
 def test_completed_incident_requires_a_verified_page_source_path() -> None:
-    with pytest.raises(ValueError, match="at least one verified source path"):
-        IncidentDecision(
-            status=IncidentStatus.COMPLETED,
-            message="Diagnosis complete.",
-            page=LocatedPage(
-                name="Order details",
-                route="/orders/:id",
-                explanation="Only a route candidate was found.",
-            ),
-            diagnosis="The route has not yet been verified against source code.",
-        )
+    decision = IncidentDecision(
+        status=IncidentStatus.COMPLETED,
+        message="Diagnosis complete.",
+        page=LocatedPage(
+            name="Order details",
+            route="/orders/:id",
+            explanation="Only a route candidate was found.",
+        ),
+        diagnosis="The route has not yet been verified against source code.",
+    )
+    with pytest.raises(ValueError, match="verified workspace-relative source path"):
+        IncidentEngine._validate_decision(decision)
 
 
 def test_pinned_workspace_guidance_stays_separate_by_flow(tmp_path: Path) -> None:
@@ -605,6 +606,72 @@ def test_page_lookup_budget_does_not_consume_business_query_budget(
     ]
 
 
+def test_incident_flow_restores_verified_page_when_model_omits_it(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace-page-continuity"
+    workspace.mkdir()
+    first_query = DataQuery(
+        name="upload_log_summary",
+        purpose="Inspect the verified page's upload-log summary.",
+        sql="SELECT id, status FROM orders WHERE id = :id",
+        parameters={"id": 42},
+    )
+    second_query = DataQuery(
+        name="upload_log_detail",
+        purpose="Inspect one additional bounded detail needed for diagnosis.",
+        sql="SELECT id, status FROM orders WHERE id = :id",
+        parameters={"id": 43},
+    )
+    runtime = ScriptedStructuredRuntime(
+        [
+            IncidentDecision(
+                status=IncidentStatus.QUERY_REQUIRED,
+                message="The page is verified; checking upload logs.",
+                page=_page(),
+                query_stage=IncidentQueryStage.BUSINESS_DATA,
+                queries=[first_query],
+            ),
+            IncidentDecision(
+                status=IncidentStatus.QUERY_REQUIRED,
+                message="Checking one additional detail.",
+                query_stage=IncidentQueryStage.BUSINESS_DATA,
+                queries=[second_query],
+            ),
+            IncidentDecision(
+                status=IncidentStatus.COMPLETED,
+                message="Diagnosis complete.",
+                diagnosis="The second row confirms the affected state.",
+            ),
+        ]
+    )
+    database = FakeDatabase()
+    store = JsonIncidentStore(tmp_path / "data-page-continuity")
+    engine = IncidentEngine(runtime, store, database)
+
+    outcome = engine.start(workspace, "The verified upload page has no saved log")
+
+    assert outcome.status == IncidentStatus.COMPLETED
+    assert outcome.page == _page()
+    assert database.queries == [first_query, second_query]
+    saved = store.load(outcome.session_id)
+    assert saved.located_page == _page()
+    repairs = [event for event in saved.events if event.type == EventType.DECISION_REPAIRED]
+    assert len(repairs) == 2
+    assert all(event.data["repair"] == "reuse_verified_page" for event in repairs)
+    assert '"name": "Order details"' in runtime.turns[1].user_message
+    assert saved.query_repair_rounds == 0
+    assert [turn.tools for turn in runtime.turns] == [
+        ["Read"],
+        ["Read", "Glob", "Grep"],
+        ["Read", "Glob", "Grep"],
+    ]
+    assert [item.stage for item in outcome.query_observations] == [
+        IncidentQueryStage.BUSINESS_DATA.value,
+        IncidentQueryStage.BUSINESS_DATA.value,
+    ]
+
+
 def test_incident_image_attachment_is_persisted_and_mounted_read_only(
     tmp_path: Path,
 ) -> None:
@@ -867,20 +934,21 @@ def test_legacy_query_decision_infers_stage_even_when_task_state_exists() -> Non
                 )
             ],
         )
-    with pytest.raises(ValueError, match="page is required"):
-        IncidentDecision(
-            status=IncidentStatus.QUERY_REQUIRED,
-            message="Need business data",
-            query_stage=IncidentQueryStage.BUSINESS_DATA,
-            queries=[
-                DataQuery(
-                    name="orders",
-                    purpose="Inspect state.",
-                    sql="SELECT id FROM orders WHERE id = :id",
-                    parameters={"id": 1},
-                )
-            ],
-        )
+    missing_page = IncidentDecision(
+        status=IncidentStatus.QUERY_REQUIRED,
+        message="Need business data",
+        query_stage=IncidentQueryStage.BUSINESS_DATA,
+        queries=[
+            DataQuery(
+                name="orders",
+                purpose="Inspect state.",
+                sql="SELECT id FROM orders WHERE id = :id",
+                parameters={"id": 1},
+            )
+        ],
+    )
+    with pytest.raises(ValueError, match="verified page is required"):
+        IncidentEngine._validate_decision(missing_page)
 
 
 def test_incident_flow_consults_hermes_and_keeps_external_guidance_untrusted(

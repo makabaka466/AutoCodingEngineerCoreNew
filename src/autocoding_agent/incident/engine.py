@@ -224,6 +224,7 @@ class IncidentEngine:
         session.query_repair_rounds = 0
         session.status = None
         session.last_decision = None
+        session.located_page = None
         session.capability_document = None
         session.events.append(
             AgentEvent(
@@ -438,6 +439,7 @@ class IncidentEngine:
                     progress_sink,
                     [item.path for item in attachments],
                 )
+                decision, page_repaired = self._restore_verified_page(session, decision)
                 self._validate_decision(decision)
             except Exception as exc:
                 self._finish_runtime_run(
@@ -449,6 +451,35 @@ class IncidentEngine:
                 )
                 self.sessions.save(session)
                 return self._fail(session, str(exc), command)
+
+            if decision.page is not None and decision.page.source_paths:
+                session.located_page = decision.page
+            if page_repaired:
+                session.events.append(
+                    AgentEvent(
+                        type=EventType.DECISION_REPAIRED,
+                        message=(
+                            "Restored the omitted page from this cycle's previously verified "
+                            "page context."
+                        ),
+                        actor="host",
+                        command_id=command.id,
+                        correlation_id=run.id,
+                        data={
+                            "repair": "reuse_verified_page",
+                            "decision_type": decision.status.value,
+                            "query_stage": (
+                                decision.query_stage.value if decision.query_stage else None
+                            ),
+                            "page": decision.page.name if decision.page else None,
+                            "source_paths": (
+                                list(decision.page.source_paths) if decision.page else []
+                            ),
+                            "cycle_number": session.cycle_number,
+                            "workflow": "incident",
+                        },
+                    )
+                )
 
             self._finish_runtime_run(
                 session,
@@ -758,6 +789,7 @@ class IncidentEngine:
                 "from code evidence and these results. Do not ask the user to run SQL. Request "
                 "another minimal query round only if essential. The successful query stage was "
                 f"{query_stage.value}.\n\n"
+                + self._verified_page_followup(session)
                 + json.dumps(
                     [result.model_dump(mode="json") for result in results],
                     ensure_ascii=False,
@@ -1260,7 +1292,51 @@ class IncidentEngine:
         )
 
     @staticmethod
+    def _restore_verified_page(
+        session: IncidentSession,
+        decision: IncidentDecision,
+    ) -> tuple[IncidentDecision, bool]:
+        requires_page = (
+            decision.status == IncidentStatus.COMPLETED
+            or (
+                decision.status == IncidentStatus.QUERY_REQUIRED
+                and decision.query_stage == IncidentQueryStage.BUSINESS_DATA
+            )
+        )
+        if not requires_page or decision.page is not None or session.located_page is None:
+            return decision, False
+        return decision.model_copy(update={"page": session.located_page}), True
+
+    @staticmethod
+    def _verified_page_followup(session: IncidentSession) -> str:
+        page = session.located_page
+        if page is None:
+            return ""
+        return (
+            "The verified page remains bound to this investigation cycle. Repeat it in every "
+            "business_data or completed structured decision:\n"
+            + json.dumps(page.model_dump(mode="json"), ensure_ascii=False)
+            + "\n\n"
+        )
+
+    @staticmethod
     def _validate_decision(decision: IncidentDecision) -> None:
+        requires_page = (
+            decision.status == IncidentStatus.COMPLETED
+            or (
+                decision.status == IncidentStatus.QUERY_REQUIRED
+                and decision.query_stage == IncidentQueryStage.BUSINESS_DATA
+            )
+        )
+        if requires_page and decision.page is None:
+            raise ValueError(
+                "A verified page is required before business-data queries or completion."
+            )
+        if requires_page and decision.page is not None and not decision.page.source_paths:
+            raise ValueError(
+                "At least one verified workspace-relative source path is required before "
+                "business-data queries or completion."
+            )
         paths: list[str] = []
         if decision.page is not None:
             paths.extend(decision.page.source_paths)

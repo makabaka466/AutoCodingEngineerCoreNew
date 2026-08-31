@@ -81,6 +81,7 @@ class EventType(StrEnum):
     RUNTIME_INTERRUPTED = "runtime_interrupted"
     RECOVERY_REQUIRED = "recovery_required"
     DECISION_RECORDED = "decision_recorded"
+    DECISION_REPAIRED = "decision_repaired"
     ARTIFACT_RECORDED = "artifact_recorded"
     ARTIFACT_FAILED = "artifact_failed"
     INPUT_REQUIRED = "input_required"

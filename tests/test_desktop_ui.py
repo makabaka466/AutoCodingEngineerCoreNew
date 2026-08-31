@@ -798,6 +798,14 @@ def test_light_theme_and_configured_workspace_keep_composer_compact(
     assert client.send_button.cget("background") == COLORS["accent"]
     assert client.send_button.cget("foreground") == "#FFFFFF"
     assert client.transcript.tag_cget("user_message", "background") == COLORS["accent_soft"]
+    assert client.transcript.cget("cursor") == "xterm"
+    assert client.transcript.cget("exportselection") == 0
+    assert client.transcript.cget("selectbackground") == COLORS["progress_accent"]
+    assert client.transcript.bind("<Button-1>")
+    assert client.transcript.bind("<Control-c>")
+    assert client.transcript.bind("<Button-3>")
+    client._select_all_transcript()
+    assert client.transcript.tag_ranges("sel")
     assert client.status_badge.cget("highlightthickness") == 1
     assert COLORS["progress_accent"] == "#667EEA"
     assert client.activity_frame.cget("background") == COLORS["progress_accent_soft"]

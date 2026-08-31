@@ -1,6 +1,6 @@
 # AutoCoding Engineer 架构说明
 
-本文描述当前 `0.7.6` 代码已经实现的架构。数据字段、公共方法和命令行参数见
+本文描述当前 `0.7.7` 代码已经实现的架构。数据字段、公共方法和命令行参数见
 [接口与数据契约](INTERFACES.md)。
 
 ## 1. 项目目标
@@ -306,7 +306,8 @@ Runtime run 的 owner、PID、heartbeat 和终态同样进入 SQLite，供启动
 ## 5. 异常诊断流程
 
 `IncidentSession` 保存问题、可选页面线索、消息附件、来源、外部消息引用、Claude 会话 ID、最后决定、
-`TaskState`、version/revision、事件、Runtime Run、CommandReceipt 和查询审计摘要。默认快照位于
+本 cycle 已验证的 `located_page`、`TaskState`、version/revision、事件、Runtime Run、
+CommandReceipt 和查询审计摘要。默认快照位于
 `agent-runtime.db` 的异常专用表；旧 `~/.autocoding-agent/incidents/*.json` 只作为幂等导入源，
 不会与开发任务 aggregate 混用。
 
@@ -360,6 +361,12 @@ stateDiagram-v2
 不会因为参数格式错误吃掉页面或业务的成功查询额度。达到对应上限才转为失败。成功查询只把限行、
 脱敏后的结果发回当前 Runtime。持久化审计保存查询阶段、成功/失败状态、脱敏错误、查询名称、
 用途、SQL SHA-256 指纹、参数名、行数、截断和脱敏列，不保存 SQL 参数值或原始业务行。
+
+结构化输出中的 `page` 是跨轮连续上下文。模型每次进入 `business_data` 或 `completed` 都应重复
+页面和工作区相对源码路径；宿主在首次验证后同时保存 `located_page` 并在查询结果回灌中明确提醒。
+如果同一 cycle 的后续决定只漏掉该字段，宿主复用已经验证的对象并追加 `decision_repaired` 事件，
+避免把成功调查误判为任务失败。没有历史验证页面、页面缺少源码路径或路径越界时仍确定性拒绝；
+completed 会话开启新 cycle 时清空该绑定，防止把上一问题的页面静默用于新问题。
 
 桌面默认 `SQLServerDatabaseReader` 使用 ODBC 和 `ApplicationIntent=ReadOnly`，只接受单条
 `SELECT/WITH`，拒绝分号、注释、写入、DDL、执行、批量和外部数据源等操作；模型契约优先使用
@@ -599,7 +606,9 @@ Windows 进程启动失败不再被合并成同一个误导性错误。
 对应的应用门面。桌面端把同步模型调用放在单一后台线程，所有 Tk 控件仍只由 UI 线程更新；
 执行期间禁止重复提交和流程/会话切换。Runtime 具备内部 interrupt 端口；产品界面在安全边界
 提供 pause/cancel，并在 recovery_required 时显示只读检查、重新规划和取消选项，不把进程终止
-描述成副作用回滚。
+描述成副作用回滚。聊天 transcript 使用只读 `Text` 控件：全部用户、Agent、系统和元数据文本
+都可以用鼠标选择，选区有明确高亮，并支持 `Ctrl+C`、`Ctrl+A` 以及右键复制/全选；只读状态只
+阻止编辑，不阻止用户取得自己的对话内容。
 
 新的交付媒介可以复用同一门面，无需复制会话、审批或 Runtime 逻辑。模型运行时和会话存储
 分别通过 `AgentRuntime`、`SessionStore` Protocol 替换；当前能力存储由 `AgentEngine` 直接

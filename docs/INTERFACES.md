@@ -1,6 +1,6 @@
 # AutoCoding Engineer 接口与数据契约
 
-本文记录当前 `0.7.6` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
+本文记录当前 `0.7.7` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
 Runtime、持久化和状态契约。
 设计动机和运行流程见[架构说明](ARCHITECTURE.md)。
 
@@ -130,7 +130,7 @@ def build_application(
 - `EventType`：除任务、状态、输入、审批、完成、失败、能力和数据库事件外，还包括
   `runtime_started/activity/completed/failed/interrupted`、`tool_started/finished`、
   `code_modified`、`test_executed`、`verification_failed`、`recovery_required`、
-  `decision_recorded`、`artifact_recorded/failed`、`task_reopened`。
+  `decision_recorded/repaired`、`artifact_recorded/failed`、`task_reopened`。
 - `RecoveryAction`：`read_only_inspect`、`replan`、`cancel`。
 
 ## 3. 结构化模型契约
@@ -748,6 +748,8 @@ autocoding-agent-client
 - SQL Server 不重复占用输入区，统一从“系统配置”管理；
 - 统一系统配置和本地滚动日志目录快捷入口；
 - 新任务、持久化聊天记录及同一 session 的多轮补充；
+- 对话记录整体保持只读但允许鼠标选取；支持 `Ctrl+C` 复制、`Ctrl+A` 全选，以及右键
+  `复制所选文本` / `全选对话`，选区不会因打开右键菜单而丢失；
 - `approval_required` 的完整修改方案、当前/目标状态、影响、验证计划、预览，以及批准或调整；
 - `recovery_required` 的只读检查、重新规划和取消恢复卡，并显示当前 TaskState；
 - evidence、changed files、测试摘要和能力文档路径；
@@ -931,6 +933,10 @@ automation_candidate: bool
 
 `LocatedPage` 保存名称、可选 route、页面源码路径、相关后端路径和定位依据。所有源码路径必须
 是安全的工作区相对路径；映射表返回的 URL 在打开当前代码验证前不能直接写成最终源码事实。
+模型契约要求每个 `business_data` 和 `completed` 决定都重复 `page`。为容忍模型在连续轮次中
+遗漏重复字段，`IncidentSession.located_page` 保存本 cycle 最近一次通过宿主校验且至少含一个
+源码路径的页面；后续决定漏传 `page` 时宿主可以恢复该对象并记录 `decision_repaired`。这不是
+放宽页面前置条件：没有已验证页面、路径为空/越界或进入新 cycle 时都不能自动补全。
 `DataQuery` 保存名称、用途、SQL、命名参数和 1–100 的请求行数，默认
 为 100；参数契约优先使用 `:name`，参数字典键写不带前缀的 `name`。SQL Server 适配器还安全
 兼容 `@name`，统一转换成 ODBC `?` 后按出现顺序独立绑定，绝不插值。数据库适配器仍会应用更小的主机上限。结果数量未知时，开发与异常 Prompt 都要求模型
@@ -944,7 +950,7 @@ automation_candidate: bool
 `IncidentSession` 与开发会话一样保存 `cycle_number/cycle_objective` 和当前轮查询审计起点；另外
 保存总尝试数 `query_rounds`、成功页面查询数 `page_query_rounds`、成功业务查询数
 `business_query_rounds` 和 SQL 失败纠错数 `query_repair_rounds`。四项在 completed 会话续聊进入
-新 cycle 时重置，但历史 Observation/Event 不清空；
+新 cycle 时重置，同时清空 `located_page`，但历史 Observation/Event 不清空；
 `IncidentOutcome` 只返回本 cycle 的查询摘要，Session/Event 继续保留全部历史审计。
 
 ### 11.3 `DatabaseReader`

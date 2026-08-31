@@ -1033,7 +1033,11 @@ class DesktopClient:
             spacing1=2,
             spacing3=6,
             font=("Microsoft YaHei UI", 10),
-            cursor="arrow",
+            cursor="xterm",
+            takefocus=True,
+            exportselection=False,
+            selectbackground=COLORS["progress_accent"],
+            selectforeground="#FFFFFF",
         )
         self.transcript.grid(row=1, column=0, sticky="nsew")
         transcript_scroll = ttk.Scrollbar(
@@ -1118,6 +1122,19 @@ class DesktopClient:
             spacing3=9,
         )
         self.transcript.configure(state="disabled")
+        self.transcript.bind("<Button-1>", self._focus_transcript, add="+")
+        self.transcript.bind("<Control-c>", self._copy_selected_transcript)
+        self.transcript.bind("<Control-C>", self._copy_selected_transcript)
+        self.transcript.bind("<Control-a>", self._select_all_transcript)
+        self.transcript.bind("<Control-A>", self._select_all_transcript)
+        self.transcript.bind("<Button-3>", self._show_transcript_menu)
+        self.transcript_menu = tk.Menu(self.transcript, tearoff=False)
+        self.transcript_menu.add_command(
+            label="复制所选文本", command=self._copy_selected_transcript
+        )
+        self.transcript_menu.add_command(
+            label="全选对话", command=self._select_all_transcript
+        )
 
         self.approval_frame = tk.Frame(
             main,
@@ -2349,6 +2366,35 @@ class DesktopClient:
         self.transcript.insert("end", f"{message}{attachment_note}\n\n", "message")
         self.transcript.configure(state="disabled")
         self.transcript.see("end")
+
+    def _focus_transcript(self, _event: tk.Event[tk.Text]) -> None:
+        self.transcript.focus_set()
+
+    def _copy_selected_transcript(self, _event: tk.Event[tk.Text] | None = None) -> str:
+        try:
+            selected = self.transcript.get("sel.first", "sel.last")
+        except tk.TclError:
+            return "break"
+        self.root.clipboard_clear()
+        self.root.clipboard_append(selected)
+        return "break"
+
+    def _select_all_transcript(self, _event: tk.Event[tk.Text] | None = None) -> str:
+        self.transcript.tag_add("sel", "1.0", "end-1c")
+        self.transcript.mark_set("insert", "1.0")
+        self.transcript.see("1.0")
+        return "break"
+
+    def _show_transcript_menu(self, event: tk.Event[tk.Text]) -> str:
+        has_selection = bool(self.transcript.tag_ranges("sel"))
+        self.transcript_menu.entryconfigure(
+            "复制所选文本", state="normal" if has_selection else "disabled"
+        )
+        try:
+            self.transcript_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.transcript_menu.grab_release()
+        return "break"
 
     def _on_prompt_paste(self, _event: tk.Event[tk.Misc]) -> str | None:
         if self.flow != FlowKind.INCIDENT or self._busy:
