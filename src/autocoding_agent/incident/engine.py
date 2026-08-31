@@ -38,6 +38,7 @@ from autocoding_agent.core.runtime.models import (
     RuntimeEventKind,
     RuntimeRunRecord,
 )
+from autocoding_agent.core.search_policy import BOUNDED_SEARCH_RULES
 from autocoding_agent.core.state_machine.machine import AgentStateMachine
 from autocoding_agent.core.state_machine.models import (
     AgentCommand,
@@ -1399,6 +1400,8 @@ def _system_prompt(
 ## Runtime context
 
 This Runtime exposes only Read, Glob, and Grep tools. {capability_note}
+
+{BOUNDED_SEARCH_RULES}
 
 Available database schema metadata for the current configured connection:
 <database_schema>

@@ -1,6 +1,6 @@
 # AutoCodingEngineerCoreNew 项目开发与工程经验
 
-> 文档基线：2026-08-31，项目版本 `0.7.4`。本文以当前代码为准，并明确区分“已实现”、
+> 文档基线：2026-08-31，项目版本 `0.7.5`。本文以当前代码为准，并明确区分“已实现”、
 > “当前限制”和“后续规划”。当前 Agent 已具备状态机、追加事件、运行记录、决策审计、
 > 任务产物、保守恢复，以及按会话持续沉淀开发/异常能力知识的 Runtime 内核。
 
@@ -442,7 +442,7 @@ task 获得连续 sequence，snapshot 使用 revision 拒绝并发旧保存，�
 
 ```text
 -p
---bare
+--safe-mode
 --no-chrome
 --strict-mcp-config
 --mcp-config {"mcpServers":{}}
@@ -453,14 +453,15 @@ task 获得连续 sequence，snapshot 使用 revision 拒绝并发旧保存，�
 --permission-mode dontAsk
 --tools <mode-specific tools>
 --allowedTools <host-approved tools>
---append-system-prompt <skills + boundaries>
+--append-system-prompt-file <per-turn temporary file>
 --json-schema <Pydantic schema>
 --session-id <new id> 或 --resume <exact runtime id>
 ```
 
 关键设计：
 
-- `--bare`、空 setting sources 和严格空 MCP 隔离目标仓库及用户全局设置，防止其扩展权限；
+- `--safe-mode`、空 setting sources 和严格空 MCP 隔离目标仓库及用户全局设置，同时保留白名单中的
+  原生Read/Glob/Grep；
 - `--no-chrome` 避免加载浏览器集成；
 - Runtime 逐行解析 system、assistant、ToolUse、ToolResult 和 result envelope；
 - `structured_output` 再经过一次 Pydantic 校验；
@@ -763,8 +764,9 @@ Windows 下不能保证解析它，PowerShell 还可能阻止 `claude.ps1`。
 **问题**：目标仓库或用户的 Claude settings、hooks、MCP、Skills 可能引入额外工具或自动授权，
 破坏宿主权限矩阵。
 
-**解决**：使用 `--bare`、空 setting sources、严格空 MCP config 和 `--no-chrome`，只暴露当前
-模式声明的内置工具。项目 CLAUDE.md 若被读取，也只是低优先级不可信项目上下文。
+**解决**：使用 `--safe-mode`、空 setting sources、严格空 MCP config 和 `--no-chrome`，只暴露
+当前模式声明的内置工具，同时避免`--bare`移除必要的Glob/Grep。项目 CLAUDE.md 若被模型主动
+读取，也只是低优先级不可信项目上下文。
 
 **经验**：提示词中的“请勿修改”不是权限边界，工具可见性和外部配置隔离才是。
 
@@ -1241,7 +1243,8 @@ FTS 精确词检索 ─┐
 - `v0.7.1`：ACE 到 Hermes 的 DeepSeek provider 安全桥接、独立 Flash 模型和真实联调；
 - `v0.7.2`：Claude启动配置刷新、失效路径恢复、启动目标预检和明确错误分类；
 - `v0.7.3`：大提示词改用临时文件、用户消息改用stdin，并增加Windows命令行长度预检；
-- `v0.7.4（当前）`：异常查询按页面/业务/纠错分配独立预算，补充安全参数兼容与失败审计；
+- `v0.7.4`：异常查询按页面/业务/纠错分配独立预算，补充安全参数兼容与失败审计；
+- `v0.7.5（当前）`：恢复原生 Glob/Grep，增加精确文件定位提示、搜索预算、范围校验和审计熔断；
 - 下一检索迭代：外部 VectorStore、健康检查、批量迁移和真实检索评测集；
 - 治理迭代：统一 Engineering Knowledge/Candidate 模型，把 Capability、异常与失败日志转为候选；
 - 质量迭代：脱敏、去重、冲突检测、陈旧标记、人工审核与基于证据的晋级；
@@ -2643,3 +2646,72 @@ Schema发现协议：先向模型提供有界表目录，允许模型根据页�
 确定性测试覆盖双占位符绑定、`@@`系统变量与引用内容、阶段契约、旧会话迁移、两轮页面查询后继续
 业务查询、SQL失败自动纠错、部分查询审计、能力文档和桌面失败摘要。发布检查为192项非live测试
 通过，Ruff、compileall和diff whitespace检查通过；没有执行写数据库或真实业务接口测试。
+
+---
+
+## 36. 原生源码搜索恢复与有界检索（v0.7.5）
+
+### 36.1 问题背景与证据
+
+异常流程已通过数据库菜单映射获得`FC良率上传机型 -> Ckhy.MES.Client.CKClient.FCModelUpload`，
+但随后仍要求用户提供源码相对路径。核对工作区后确认源码真实存在于嵌套目录
+`zwqtmes/MESClient/CKClient/FCModelUpload.cs`；Claude会话记录则显示`Glob is disabled`和
+`Grep is disabled`，直接`Read`尝试都遗漏了`zwqtmes`这一层。因此问题不是数据库映射错误，也不是
+源码缺失，而是Runtime虽然在白名单中声明了Glob/Grep，却同时使用`--bare`把这两个原生工具从
+Claude Code会话中移除了。
+
+使用当前Claude Code 2.1.237做对照验证：`--bare`下模型只能使用Read；改为`--safe-mode`且保持相同
+的`--tools Read,Glob,Grep`后，精确Glob模式`**/FCModelUpload.cs`成功返回
+`zwqtmes/MESClient/CKClient/FCModelUpload.cs`。另一次边界实验表明，仅增加
+`--disallowedTools Glob(**/*)`并不能阻止全量模式，实际仍列出634个匹配路径，所以不能把该参数
+写法当作可靠范围控制。
+
+### 36.2 方案权衡
+
+最终没有恢复“无限制原生搜索”，也没有用文件名关键词表代替模型判断。采用三层组合：
+
+1. `--safe-mode`恢复显式白名单内的内置搜索，同时继续隔离项目/用户Claude自定义项；
+2. 共享提示规则要求从数据库映射、类名、页面标题、路由或已知路径推导精确文件名，先Read或
+   `**/ExactFile.cs`，再在候选文件/子树内Grep；
+3. 宿主对流式工具调用实施机械边界：越界路径、仓库级Glob、无上限/无文件过滤的目录Grep、单轮
+   超预算会被审计并熔断。
+
+没有把业务类名、MES目录结构或页面名称写进宿主规则。模型仍负责“哪个页面、哪个类、哪段代码
+相关”的语义判断；代码只处理无需模型推理即可确定的最坏情况。这符合本项目“模型做判断，宿主做
+权限和资源边界”的总体原则。
+
+### 36.3 核心实现与行为
+
+`core/search_policy.py`同时提供模型可见的`BOUNDED_SEARCH_RULES`和宿主
+`BoundedSearchGuard`。开发与异常流程复用同一规则：
+
+- 每个Runtime turn最多8次Glob/Grep；
+- 禁止`*`、`**`、`**/*`、`**/*.cs`及等价的递归全扩展枚举；
+- 允许`**/FCModelUpload.cs`、`**/*FCModelUpload*.cs`等带业务锚点的精确候选定位；
+- Grep必须设置1..100的`head_limit`；目录搜索还必须提供`glob`或`type`，精确文件搜索不强制；
+- 显式path解析后必须位于workspace、能力目录或本轮附件目录；`..`或外部绝对目录不能绕过；
+- Runtime审计保留path/pattern/glob/type/output mode/head limit等脱敏摘要，不保存匹配正文。
+
+模型一旦产生机械违规调用，流式适配器写入`policy_blocked`活动、记录安全日志、终止当前进程，并
+返回要求缩小到文件名/类名/候选子目录的明确错误。正常搜索继续产生`tool_started/tool_finished`，
+桌面状态仍投影为“正在定位页面”或“正在阅读相关代码”。
+
+### 36.4 技术边界与后续方向
+
+当前保护重点是避免默认全库枚举、限制结果规模并留下审计证据，不宣称它是操作系统级文件沙箱。
+Claude Code 2.1.237尚不具备新版本CLI的完整restricted mode；流式熔断也不同于工具内部的原子
+PreToolUse沙箱。后续升级Claude Code后，应评估官方restricted mode或ACE自有的受控搜索工具，
+把“调用前拒绝”做成更强边界，同时保留本次精确搜索策略作为资源预算层。
+
+### 36.5 决策记录
+
+- ADR-106：用`--safe-mode`替代会移除原生搜索的`--bare`，工具能力仍由状态白名单决定；
+- ADR-107：源码定位优先使用证据派生的精确文件名/子树，不以仓库清单作为调查入口；
+- ADR-108：Glob/Grep共享8次调用预算，目录Grep必须有文件过滤和至多100条输出；
+- ADR-109：明显越界搜索进入Runtime审计并熔断；后续再以restricted mode或受控工具强化原子边界。
+
+### 36.6 验证结果
+
+新增测试覆盖精确Glob放行、全库/全扩展Glob拒绝、Grep上限与文件过滤、精确文件例外、路径越界、
+组合调用预算、流式policy事件和进程终止。真实Claude Code + DeepSeek联调在MES测试工作区成功定位
+嵌套页面源码；测试过程只读取文件路径，没有修改源码、执行数据库写入或调用业务接口测试。

@@ -22,6 +22,7 @@ from autocoding_agent.adapters.process_options import hidden_window_options
 from autocoding_agent.config import Settings, resolve_claude_command
 from autocoding_agent.core.models import AgentDecision, AgentUsage, RuntimeResult, RuntimeTurn
 from autocoding_agent.core.runtime.models import RuntimeActivity, RuntimeEventKind
+from autocoding_agent.core.search_policy import BoundedSearchGuard, SearchPolicyViolation
 from autocoding_agent.ports.runtime import RuntimeEventSink, RuntimeInterruptedError
 from autocoding_agent.ports.structured_runtime import StructuredRuntimeResult
 
@@ -202,6 +203,10 @@ class ClaudeCodeRuntime:
         stdout_done = False
         result_envelope: dict[str, Any] | None = None
         tool_context: dict[str, tuple[str, dict[str, Any]]] = {}
+        search_guard = BoundedSearchGuard(
+            turn.workspace,
+            [item for item in [turn.capability_dir, *turn.additional_dirs] if item],
+        )
         try:
             while not (stdout_done and process.poll() is not None):
                 now = time.monotonic()
@@ -242,6 +247,29 @@ class ClaudeCodeRuntime:
                     continue
                 if envelope.get("type") == "result":
                     result_envelope = envelope
+                violation = _search_policy_violation(envelope, search_guard)
+                if violation is not None:
+                    event_sink(
+                        RuntimeActivity(
+                            run_id=run_id,
+                            kind=RuntimeEventKind.POLICY_BLOCKED,
+                            summary=f"ACE blocked an over-broad {violation.tool_name} search.",
+                            tool_name=violation.tool_name,
+                            data={"reason": violation.reason},
+                        )
+                    )
+                    logger.warning(
+                        "search_policy_blocked session_id=%s run_id=%s tool=%s reason=%s",
+                        turn.session_id,
+                        run_id,
+                        violation.tool_name,
+                        violation.reason,
+                    )
+                    self._terminate_process(process)
+                    raise ClaudeCodeError(
+                        "ACE 已阻止范围过大的源码搜索。"
+                        f"{violation.reason}。请缩小到明确文件名、类名或候选子目录后重试。"
+                    )
                 for activity in _stream_activities(
                     envelope,
                     run_id=run_id,
@@ -476,7 +504,7 @@ class ClaudeCodeRuntime:
         command = [
             self.settings.claude_command,
             "-p",
-            "--bare",
+            "--safe-mode",
             "--no-chrome",
             "--strict-mcp-config",
             "--mcp-config",
@@ -767,6 +795,28 @@ def _stream_activities(
     return activities
 
 
+def _search_policy_violation(
+    envelope: dict[str, Any],
+    guard: BoundedSearchGuard,
+) -> SearchPolicyViolation | None:
+    if envelope.get("type") != "assistant":
+        return None
+    message = envelope.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(content, list):
+        return None
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "tool_use":
+            continue
+        violation = guard.inspect(
+            str(block.get("name") or "unknown"),
+            block.get("input"),
+        )
+        if violation is not None:
+            return violation
+    return None
+
+
 def _safe_tool_data(tool_name: str, raw_input: Any, workspace: str) -> dict[str, Any]:
     if not isinstance(raw_input, dict):
         return {}
@@ -774,12 +824,22 @@ def _safe_tool_data(tool_name: str, raw_input: Any, workspace: str) -> dict[str,
         return {
             "command": _safe_runtime_text(str(raw_input.get("command") or ""), workspace, limit=800)
         }
+    data: dict[str, Any] = {}
     for key in ("file_path", "path"):
         if raw_input.get(key):
-            return {"path": _safe_path_hint(str(raw_input[key]), workspace)}
+            data["path"] = _safe_path_hint(str(raw_input[key]), workspace)
+            break
     if raw_input.get("pattern"):
-        return {"pattern": _safe_runtime_text(str(raw_input["pattern"]), workspace, limit=300)}
-    return {}
+        data["pattern"] = _safe_runtime_text(
+            str(raw_input["pattern"]), workspace, limit=300
+        )
+    for key in ("glob", "type", "output_mode"):
+        if raw_input.get(key):
+            data[key] = _safe_runtime_text(str(raw_input[key]), workspace, limit=100)
+    head_limit = raw_input.get("head_limit")
+    if isinstance(head_limit, int) and not isinstance(head_limit, bool):
+        data["head_limit"] = head_limit
+    return data
 
 
 def _safe_path_hint(value: str, workspace: str) -> str:

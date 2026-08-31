@@ -69,7 +69,8 @@ def test_build_command_contains_structured_contract_and_new_session_id(tmp_path:
 
     assert command[0] == "D:/claude/claude.exe"
     assert turn.user_message not in command
-    assert "--bare" in command
+    assert "--safe-mode" in command
+    assert "--bare" not in command
     assert "--no-chrome" in command
     assert "--strict-mcp-config" in command
     assert _option_value(command, "--mcp-config") == '{"mcpServers":{}}'
@@ -518,6 +519,41 @@ def test_observed_runtime_supports_incident_structured_contract(tmp_path: Path) 
     assert result.output.status == IncidentStatus.NEEDS_INPUT
     assert result.output.question == "What title is visible on the page?"
     assert activities[0].kind == RuntimeEventKind.SYSTEM_INIT
+
+
+def test_observed_runtime_blocks_repository_wide_glob(tmp_path: Path) -> None:
+    stream = [
+        {"type": "system", "subtype": "init", "model": "deepseek-test"},
+        {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "tool-broad-glob",
+                        "name": "Glob",
+                        "input": {"pattern": "**/*"},
+                    }
+                ]
+            },
+        },
+    ]
+    script = "import sys, time\n" + "\n".join(
+        f"print({json.dumps(json.dumps(item))}, flush=True)" for item in stream
+    ) + "\ntime.sleep(30)"
+
+    def popen_factory(command: list[str], **kwargs: object) -> subprocess.Popen[str]:
+        return subprocess.Popen([sys.executable, "-c", script], **kwargs)
+
+    runtime = ClaudeCodeRuntime(_settings(tmp_path), popen_factory=popen_factory)
+    activities = []
+
+    with pytest.raises(ClaudeCodeError, match="范围过大的源码搜索"):
+        runtime.run_observed(_turn(tmp_path), "run-broad-glob", activities.append)
+
+    assert activities[-1].kind == RuntimeEventKind.POLICY_BLOCKED
+    assert activities[-1].tool_name == "Glob"
+    assert "禁止通配整个项目" in activities[-1].data["reason"]
 
 
 def test_observed_runtime_can_be_interrupted(tmp_path: Path) -> None:

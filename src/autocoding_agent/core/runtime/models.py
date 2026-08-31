@@ -23,6 +23,7 @@ class RuntimeEventKind(StrEnum):
     TOOL_FINISHED = "tool_finished"
     HEARTBEAT = "heartbeat"
     PROTOCOL_WARNING = "protocol_warning"
+    POLICY_BLOCKED = "policy_blocked"
 
 
 class RunStatus(StrEnum):

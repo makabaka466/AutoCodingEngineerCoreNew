@@ -1,6 +1,6 @@
 # AutoCoding Engineer 接口与数据契约
 
-本文记录当前 `0.7.4` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
+本文记录当前 `0.7.5` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
 Runtime、持久化和状态契约。
 设计动机和运行流程见[架构说明](ARCHITECTURE.md)。
 
@@ -479,7 +479,7 @@ class StructuredRuntime(Protocol):
 
 ```text
 claude -p
-  --bare
+  --safe-mode
   --no-chrome
   --strict-mcp-config
   --mcp-config '{"mcpServers":{}}'
@@ -510,6 +510,13 @@ Windows 运行时还会传入隐藏 `STARTUPINFO` 和 `CREATE_NO_WINDOW`，避�
 Runner/Popen 时跳过本机路径恢复，保留可替换 Runtime 的确定性测试边界。每次调用还会记录
 `command_chars`、系统提示词/用户消息/JSON Schema 的字符数，并在 Windows `CreateProcess` 前
 拒绝仍达到 32,767 字符的剩余参数；日志不包含这些输入的正文。
+
+`--safe-mode` 与显式 `--tools/--allowedTools` 组合使用：前者阻止项目或用户自定义项改变本轮
+行为，后者只开放当前状态允许的原生工具。可观测 Runtime 还会检查每个流式 `Glob/Grep`
+调用：单轮组合预算为 8 次；Glob 不接受通配整个仓库或递归全扩展模式；目录级 Grep 必须设置
+`glob/type` 和 `head_limit=1..100`；显式搜索路径必须位于 workspace、能力目录或附件目录。
+违反策略会产生 `RuntimeEventKind.POLICY_BLOCKED`，审计中只保存工具名、脱敏后的范围信息和阻断
+原因，不保存源码正文。
 
 ```json
 {
