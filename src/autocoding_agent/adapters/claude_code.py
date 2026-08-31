@@ -546,13 +546,17 @@ class ClaudeCodeRuntime:
             turn.permission_mode,
             "--tools",
             ",".join(turn.tools),
-            "--allowedTools",
-            *turn.allowed_tools,
-            "--append-system-prompt-file",
-            str(prompt_path),
-            "--json-schema",
-            schema,
         ]
+        if turn.allowed_tools:
+            command.extend(["--allowedTools", *turn.allowed_tools])
+        command.extend(
+            [
+                "--append-system-prompt-file",
+                str(prompt_path),
+                "--json-schema",
+                schema,
+            ]
+        )
         if stream:
             command.extend(["--verbose", "--include-hook-events"])
         read_directories = [

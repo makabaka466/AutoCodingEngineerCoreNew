@@ -66,8 +66,10 @@ class ScriptedRuntime:
 class FakeDatabase:
     def __init__(self) -> None:
         self.queries: list[DataQuery] = []
+        self.describe_calls = 0
 
     def describe_schema(self) -> str:
+        self.describe_calls += 1
         return "orders(id INTEGER, status TEXT)"
 
     def execute(self, query: DataQuery) -> QueryResult:
@@ -313,7 +315,10 @@ def test_development_flow_can_use_shared_read_only_database(tmp_path: Path) -> N
     assert database.queries == [query]
     assert outcome.query_observations[0].returned_rows == 1
     assert len(runtime.turns) == 2
-    assert "orders(id INTEGER, status TEXT)" in runtime.turns[0].system_prompt
+    assert database.describe_calls == 0
+    assert "orders(id INTEGER, status TEXT)" not in runtime.turns[0].system_prompt
+    assert "Microsoft SQL Server (T-SQL)" in runtime.turns[0].system_prompt
+    assert "INFORMATION_SCHEMA.COLUMNS" in runtime.turns[0].system_prompt
     assert "Never ask the user to run SQL" in " ".join(
         runtime.turns[0].system_prompt.split()
     )

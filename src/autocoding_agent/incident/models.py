@@ -23,6 +23,8 @@ from autocoding_agent.database_models import (
 
 __all__ = [
     "DataQuery",
+    "IncidentContinuationDecision",
+    "IncidentContinuationStatus",
     "IncidentDecision",
     "IncidentFinding",
     "IncidentOutcome",
@@ -53,6 +55,13 @@ class IncidentQueryStage(StrEnum):
     BUSINESS_DATA = "business_data"
 
 
+class IncidentContinuationStatus(StrEnum):
+    """Model-owned routing for a message sent after a completed incident cycle."""
+
+    ANSWER = "answer"
+    INVESTIGATE = "investigate"
+
+
 class LocatedPage(BaseModel):
     """The page and related code located by the model."""
 
@@ -66,6 +75,22 @@ class LocatedPage(BaseModel):
 class IncidentFinding(BaseModel):
     summary: NonEmptyText
     evidence: list[NonEmptyText] = Field(default_factory=list)
+
+
+class IncidentContinuationDecision(BaseModel):
+    """Compact follow-up answer or escalation without replaying the full workflow prompt."""
+
+    status: IncidentContinuationStatus
+    message: NonEmptyText
+    diagnosis: NonEmptyText | None = None
+    recommended_actions: list[NonEmptyText] = Field(default_factory=list)
+    confidence: float | None = Field(default=None, ge=0, le=1)
+
+    @model_validator(mode="after")
+    def validate_answer(self) -> IncidentContinuationDecision:
+        if self.status == IncidentContinuationStatus.ANSWER and self.diagnosis is None:
+            raise ValueError("diagnosis is required for a completed continuation answer")
+        return self
 
 
 class IncidentDecision(BaseModel):

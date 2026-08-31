@@ -64,6 +64,7 @@ from autocoding_agent.core.state_machine.models import (
     TaskState,
 )
 from autocoding_agent.database_models import QueryObservation, QueryResult, sql_fingerprint
+from autocoding_agent.database_prompt import compact_database_context
 from autocoding_agent.knowledge_rag.models import KnowledgeDomain
 from autocoding_agent.knowledge_rag.ports import KnowledgeRetriever
 from autocoding_agent.knowledge_rag.service import workspace_id_for
@@ -666,10 +667,9 @@ class AgentEngine:
                 ),
             )
             try:
-                database_schema = (
-                    self.database.describe_schema()
-                    if mode == AgentMode.INSPECT and self.database is not None
-                    else "No shared read-only database is configured for this task."
+                database_context = compact_database_context(
+                    configured=mode == AgentMode.INSPECT and self.database is not None,
+                    reference=self.database_reference,
                 )
                 handler = self.handlers.for_state(session.task_state)
                 handler_result = handler.execute(
@@ -683,7 +683,7 @@ class AgentEngine:
                             self.skills.build_system_prompt(
                                 mode,
                                 readable_capability_dir,
-                                database_schema,
+                                database_context,
                                 session.project,
                                 self.hermes.catalog_prompt(),
                             )

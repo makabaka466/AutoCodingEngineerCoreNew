@@ -121,6 +121,20 @@ def test_build_command_resumes_exact_runtime_session(tmp_path: Path) -> None:
     assert "--max-budget-usd" not in command
 
 
+def test_build_command_can_explicitly_disable_all_tools(tmp_path: Path) -> None:
+    runtime = ClaudeCodeRuntime(_settings(tmp_path))
+    turn = _turn(tmp_path)
+    turn.tools = []
+    turn.allowed_tools = []
+    prompt_file = tmp_path / "system-prompt.md"
+    prompt_file.write_text(turn.system_prompt, encoding="utf-8")
+
+    command = runtime.build_command(turn, system_prompt_file=prompt_file)
+
+    assert _option_value(command, "--tools") == ""
+    assert "--allowedTools" not in command
+
+
 def test_build_command_mounts_capability_and_isolated_attachment_directories(
     tmp_path: Path,
 ) -> None:

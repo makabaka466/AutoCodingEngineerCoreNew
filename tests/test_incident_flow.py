@@ -33,6 +33,8 @@ from autocoding_agent.incident.capability_store import IncidentCapabilityStore
 from autocoding_agent.incident.engine import IncidentEngine
 from autocoding_agent.incident.models import (
     DataQuery,
+    IncidentContinuationDecision,
+    IncidentContinuationStatus,
     IncidentDecision,
     IncidentQueryStage,
     IncidentSession,
@@ -52,19 +54,25 @@ from autocoding_agent.ports.structured_runtime import StructuredRuntimeResult
 
 
 class ScriptedStructuredRuntime:
-    def __init__(self, decisions: Iterable[IncidentDecision]) -> None:
+    def __init__(
+        self,
+        decisions: Iterable[IncidentDecision | IncidentContinuationDecision],
+    ) -> None:
         self.decisions = iter(decisions)
         self.turns: list[RuntimeTurn] = []
 
     def run_structured(
         self,
         turn: RuntimeTurn,
-        response_model: type[IncidentDecision],
-    ) -> StructuredRuntimeResult[IncidentDecision]:
-        assert response_model is IncidentDecision
+        response_model: type[IncidentDecision] | type[IncidentContinuationDecision],
+    ) -> StructuredRuntimeResult[IncidentDecision] | StructuredRuntimeResult[
+        IncidentContinuationDecision
+    ]:
         self.turns.append(turn)
+        output = next(self.decisions)
+        assert isinstance(output, response_model)
         return StructuredRuntimeResult(
-            output=next(self.decisions),
+            output=output,
             runtime_session_id=turn.session_id,
             usage=AgentUsage(input_tokens=10, output_tokens=5, turns=1),
         )
@@ -73,8 +81,10 @@ class ScriptedStructuredRuntime:
 class FakeDatabase:
     def __init__(self) -> None:
         self.queries: list[DataQuery] = []
+        self.describe_calls = 0
 
     def describe_schema(self) -> str:
+        self.describe_calls += 1
         return "orders(id INTEGER, status TEXT)"
 
     def execute(self, query: DataQuery) -> QueryResult:
@@ -288,9 +298,13 @@ def test_incident_flow_locates_page_queries_data_and_diagnoses(tmp_path: Path) -
     assert "结论置信度\n90%" in outcome.message
     assert outcome.query_observations[0].returned_rows == 1
     assert database.queries == [query]
+    assert database.describe_calls == 0
     assert len(runtime.turns) == 2
     assert runtime.turns[0].runtime_session_id is None
     assert runtime.turns[1].runtime_session_id == outcome.session_id
+    assert "full catalog is intentionally omitted" in runtime.turns[0].system_prompt
+    assert "orders(id INTEGER, status TEXT)" not in runtime.turns[0].system_prompt
+    assert len(runtime.turns[0].system_prompt) < 16_000
     assert store.load(outcome.session_id).database_reference == database_reference
     assert store.load(outcome.session_id).project == "生物"
     assert "selected the knowledge project '生物'" in runtime.turns[0].system_prompt
@@ -375,11 +389,12 @@ def test_completed_incident_reopens_and_appends_to_one_capability_document(
                 page=_page(),
                 diagnosis="The first symptom is explained.",
             ),
-            IncidentDecision(
-                status=IncidentStatus.COMPLETED,
+            IncidentContinuationDecision(
+                status=IncidentContinuationStatus.ANSWER,
                 message="Follow-up diagnosis complete.",
-                page=_page(),
                 diagnosis="The additional symptom has the same request boundary.",
+                recommended_actions=["Reuse the verified endpoint boundary."],
+                confidence=0.8,
             ),
         ]
     )
@@ -419,6 +434,13 @@ def test_completed_incident_reopens_and_appends_to_one_capability_document(
         "Continue: does the refresh action use the same endpoint?"
     )
     assert len(runtime.turns) == 2
+    assert runtime.turns[1].tools == []
+    assert runtime.turns[1].allowed_tools == []
+    assert runtime.turns[1].runtime_session_id is None
+    assert runtime.turns[1].session_id != first.session_id
+    assert len(runtime.turns[1].system_prompt) < 2_000
+    assert "<previous_incident_summary>" in runtime.turns[1].user_message
+    assert session.located_page == _page()
     assert first_document.is_file()
     assert second_document.is_file()
     assert first_document == second_document
@@ -446,6 +468,54 @@ def test_completed_incident_reopens_and_appends_to_one_capability_document(
     assert event_types.count(EventType.TASK_REOPENED) == 1
     assert event_types.count(EventType.TASK_COMPLETED) == 2
     assert event_types.count(EventType.CAPABILITY_SAVED) == 2
+
+
+def test_completed_follow_up_escalates_without_losing_verified_page(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace-follow-up-escalation"
+    workspace.mkdir()
+    runtime = ScriptedStructuredRuntime(
+        [
+            IncidentDecision(
+                status=IncidentStatus.COMPLETED,
+                message="Initial diagnosis complete.",
+                page=_page(),
+                diagnosis="The original stale state was explained.",
+            ),
+            IncidentContinuationDecision(
+                status=IncidentContinuationStatus.INVESTIGATE,
+                message="The user reported a new environment-specific symptom.",
+            ),
+            IncidentDecision(
+                status=IncidentStatus.COMPLETED,
+                message="The new symptom was checked against the existing page.",
+                diagnosis="The new environment changes the request boundary.",
+                recommended_actions=["Verify the environment-specific endpoint setting."],
+            ),
+        ]
+    )
+    store = JsonIncidentStore(tmp_path / "data-follow-up-escalation")
+    engine = IncidentEngine(runtime, store, None)
+
+    first = engine.start(workspace, "The page is stale", "/orders/42")
+    second = engine.send(first.session_id, "Production now shows a different timeout.")
+
+    assert second.status == IncidentStatus.COMPLETED
+    assert second.cycle_number == 2
+    assert len(runtime.turns) == 3
+    assert runtime.turns[1].tools == []
+    assert runtime.turns[1].runtime_session_id is None
+    assert runtime.turns[2].runtime_session_id == first.session_id
+    assert runtime.turns[2].tools == ["Read", "Glob", "Grep"]
+    assert second.page == _page()
+    routed = [
+        event
+        for event in second.events
+        if event.type == EventType.RUNTIME_FINISHED
+        and event.data.get("prompt_profile") == "continuation_compact"
+    ]
+    assert len(routed) == 1
 
 
 def test_agent_resolves_page_with_host_executed_sql_before_page_is_known(

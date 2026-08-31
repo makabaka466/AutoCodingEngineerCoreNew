@@ -1,6 +1,6 @@
 # AutoCoding Engineer 接口与数据契约
 
-本文记录当前 `0.7.10` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
+本文记录当前 `0.7.11` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
 Runtime、持久化和状态契约。
 设计动机和运行流程见[架构说明](ARCHITECTURE.md)。
 
@@ -1203,3 +1203,26 @@ Runtime 决策后计数归零。`MAX_SEARCH_REPAIR_ROUNDS=1` 因而约束的是�
 
 结构化字段 `diagnosis`、`recommended_actions` 和 `confidence` 仍分别保留，供 API、能力文档与审计
 使用。桌面元数据区域同步使用“为什么出现这个异常”和“解决方法”标签。
+
+## 17. 紧凑数据库上下文与异常续聊契约
+
+`compact_database_context(configured, reference)` 是开发和异常 Engine 共用的 Prompt 适配器。它
+只返回数据库方言、按需读取元数据的方法和只读校验声明，不调用 `DatabaseReader.describe_schema()`。
+完整数据库访问仍通过既有 `DataQuery`、`DatabaseReader.execute()` 和查询审计接口完成。
+
+异常完成后无新附件的 `send()` 先请求：
+
+```python
+class IncidentContinuationDecision(BaseModel):
+    status: Literal["answer", "investigate"]
+    message: str
+    diagnosis: str | None
+    recommended_actions: list[str]
+    confidence: float | None
+```
+
+`answer` 必须提供 `diagnosis`，并使用已有 `LocatedPage` 形成标准完成结果；`investigate` 只表达需要
+深度调查的原因。该路由使用新的 Claude session、空 `history`、`tools=[]` 和
+`allowed_tools=[]`，不会覆盖主调查的 `session.runtime_session_id`。有新图片时绕过紧凑路由，
+直接进入完整图片/页面调查。Claude CLI 命令构造器以 `--tools ""` 明确关闭工具，并且只有非空
+列表才发送 `--allowedTools`。
