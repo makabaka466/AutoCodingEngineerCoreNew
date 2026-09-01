@@ -1,4 +1,4 @@
-"""Transactional incident snapshots with append-only shared lifecycle events."""
+"""异常任务的事务快照与只追加生命周期事件存储。"""
 
 from __future__ import annotations
 
@@ -24,10 +24,10 @@ logger = logging.getLogger("autocoding_agent.store.sqlite_incident")
 
 
 class SQLiteIncidentStore:
-    """Persist incident snapshots around the shared SQLite lifecycle mechanics.
+    """在共享 SQLite 生命周期能力之上持久化异常领域快照。
 
-    The incident schema and migration stay local to this store; connection policy and
-    immutable Event/Run/Command records are delegated to ``SQLiteRuntimeDatabase``.
+    异常表结构和旧数据迁移仍由本 Store 负责；连接策略以及不可变 Event/Run/Command
+    记录委托给 ``SQLiteRuntimeDatabase``。
     """
 
     def __init__(self, root: str | Path, *, migrate_legacy_json: bool = True) -> None:

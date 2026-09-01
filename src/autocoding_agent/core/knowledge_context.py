@@ -1,4 +1,4 @@
-"""Shared, failure-tolerant retrieval of manually indexed engineering knowledge."""
+"""共用的工程知识检索入口；检索失败时允许主任务安全降级。"""
 
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ def retrieve_knowledge_context(
     command_id: str,
     progress_sink: ProgressSink | None,
 ) -> str:
-    """Retrieve a bounded prompt fragment and audit success or graceful degradation."""
+    """检索有界提示词片段，并审计成功结果或失败降级。"""
 
     if retriever is None:
         return ""

@@ -1,8 +1,7 @@
-"""Shared Runtime bookkeeping used by development and incident orchestration.
+"""供开发与异常流程共用的 Runtime 生命周期记账组件。
 
-This module deliberately owns only mechanical lifecycle work: creating a run,
-recording observable activities, projecting safe progress and closing the run.
-Domain decisions remain in the two Engines.
+本模块只负责机械性的生命周期工作：创建 Run、记录可观测活动、投影安全进度并结束 Run。
+所有领域决策仍由两个 Engine 分别负责。
 """
 
 from __future__ import annotations
@@ -28,7 +27,7 @@ from autocoding_agent.core.state_machine.models import TaskState
 
 
 class RuntimeAggregate(Protocol):
-    """The small session surface required by Runtime lifecycle bookkeeping."""
+    """Runtime 生命周期记账所需的最小会话字段集合。"""
 
     id: str
     task_state: TaskState
@@ -42,7 +41,7 @@ ErrorFactory = Callable[[str], Exception]
 
 
 class RuntimeLifecycle:
-    """Record one workflow's Runtime runs without owning its business loop."""
+    """记录一个工作流的 Runtime Run，但不接管其业务循环。"""
 
     def __init__(
         self,
@@ -66,7 +65,7 @@ class RuntimeLifecycle:
         mode: str,
         command_id: str | None,
     ) -> RuntimeRunRecord:
-        """Create the durable run envelope before the external process starts."""
+        """在外部进程启动前创建可持久化的 Run 记录。"""
 
         run = RuntimeRunRecord(
             task_id=session.id,
@@ -105,7 +104,7 @@ class RuntimeLifecycle:
         progress_sink: ProgressSink | None,
         attachment_paths: Collection[str] = (),
     ) -> None:
-        """Persist one sanitized activity and publish its optional UI progress phase."""
+        """持久化一条已脱敏的 Runtime 活动，并按需发布 UI 进度。"""
 
         if activity.run_id != run.id or run.status != RunStatus.STARTED:
             raise self.error_factory("Runtime activity does not belong to the active run.")
@@ -157,7 +156,7 @@ class RuntimeLifecycle:
         command_id: str | None,
         runtime_session_id: str | None = None,
     ) -> None:
-        """Move a started run to one immutable terminal result and emit its event."""
+        """把已启动 Run 转为唯一且不可改写的终态，并生成对应事件。"""
 
         if run.status != RunStatus.STARTED:
             raise self.error_factory(f"Runtime run {run.id} already has a terminal result.")
@@ -223,7 +222,7 @@ class RuntimeLifecycle:
 
 
 def merge_usage(current: AgentUsage, new: AgentUsage) -> AgentUsage:
-    """Add provider usage from another Runtime call to the current cycle total."""
+    """把另一次 Runtime 调用的用量累加到当前轮次。"""
 
     return AgentUsage(
         input_tokens=current.input_tokens + new.input_tokens,
@@ -236,7 +235,7 @@ def merge_usage(current: AgentUsage, new: AgentUsage) -> AgentUsage:
 
 
 def is_test_command(command: str) -> bool:
-    """Recognize common validation commands for host-verified audit events."""
+    """识别常见验证命令，用于生成宿主可核验的测试审计事件。"""
 
     normalized = " ".join(command.casefold().split())
     markers = (

@@ -1,8 +1,7 @@
-"""Shared SQLite mechanics for development and incident task stores.
+"""开发与异常任务 Store 共用的 SQLite 基础实现。
 
-The two domains intentionally keep different snapshot tables and domain records. This
-component centralizes connection policy plus the append-only Event/Run/Command rules so
-their transactional guarantees cannot drift apart.
+两个领域仍使用不同的快照表和领域记录。本组件只集中管理连接策略以及只追加的
+Event/Run/Command 规则，避免两套事务约束逐渐产生差异。
 """
 
 from __future__ import annotations
@@ -32,7 +31,7 @@ class RuntimeStoredAggregate(Protocol):
 
 @dataclass(frozen=True)
 class SQLiteRuntimeLayout:
-    """Trusted table layout for one domain inside the shared runtime database."""
+    """共享 Runtime 数据库中某个领域的受信任表布局。"""
 
     tasks: str
     events: str
@@ -73,7 +72,7 @@ INCIDENT_LAYOUT = SQLiteRuntimeLayout(
 
 
 class SQLiteRuntimeDatabase:
-    """Own shared connection and immutable lifecycle-record operations."""
+    """统一管理 SQLite 连接和不可变生命周期记录。"""
 
     def __init__(self, root: str | Path, layout: SQLiteRuntimeLayout) -> None:
         self.data_dir = Path(root).expanduser().resolve()
@@ -83,7 +82,7 @@ class SQLiteRuntimeDatabase:
         self.layout = layout
 
     def connect(self) -> sqlite3.Connection:
-        """Open one consistently configured connection to the shared runtime database."""
+        """使用统一参数打开共享 Runtime 数据库连接。"""
 
         connection = sqlite3.connect(self.path, timeout=5)
         connection.execute("PRAGMA foreign_keys = ON")
@@ -92,7 +91,7 @@ class SQLiteRuntimeDatabase:
         return connection
 
     def initialize(self, schema: str) -> None:
-        """Create one domain's tables without changing an existing schema."""
+        """创建某个领域所需的表，不修改已经存在的表结构。"""
 
         with self.connect() as connection:
             connection.executescript(schema)
@@ -139,7 +138,7 @@ class SQLiteRuntimeDatabase:
         json_column: str,
         order_by: tuple[str, ...],
     ) -> list[str]:
-        """Read ordered JSON records from a trusted domain table."""
+        """从受信任领域表中按稳定顺序读取 JSON 记录。"""
 
         for identifier in (table, json_column, *order_by):
             if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", identifier):
@@ -164,7 +163,7 @@ class SQLiteRuntimeDatabase:
         session: RuntimeStoredAggregate,
         corruption: type[Exception],
     ) -> None:
-        """Append new events and reject mutation of previously persisted facts."""
+        """追加新事件，并拒绝修改已经持久化的历史事实。"""
 
         table = self.layout.events
         row = connection.execute(
@@ -238,7 +237,7 @@ class SQLiteRuntimeDatabase:
         session: RuntimeStoredAggregate,
         corruption: type[Exception],
     ) -> None:
-        """Insert active runs and allow only their monotonic transition to a terminal state."""
+        """插入活动 Run，并且只允许它单向转换到一个终态。"""
 
         table = self.layout.runs
         for run in session.runs:
@@ -337,7 +336,7 @@ class SQLiteRuntimeDatabase:
         session: RuntimeStoredAggregate,
         corruption: type[Exception],
     ) -> None:
-        """Persist idempotency receipts as immutable command outcomes."""
+        """把幂等命令回执保存为不可变的命令结果。"""
 
         table = self.layout.commands
         for receipt in session.command_receipts:
@@ -389,7 +388,7 @@ class SQLiteRuntimeDatabase:
         *,
         label: str,
     ) -> TaskState:
-        """Rebuild task state from transition facts and reject a broken event chain."""
+        """根据状态转换事件重建任务状态，并拒绝断裂的事件链。"""
 
         current = TaskState.CREATED
         for event in events:

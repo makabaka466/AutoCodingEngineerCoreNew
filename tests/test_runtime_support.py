@@ -1,4 +1,4 @@
-"""Direct tests for shared Runtime lifecycle and SQLite infrastructure."""
+"""共享 Runtime 生命周期和 SQLite 基础设施的直接测试。"""
 
 from __future__ import annotations
 

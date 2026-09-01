@@ -1,4 +1,4 @@
-"""The small stateful kernel that coordinates model turns and hard boundaries."""
+"""负责协调模型轮次和确定性安全边界的轻量状态内核。"""
 
 from __future__ import annotations
 
@@ -80,18 +80,17 @@ class PolicyViolation(RuntimeError):
 
 
 class AgentEngine:
-    """Coordinate one auditable software-development conversation.
+    """编排一段可审计的软件开发对话。
 
-    Main flow:
-    1. enter the state matching inspect, implement, or verify;
-    2. prepare project knowledge and an optional implementation baseline;
-    3. run the state handler inside a durable Runtime envelope;
-    4. validate and record the model decision;
-    5. execute bounded host services such as Hermes or read-only SQL when requested;
-    6. stop for user input/approval, continue another model round, or persist completion.
+    主流程：
+    1. 根据 inspect、implement 或 verify 模式进入对应状态；
+    2. 准备项目知识，并在实施前按需保存代码基线；
+    3. 在可持久化的 Runtime Run 中执行当前状态 Handler；
+    4. 校验并记录模型的结构化决策；
+    5. 按模型请求调用受限的 Hermes 或只读 SQL 等宿主能力；
+    6. 等待用户补充/审批、进入下一次模型调用，或者持久化完成结果。
 
-    Runtime bookkeeping and knowledge retrieval are shared components. This class keeps
-    only development-domain choices such as approval and modification recovery.
+    Runtime 记账和知识检索由共享组件处理；本类只保留审批、修改和恢复等开发领域决策。
     """
 
     def __init__(
@@ -211,7 +210,7 @@ class AgentEngine:
             raise ValueError("Message cannot be empty.")
         if session.task_state == TaskState.CANCELLED:
             raise ValueError("This task was cancelled and cannot be reopened.")
-        # A normal reply while approval is pending is treated as a revised instruction.
+        # 等待审批时收到普通回复，表示用户正在修改原要求，而不是默认批准。
         session.pending_approval = None
         command = AgentCommand(
             id=command_id or str(uuid4()),
@@ -494,7 +493,7 @@ class AgentEngine:
         command: AgentCommand,
         progress_sink: ProgressSink | None = None,
     ) -> AgentOutcome:
-        """Run one idempotent user command and persist its terminal receipt."""
+        """执行一个具备幂等语义的用户命令，并持久化最终命令回执。"""
 
         emit_progress(
             progress_sink,
@@ -585,9 +584,9 @@ class AgentEngine:
         command: AgentCommand,
         progress_sink: ProgressSink | None = None,
     ) -> AgentOutcome:
-        """Advance one development turn until it reaches a durable user-facing outcome."""
+        """推进一次开发对话，直到得到可持久化、可向用户展示的结果。"""
 
-        # 1. Make the authorized mode explicit before any Runtime or host operation.
+        # 第 1 步：先进入本轮已授权的模式，再允许 Runtime 或宿主执行任何操作。
         self._enter_mode_state(session, mode, command)
         session.messages.append(ChatMessage(role=MessageRole.USER, content=user_message))
         session.events.append(
@@ -600,7 +599,7 @@ class AgentEngine:
         session.updated_at = utc_now()
         self.sessions.save(session)
 
-        # 2. A write turn may start only after its pre-change evidence is durable.
+        # 第 2 步：实施轮次必须先保存修改前证据，之后才允许启动写操作。
         if mode == AgentMode.IMPLEMENT and self.artifact_recorder is not None:
             try:
                 self.artifact_recorder.record_baseline(session, command.id)
@@ -613,10 +612,10 @@ class AgentEngine:
                     command.id,
                 )
 
-        # 3. Assemble bounded project/capability/RAG context outside the Engine loop.
+        # 第 3 步：在主循环外准备有界的项目知识、能力文档和 RAG 上下文。
         capability_dir = self.capabilities.prepare(session.workspace, session.project)
-        # The memory directory is outside the target workspace. Mount it only when no
-        # write/command tool exists; resumed modes retain anything already read.
+        # 能力目录位于目标工作区之外，只在没有写入/命令工具的只读轮次中挂载；
+        # 后续恢复轮次仍可使用之前已经读取到的上下文。
         readable_capability_dir = str(capability_dir) if mode == AgentMode.INSPECT else None
         pending_message = user_message
         knowledge_context = self._retrieve_knowledge(
@@ -629,13 +628,13 @@ class AgentEngine:
         hermes_skill_rounds = 0
         consecutive_search_repair_rounds = 0
 
-        # 4. Each loop iteration is one auditable Runtime call. Host services can return
-        # evidence and intentionally schedule another iteration without hiding the boundary.
+        # 第 4 步：每次循环只对应一次可审计的 Runtime 调用。宿主服务可以返回证据并触发
+        # 下一次模型调用，但每次调用边界都会单独记录，不会被隐藏。
         while True:
             existing_runtime_session_id = session.runtime_session_id
             if existing_runtime_session_id is None:
-                # Persist the preallocated Claude session before launch so a timeout cannot
-                # replay a side-effecting first turn as a new session.
+                # 启动前先保存预分配的 Claude 会话 ID，避免超时后把可能产生副作用的首轮
+                # 错误地当成新会话再次执行。
                 session.runtime_session_id = session.id
                 self.sessions.save(session)
             run = self.runtime_lifecycle.start(
@@ -696,8 +695,8 @@ class AgentEngine:
                 )
                 result = handler_result.runtime
             except Exception as exc:
-                # 5. Terminalize the run first; then choose bounded search repair,
-                # explicit recovery for write/verify, or a normal inspect failure.
+                # 第 5 步：先把本次 Run 记为终态，再根据失败类型选择有界搜索纠正、
+                # 写入/验证恢复，或者普通只读调查失败。
                 run_status = (
                     RunStatus.INTERRUPTED
                     if isinstance(exc, RuntimeInterruptedError)
@@ -764,8 +763,8 @@ class AgentEngine:
                     )
                 return self._fail(session, str(exc), command.id)
 
-            # A validated Runtime decision ends the previous correction chain. A later,
-            # independent inspect turn may receive its own single bounded correction.
+            # 一个通过校验的 Runtime 决策表示上一次纠错链已经结束；后续独立调查轮次
+            # 可以重新获得一次有界纠正机会。
             consecutive_search_repair_rounds = 0
 
             self.runtime_lifecycle.finish(
@@ -801,7 +800,7 @@ class AgentEngine:
                     )
                 return self._fail(session, str(exc), command.id)
 
-            # 6. Accept only a validated structured decision, then persist its rationale.
+            # 第 6 步：只接受通过契约校验的结构化决策，并持久化其理由和证据。
             decision = result.decision
             session.runtime_session_id = result.runtime_session_id
             session.last_usage = merge_usage(session.last_usage, result.usage)
@@ -819,8 +818,8 @@ class AgentEngine:
                 runtime_session_id=result.runtime_session_id,
                 command_id=command.id,
             )
-            # 7. Hermes and SQL are host-controlled evidence branches. Their outputs return
-            # to the primary model; neither service can silently complete the task itself.
+            # 第 7 步：Hermes 和 SQL 都是宿主控制的证据分支。结果必须返回主模型继续判断，
+            # 两者都不能绕过主模型静默完成任务。
             if decision.status == AgentStatus.HERMES_SKILL_REQUIRED:
                 if hermes_skill_rounds >= self.max_hermes_skill_rounds:
                     return self._fail(
@@ -946,8 +945,8 @@ class AgentEngine:
                 self.sessions.save(session)
                 continue
 
-            # 8. A user-facing decision ends this command; completion also writes reusable
-            # capability and final-report artifacts on a best-effort basis.
+            # 第 8 步：形成用户可见决策后结束本条命令；若任务完成，则尽力保存可复用能力
+            # 和最终报告，保存失败会留痕但不会伪造任务结果。
             self._append_status_event(session, decision)
             if decision.status == AgentStatus.COMPLETED:
                 emit_progress(
@@ -1128,7 +1127,7 @@ class AgentEngine:
                 )
             )
         except Exception as exc:
-            # Memory is secondary: a successful software task remains successful.
+            # 能力沉淀属于次要产物：保存失败不能把已经成功的软件任务改判为失败。
             session.events.append(
                 AgentEvent(
                     type=EventType.CAPABILITY_FAILED,

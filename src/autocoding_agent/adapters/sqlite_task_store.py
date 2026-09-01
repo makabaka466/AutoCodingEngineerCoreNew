@@ -1,4 +1,4 @@
-"""Transactional task snapshots and append-only lifecycle events."""
+"""开发任务的事务快照与只追加生命周期事件存储。"""
 
 from __future__ import annotations
 
@@ -22,18 +22,18 @@ logger = logging.getLogger("autocoding_agent.store.sqlite_task")
 
 
 class ConcurrentSessionUpdate(RuntimeError):
-    """The stored snapshot changed after this caller loaded it."""
+    """调用方加载快照后，数据库中的快照已经被其他操作修改。"""
 
 
 class EventStoreCorruption(RuntimeError):
-    """Persisted events cannot be replayed as one valid lifecycle timeline."""
+    """持久化事件无法回放为一条合法的生命周期时间线。"""
 
 
 class SQLiteTaskStore:
-    """Persist development-specific snapshots around shared SQLite mechanics.
+    """在共享 SQLite 基础能力之上持久化开发领域快照。
 
-    Decisions and artifacts remain development-domain records. Connection setup plus
-    Event/Run/Command append rules are delegated to ``SQLiteRuntimeDatabase``.
+    Decision 和 Artifact 仍属于开发领域；连接配置以及 Event/Run/Command 追加规则
+    委托给 ``SQLiteRuntimeDatabase``。
     """
 
     def __init__(self, root: str | Path, *, migrate_legacy_json: bool = True) -> None:
@@ -198,7 +198,7 @@ class SQLiteTaskStore:
         return [CommandReceipt.model_validate_json(payload) for payload in payloads]
 
     def replay_task_state(self, task_id: str) -> TaskState:
-        """Rebuild lifecycle state from ordered transition facts and verify their chain."""
+        """根据有序转换事件重建生命周期状态，并校验事件链。"""
 
         return self.database.replay_state(
             self.list_events(task_id),
