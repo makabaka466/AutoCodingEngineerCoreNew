@@ -1,6 +1,6 @@
 # AutoCoding Engineer 接口与数据契约
 
-本文记录当前 `0.7.13` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
+本文记录当前 `0.7.14` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
 Runtime、持久化和状态契约。
 设计动机和运行流程见[架构说明](ARCHITECTURE.md)。
 
