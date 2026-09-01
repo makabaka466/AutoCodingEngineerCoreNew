@@ -1,6 +1,6 @@
 # AutoCoding Engineer 架构说明
 
-本文描述当前 `0.7.11` 代码已经实现的架构。数据字段、公共方法和命令行参数见
+本文描述当前 `0.7.12` 代码已经实现的架构。数据字段、公共方法和命令行参数见
 [接口与数据契约](INTERFACES.md)。
 
 ## 1. 项目目标
@@ -42,6 +42,11 @@ flowchart TD
     ENGINE --> DB_PORT
     ENGINE --> RAG["KnowledgeRAGService"]
     ENGINE --> HERMES_COORD["HermesConsultationCoordinator"]
+    ENGINE --> RUNTIME_LIFECYCLE["RuntimeLifecycle"]
+    INCIDENT_ENGINE --> RUNTIME_LIFECYCLE
+    ENGINE --> KNOWLEDGE_CONTEXT["retrieve_knowledge_context"]
+    INCIDENT_ENGINE --> KNOWLEDGE_CONTEXT
+    KNOWLEDGE_CONTEXT --> RAG
     INCIDENT_ENGINE --> STRUCTURED_PORT["StructuredRuntime port"]
     INCIDENT_ENGINE --> DB_PORT["DatabaseReader port"]
     INCIDENT_ENGINE --> RAG
@@ -58,6 +63,8 @@ flowchart TD
     DB_PORT --> SQLITE["SQLiteDatabaseReader (CLI compatibility)"]
     INCIDENT_STORE --> INCIDENT_SQLITE["SQLiteIncidentStore + EventStore"]
     SESSION_PORT --> TASK_STORE["SQLiteTaskStore + EventStore"]
+    INCIDENT_SQLITE --> SQLITE_RUNTIME["SQLiteRuntimeDatabase"]
+    TASK_STORE --> SQLITE_RUNTIME
     ARTIFACTS --> ARTIFACT_STORE["TaskArtifactStore + Git observer"]
     HERMES_COORD --> HERMES_PORT["HermesSkillService port"]
     HERMES_PORT --> HERMES_CLI["Hermes CLI isolated rules + web tools"]
@@ -68,7 +75,7 @@ flowchart TD
     RECOVERY --> TASK_STORE
     INCIDENT_RECOVERY --> INCIDENT_SQLITE
     CLAUDE --> CC["Claude Code CLI / configured model"]
-    TASK_STORE --> DATA["~/.autocoding-agent/runtime/agent-runtime.db"]
+    SQLITE_RUNTIME --> DATA["~/.autocoding-agent/runtime/agent-runtime.db"]
     ARTIFACT_STORE --> ARTIFACT_DATA["~/.autocoding-agent/tasks/id/artifacts"]
     INCIDENT_SQLITE --> DATA
     RAG --> RAG_DB["~/.autocoding-agent/rag/knowledge-*.db"]
@@ -85,9 +92,9 @@ flowchart TD
 | 应用门面 | `application.py` | 组装依赖并暴露稳定的任务 API |
 | 异常领域 | `incident/` | 页面定位、只读查询计划、数据诊断及独立会话状态机 |
 | RAG | `knowledge_rag/` | 发现 Markdown、分块、建立可重建双索引、混合检索并按领域/项目/工作区过滤 |
-| 核心 | `core/` | 状态机、阶段 Handler、Decision、Artifact、Recovery、执行模式和权限校验 |
+| 核心 | `core/` | 状态机、阶段 Handler、共享 Runtime 生命周期/RAG 检索、Decision、Artifact、Recovery、执行模式和权限校验 |
 | 端口 | `ports/` | 定义 Runtime、Session/Event/Decision/Artifact 存储所需的最小协议 |
-| 适配器 | `adapters/` | 调用 Claude Code、保存事务任务/事件/产物与能力文档、观察 Git、只读访问数据库 |
+| 适配器 | `adapters/` | 调用 Claude Code、通过共享 SQLite 基础设施保存事务任务/事件/产物与能力文档、观察 Git、只读访问数据库 |
 | Skills | `skills/` | 向模型提供澄清、调查、修改、验证和能力归纳方法 |
 
 `build_application()` 是默认组合根。它创建 `ClaudeCodeRuntime`、`SQLiteTaskStore`、
@@ -106,6 +113,12 @@ Runtime Run 和孤儿租约扫描。未来接入 MySQL/PostgreSQL 只需实现 `
 
 桌面端只创建一份 `SQLServerConnectionService`。它把同一个只读 reader/reference 注入开发与
 异常组合根；连接更换只作用于新任务，已有任务继续绑定启动时的数据源引用，避免半途中切库。
+
+两个 Engine 不通过继承合并领域流程。`AgentEngine` 保留开发审批、修改和验证恢复，
+`IncidentEngine` 保留页面定位、分阶段只读查询和异常结论；二者只组合
+`RuntimeLifecycle`（Run 创建/活动审计/进度投影/终态记录）和
+`retrieve_knowledge_context()`（有界 RAG 检索及失败降级）这类无领域判断的基础能力。这样可避免
+两份机械代码漂移，又不会把不同工作流写成难以理解的万能状态机。
 
 ## 3. 核心设计原则
 
@@ -573,6 +586,12 @@ busy timeout 和单事务提交；
 sequence 单调递增，已追加事件若被修改会拒绝保存。旧 `sessions/*.json` 启动时幂等导入，导入
 完成后不再作为运行时任务写入目标。旧异常 JSON 同样幂等导入但不删除；能力 Markdown 继续使用
 临时文件加 replace。
+
+`SQLiteTaskStore` 与 `SQLiteIncidentStore` 仍拥有各自 snapshot 表、领域记录和旧 JSON 迁移；
+连接配置、UUID 校验、JSON 记录读取、Event 追加、Run 终态约束、Command Receipt 不可变约束和
+状态回放统一委托给 `SQLiteRuntimeDatabase`。共享类通过受信任的 `SQLiteRuntimeLayout` 适配既有
+表名，不要求迁移生产数据库结构。领域 Store 继续负责同一事务的开始、snapshot revision 检查和
+提交，因此抽取没有削弱原子性。
 
 `SQLiteTaskStore.replay_task_state()` 与 `SQLiteIncidentStore.replay_task_state()` 按 sequence 回放
 `state_transitioned` 并验证 from/to 链；旧 JSON 没有生命周期事件时会生成 actor=migration 的

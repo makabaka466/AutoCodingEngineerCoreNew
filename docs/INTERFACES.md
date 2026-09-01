@@ -1,6 +1,6 @@
 # AutoCoding Engineer 接口与数据契约
 
-本文记录当前 `0.7.11` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
+本文记录当前 `0.7.12` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
 Runtime、持久化和状态契约。
 设计动机和运行流程见[架构说明](ARCHITECTURE.md)。
 
@@ -578,6 +578,21 @@ class SessionStore(Protocol):
 
 数据库表为 `tasks`、`events`、`decisions`、`artifacts`、`runs`、`commands`。Event/Decision/Artifact/
 CommandReceipt 插入后不可修改；Run 只允许从 started 转到一个终态，终态记录不可重写。
+
+`SQLiteTaskStore` 和 `SQLiteIncidentStore` 内部组合 `SQLiteRuntimeDatabase`。这个基础类统一：
+
+| 方法 | 内部契约 |
+| --- | --- |
+| `connect()` | 打开同一个 `agent-runtime.db`，启用 foreign key、5000ms busy timeout 和 WAL |
+| `safe_id(task_id)` | 只接受 UUID，阻止 ID 被当作路径或 SQL 标识符 |
+| `read_json_records(...)` | 从受信任布局中的表按 task 和稳定顺序读取 JSON 记录 |
+| `append_events(...)` | 分配连续 sequence，并拒绝修改已追加事件 |
+| `upsert_runs(...)` | 只允许 started Run 更新 heartbeat 或进入一个不可改写终态 |
+| `append_command_receipts(...)` | 保存全局幂等命令结果并拒绝覆盖 |
+| `replay_state(...)` | 按转换事件回放状态，断链时报告 `EventStoreCorruption` |
+
+表布局由代码内的 `DEVELOPMENT_LAYOUT` / `INCIDENT_LAYOUT` 提供并校验标识符；调用方不能把用户输入
+作为表名传入。领域 Store 仍控制 snapshot、Decision/Artifact、旧 JSON 迁移和事务提交。
 
 Artifact 正文由 `TaskArtifactStore` 保存到 `<data_dir>/tasks/<task-id>/artifacts/`。文件名使用 UUID，
 manifest 保存类型、哈希、来源和关联路径；正文经过凭据脱敏、大小限制和原子替换。工作区 observer

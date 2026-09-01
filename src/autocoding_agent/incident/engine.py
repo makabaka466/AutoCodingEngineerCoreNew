@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path, PureWindowsPath
 from uuid import uuid4
 
@@ -12,6 +11,7 @@ from autocoding_agent.core.hermes_consultation import (
     HermesConsultationCoordinator,
     hermes_followup_message,
 )
+from autocoding_agent.core.knowledge_context import retrieve_knowledge_context
 from autocoding_agent.core.models import (
     AgentEvent,
     AgentMode,
@@ -26,7 +26,6 @@ from autocoding_agent.core.models import (
 from autocoding_agent.core.progress import (
     ProgressEvent,
     ProgressPhase,
-    ProgressProjector,
     ProgressSink,
     ProgressWorkflow,
     emit_progress,
@@ -34,10 +33,9 @@ from autocoding_agent.core.progress import (
 from autocoding_agent.core.recovery.models import RecoveryAction
 from autocoding_agent.core.runtime.models import (
     RunStatus,
-    RuntimeActivity,
-    RuntimeEventKind,
     RuntimeRunRecord,
 )
+from autocoding_agent.core.runtime_lifecycle import RuntimeLifecycle, merge_usage
 from autocoding_agent.core.search_policy import (
     BOUNDED_SEARCH_RULES,
     MAX_SEARCH_REPAIR_ROUNDS,
@@ -71,7 +69,6 @@ from autocoding_agent.incident.ports import IncidentSessionStore
 from autocoding_agent.incident.prompting import load_incident_workflow_rules
 from autocoding_agent.knowledge_rag.models import KnowledgeDomain
 from autocoding_agent.knowledge_rag.ports import KnowledgeRetriever
-from autocoding_agent.knowledge_rag.service import workspace_id_for
 from autocoding_agent.ports.database import DatabaseReader
 from autocoding_agent.ports.hermes_skills import HermesSkillService
 from autocoding_agent.ports.runtime import RuntimePolicyBlockedError
@@ -82,7 +79,19 @@ _SOURCE_INVESTIGATION_TOOLS = ["Read", "Glob", "Grep"]
 
 
 class IncidentEngine:
-    """Let the model investigate code while the host controls database access."""
+    """Coordinate one read-only, evidence-backed incident conversation.
+
+    Main flow:
+    1. record the user report and optional screenshot as the current turn;
+    2. retrieve bounded project knowledge, then open an auditable Runtime run;
+    3. let the model locate/read the page under source-search policy;
+    4. let the host execute only model-requested, bounded read-only SQL;
+    5. return SQL evidence to the same investigation loop for diagnosis;
+    6. ask one focused question, consult Hermes, fail safely, or persist the conclusion.
+
+    Runtime lifecycle and knowledge retrieval are shared with development. This Engine
+    keeps incident-only decisions such as page identity, query stages and diagnosis rules.
+    """
 
     def __init__(
         self,
@@ -121,6 +130,11 @@ class IncidentEngine:
         self.model = model
         self.state_machine = state_machine or AgentStateMachine()
         self.owner_id = owner_id or str(uuid4())
+        self.runtime_lifecycle = RuntimeLifecycle(
+            workflow=ProgressWorkflow.INCIDENT,
+            owner_id=self.owner_id,
+            save=self.sessions.save,
+        )
         self.knowledge_retriever = knowledge_retriever
         self.artifact_recorder = artifact_recorder
         self.hermes = HermesConsultationCoordinator(hermes_skills, artifact_recorder)
@@ -404,7 +418,10 @@ class IncidentEngine:
         progress_sink: ProgressSink | None = None,
         continuation_context: str | None = None,
     ) -> IncidentOutcome:
+        """Advance an incident turn until input, failure, or a diagnosis is durable."""
+
         attachments = attachments or []
+        # 1. Persist the turn and attachment identity before the model sees any context.
         emit_progress(
             progress_sink,
             ProgressEvent.for_phase(
@@ -444,6 +461,8 @@ class IncidentEngine:
         )
         pending_message = self._message_with_attachments(user_message, attachments)
         attachment_dirs = list(dict.fromkeys(str(Path(item.path).parent) for item in attachments))
+        # 2. A simple follow-up can use the compact router; a new investigation receives
+        # bounded RAG context. The raw indexed corpus is never injected wholesale.
         knowledge_context = ""
         if continuation_context is None:
             knowledge_context = self._retrieve_knowledge(
@@ -455,10 +474,16 @@ class IncidentEngine:
         hermes_skill_rounds = 0
         consecutive_search_repair_rounds = 0
 
+        # 3. One loop iteration equals one durable Runtime run. SQL/Hermes evidence may
+        # schedule another iteration, but every boundary remains replayable.
         while True:
             session.updated_at = utc_now()
             self.sessions.save(session)
-            run = self._start_runtime_run(session, command.id)
+            run = self.runtime_lifecycle.start(
+                session,
+                mode=AgentMode.INSPECT.value,
+                command_id=command.id,
+            )
             self.sessions.save(session)
             emit_progress(
                 progress_sink,
@@ -485,15 +510,15 @@ class IncidentEngine:
                         progress_sink,
                     )
                     if route.status == IncidentContinuationStatus.INVESTIGATE:
-                        self._finish_runtime_run(
+                        self.runtime_lifecycle.finish(
                             session,
                             run,
-                            RunStatus.COMPLETED,
-                            None,
-                            command.id,
+                            status=RunStatus.COMPLETED,
+                            reason=None,
+                            command_id=command.id,
                             runtime_session_id=run.runtime_session_id,
                         )
-                        session.last_usage = _merge_usage(session.last_usage, usage)
+                        session.last_usage = merge_usage(session.last_usage, usage)
                         session.events.append(
                             AgentEvent(
                                 type=EventType.RUNTIME_FINISHED,
@@ -552,12 +577,13 @@ class IncidentEngine:
                     decision, page_repaired = self._restore_verified_page(session, decision)
                 self._validate_decision(decision)
             except RuntimePolicyBlockedError as exc:
-                self._finish_runtime_run(
+                # 4. A too-broad source search gets at most one automatic bounded repair.
+                self.runtime_lifecycle.finish(
                     session,
                     run,
-                    RunStatus.FAILED,
-                    str(exc),
-                    command.id,
+                    status=RunStatus.FAILED,
+                    reason=str(exc),
+                    command_id=command.id,
                 )
                 if (
                     not exc.retryable
@@ -596,12 +622,12 @@ class IncidentEngine:
                 self.sessions.save(session)
                 continue
             except Exception as exc:
-                self._finish_runtime_run(
+                self.runtime_lifecycle.finish(
                     session,
                     run,
-                    RunStatus.FAILED,
-                    str(exc),
-                    command.id,
+                    status=RunStatus.FAILED,
+                    reason=str(exc),
+                    command_id=command.id,
                 )
                 self.sessions.save(session)
                 return self._fail(session, str(exc), command)
@@ -610,6 +636,8 @@ class IncidentEngine:
             # independent model turn may receive its own single bounded correction.
             consecutive_search_repair_rounds = 0
 
+            # 5. Repair only safe omissions from already verified page evidence, then audit
+            # the model decision before any external host service is called.
             if decision.page is not None and decision.page.source_paths:
                 session.located_page = decision.page
             if page_repaired:
@@ -639,16 +667,16 @@ class IncidentEngine:
                     )
                 )
 
-            self._finish_runtime_run(
+            self.runtime_lifecycle.finish(
                 session,
                 run,
-                RunStatus.COMPLETED,
-                None,
-                command.id,
+                status=RunStatus.COMPLETED,
+                reason=None,
+                command_id=command.id,
                 runtime_session_id=run.runtime_session_id or session.runtime_session_id,
             )
 
-            session.last_usage = _merge_usage(session.last_usage, usage)
+            session.last_usage = merge_usage(session.last_usage, usage)
             session.updated_at = utc_now()
             session.events.append(
                 AgentEvent(
@@ -678,6 +706,7 @@ class IncidentEngine:
                     },
                 )
             )
+            # 6. Hermes is advisory: its candidate experience returns to the primary model.
             if decision.status == IncidentStatus.HERMES_SKILL_REQUIRED:
                 if hermes_skill_rounds >= self.max_hermes_skill_rounds:
                     return self._fail(
@@ -740,6 +769,8 @@ class IncidentEngine:
             )
             self._transition_for_decision(session, decision, command.id)
 
+            # 7. Non-query decisions end the command and, on completion, persist the reusable
+            # incident capability. A query decision enters the guarded read-only SQL branch.
             if decision.status != IncidentStatus.QUERY_REQUIRED:
                 if decision.status == IncidentStatus.COMPLETED and self.capabilities is not None:
                     emit_progress(
@@ -844,6 +875,8 @@ class IncidentEngine:
                     command,
                 )
 
+            # 8. Execute the smallest staged query plan through the host. Only metadata is
+            # persisted; raw business rows are returned to the current model call chain.
             session.query_rounds += 1
             emit_progress(
                 progress_sink,
@@ -1162,122 +1195,6 @@ class IncidentEngine:
             for query in decision.queries
         ]
 
-    def _start_runtime_run(
-        self,
-        session: IncidentSession,
-        command_id: str,
-    ) -> RuntimeRunRecord:
-        run = RuntimeRunRecord(
-            task_id=session.id,
-            state=session.task_state,
-            mode=AgentMode.INSPECT.value,
-            owner_id=self.owner_id,
-            owner_pid=os.getpid(),
-            runtime_session_id=session.runtime_session_id,
-        )
-        session.runs.append(run)
-        session.events.append(
-            AgentEvent(
-                type=EventType.RUNTIME_STARTED,
-                message="Started read-only incident Runtime run.",
-                actor="host",
-                command_id=command_id,
-                correlation_id=run.id,
-                data={
-                    "run_id": run.id,
-                    "state": run.state.value,
-                    "mode": run.mode,
-                    "workflow": "incident",
-                },
-            )
-        )
-        return run
-
-    def _record_and_project_runtime_activity(
-        self,
-        session: IncidentSession,
-        run: RuntimeRunRecord,
-        activity: RuntimeActivity,
-        command_id: str,
-        progress_sink: ProgressSink | None,
-        attachment_paths: list[str],
-    ) -> None:
-        if activity.run_id != run.id or run.status != RunStatus.STARTED:
-            raise ValueError("Runtime activity does not belong to the active incident run.")
-        run.heartbeat_at = max(run.heartbeat_at, activity.created_at)
-        run.activity_ids.append(activity.id)
-        event_type = {
-            RuntimeEventKind.TOOL_STARTED: EventType.TOOL_STARTED,
-            RuntimeEventKind.TOOL_FINISHED: EventType.TOOL_FINISHED,
-        }.get(activity.kind, EventType.RUNTIME_ACTIVITY)
-        session.events.append(
-            AgentEvent(
-                type=event_type,
-                message=activity.summary,
-                actor="runtime",
-                command_id=command_id,
-                correlation_id=run.id,
-                data={
-                    "activity_id": activity.id,
-                    "run_id": run.id,
-                    "kind": activity.kind.value,
-                    "tool_name": activity.tool_name,
-                    "tool_use_id": activity.tool_use_id,
-                    "workflow": "incident",
-                    **activity.data,
-                },
-                created_at=activity.created_at,
-            )
-        )
-        self.sessions.save(session)
-        progress = ProgressProjector.from_runtime(
-            activity,
-            workflow=ProgressWorkflow.INCIDENT,
-            task_id=session.id,
-            mode=AgentMode.INSPECT.value,
-            attachment_paths=attachment_paths,
-        )
-        if progress is not None:
-            emit_progress(progress_sink, progress)
-
-    @staticmethod
-    def _finish_runtime_run(
-        session: IncidentSession,
-        run: RuntimeRunRecord,
-        status: RunStatus,
-        reason: str | None,
-        command_id: str,
-        *,
-        runtime_session_id: str | None = None,
-    ) -> None:
-        if run.status != RunStatus.STARTED:
-            raise ValueError(f"Incident Runtime run {run.id} is already terminal.")
-        now = utc_now()
-        run.status = status
-        run.heartbeat_at = now
-        run.completed_at = now
-        run.terminal_reason = " ".join((reason or "").split())[:500] or None
-        run.runtime_session_id = runtime_session_id or run.runtime_session_id
-        session.events.append(
-            AgentEvent(
-                type={
-                    RunStatus.COMPLETED: EventType.RUNTIME_COMPLETED,
-                    RunStatus.FAILED: EventType.RUNTIME_FAILED,
-                    RunStatus.INTERRUPTED: EventType.RUNTIME_INTERRUPTED,
-                }[status],
-                message=f"Incident Runtime run {status.value}.",
-                actor="host",
-                command_id=command_id,
-                correlation_id=run.id,
-                data={
-                    "run_id": run.id,
-                    "mode": run.mode,
-                    "terminal_reason": run.terminal_reason,
-                    "workflow": "incident",
-                },
-            )
-        )
-
     def _model_turn(
         self,
         session: IncidentSession,
@@ -1334,13 +1251,14 @@ class IncidentEngine:
                 turn,
                 IncidentDecision,
                 run.id,
-                lambda activity: self._record_and_project_runtime_activity(
+                lambda activity: self.runtime_lifecycle.record_activity(
                     session,
                     run,
                     activity,
-                    command_id,
-                    progress_sink,
-                    attachment_paths or [],
+                    command_id=command_id,
+                    mode=AgentMode.INSPECT.value,
+                    progress_sink=progress_sink,
+                    attachment_paths=attachment_paths or [],
                 ),
             )
         else:
@@ -1382,13 +1300,13 @@ class IncidentEngine:
                 turn,
                 IncidentContinuationDecision,
                 run.id,
-                lambda activity: self._record_and_project_runtime_activity(
+                lambda activity: self.runtime_lifecycle.record_activity(
                     session,
                     run,
                     activity,
-                    command_id,
-                    progress_sink,
-                    [],
+                    command_id=command_id,
+                    mode=AgentMode.INSPECT.value,
+                    progress_sink=progress_sink,
                 ),
             )
         else:
@@ -1426,56 +1344,15 @@ class IncidentEngine:
         command_id: str,
         progress_sink: ProgressSink | None = None,
     ) -> str:
-        if self.knowledge_retriever is None:
-            return ""
-        emit_progress(
-            progress_sink,
-            ProgressEvent.for_phase(
-                ProgressWorkflow.INCIDENT,
-                ProgressPhase.RETRIEVING_KNOWLEDGE,
-                task_id=session.id,
-            ),
+        return retrieve_knowledge_context(
+            self.knowledge_retriever,
+            session,
+            query,
+            domain=KnowledgeDomain.INCIDENT,
+            workflow=ProgressWorkflow.INCIDENT,
+            command_id=command_id,
+            progress_sink=progress_sink,
         )
-        try:
-            result = self.knowledge_retriever.retrieve(
-                query,
-                domain=KnowledgeDomain.INCIDENT,
-                project=session.project,
-                workspace_id=workspace_id_for(session.workspace),
-            )
-        except Exception as exc:
-            session.events.append(
-                AgentEvent(
-                    type=EventType.KNOWLEDGE_RETRIEVAL_FAILED,
-                    message=(
-                        "RAG knowledge retrieval failed; continuing without retrieved "
-                        "knowledge."
-                    ),
-                    actor="host",
-                    command_id=command_id,
-                    data={"error": " ".join(str(exc).split())[:800], "workflow": "incident"},
-                )
-            )
-            return ""
-        session.events.append(
-            AgentEvent(
-                type=EventType.KNOWLEDGE_RETRIEVED,
-                message=f"Retrieved {len(result.hits)} manually indexed knowledge chunks.",
-                actor="host",
-                command_id=command_id,
-                data={
-                    "count": len(result.hits),
-                    "embedding_model": result.embedding_model,
-                    "simulated": result.simulated,
-                    "workflow": "incident",
-                    "chunks": [
-                        {"chunk_id": item.chunk_id, "source": item.source_path}
-                        for item in result.hits
-                    ],
-                },
-            )
-        )
-        return result.prompt_context()
 
     @staticmethod
     def _validate_attachments(
@@ -1800,15 +1677,4 @@ def _source_search_enabled(session: IncidentSession) -> bool:
             or observation.stage == IncidentQueryStage.BUSINESS_DATA.value
         )
         for observation in observations
-    )
-
-
-def _merge_usage(current: AgentUsage, new: AgentUsage) -> AgentUsage:
-    return AgentUsage(
-        input_tokens=current.input_tokens + new.input_tokens,
-        output_tokens=current.output_tokens + new.output_tokens,
-        cache_read_tokens=current.cache_read_tokens + new.cache_read_tokens,
-        cost_usd=(current.cost_usd or 0) + (new.cost_usd or 0),
-        duration_ms=(current.duration_ms or 0) + (new.duration_ms or 0),
-        turns=(current.turns or 0) + (new.turns or 0),
     )

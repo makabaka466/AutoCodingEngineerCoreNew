@@ -7,12 +7,15 @@ import logging
 import sqlite3
 from contextlib import closing
 from pathlib import Path
-from uuid import UUID
 
+from autocoding_agent.adapters.sqlite_runtime import (
+    DEVELOPMENT_LAYOUT,
+    SQLiteRuntimeDatabase,
+)
 from autocoding_agent.core.artifacts.models import ArtifactRecord
 from autocoding_agent.core.audit.models import DecisionRecord
 from autocoding_agent.core.models import AgentEvent, AgentSession, EventType
-from autocoding_agent.core.runtime.models import RunStatus, RuntimeRunRecord
+from autocoding_agent.core.runtime.models import RuntimeRunRecord
 from autocoding_agent.core.state_machine.models import CommandReceipt, TaskState
 
 logger = logging.getLogger("autocoding_agent.store.sqlite_task")
@@ -27,13 +30,17 @@ class EventStoreCorruption(RuntimeError):
 
 
 class SQLiteTaskStore:
-    """Store a task snapshot and its new events in the same SQLite transaction."""
+    """Persist development-specific snapshots around shared SQLite mechanics.
+
+    Decisions and artifacts remain development-domain records. Connection setup plus
+    Event/Run/Command append rules are delegated to ``SQLiteRuntimeDatabase``.
+    """
 
     def __init__(self, root: str | Path, *, migrate_legacy_json: bool = True) -> None:
-        self.data_dir = Path(root).expanduser().resolve()
-        self.runtime_dir = self.data_dir / "runtime"
-        self.runtime_dir.mkdir(parents=True, exist_ok=True)
-        self.path = self.runtime_dir / "agent-runtime.db"
+        self.database = SQLiteRuntimeDatabase(root, DEVELOPMENT_LAYOUT)
+        self.data_dir = self.database.data_dir
+        self.runtime_dir = self.database.runtime_dir
+        self.path = self.database.path
         self._initialize()
         if migrate_legacy_json:
             self._migrate_legacy_sessions()
@@ -42,15 +49,17 @@ class SQLiteTaskStore:
         task_id = self._safe_id(session.id)
         original_revision, original_sequences = self._capture_mutable_store_fields(session)
         try:
-            with closing(self._connect()) as connection:
+            with closing(self.database.connect()) as connection:
                 connection.execute("BEGIN IMMEDIATE")
                 if self._task_exists(connection, task_id):
                     raise FileExistsError(f"Session already exists: {task_id}")
-                self._append_new_events(connection, session)
+                self.database.append_events(connection, session, EventStoreCorruption)
                 self._append_new_decisions(connection, session)
                 self._append_new_artifacts(connection, session)
-                self._upsert_runs(connection, session)
-                self._append_command_receipts(connection, session)
+                self.database.upsert_runs(connection, session, EventStoreCorruption)
+                self.database.append_command_receipts(
+                    connection, session, EventStoreCorruption
+                )
                 session.revision = 1
                 connection.execute(
                     """
@@ -76,7 +85,7 @@ class SQLiteTaskStore:
 
     def load(self, session_id: str) -> AgentSession:
         task_id = self._safe_id(session_id)
-        with closing(self._connect()) as connection:
+        with closing(self.database.connect()) as connection:
             row = connection.execute(
                 "SELECT snapshot_json FROM tasks WHERE task_id = ?",
                 (task_id,),
@@ -89,7 +98,7 @@ class SQLiteTaskStore:
         task_id = self._safe_id(session.id)
         original_revision, original_sequences = self._capture_mutable_store_fields(session)
         try:
-            with closing(self._connect()) as connection:
+            with closing(self.database.connect()) as connection:
                 connection.execute("BEGIN IMMEDIATE")
                 row = connection.execute(
                     "SELECT revision FROM tasks WHERE task_id = ?",
@@ -104,11 +113,13 @@ class SQLiteTaskStore:
                         f"{session.revision}, stored {stored_revision}."
                     )
 
-                self._append_new_events(connection, session)
+                self.database.append_events(connection, session, EventStoreCorruption)
                 self._append_new_decisions(connection, session)
                 self._append_new_artifacts(connection, session)
-                self._upsert_runs(connection, session)
-                self._append_command_receipts(connection, session)
+                self.database.upsert_runs(connection, session, EventStoreCorruption)
+                self.database.append_command_receipts(
+                    connection, session, EventStoreCorruption
+                )
                 session.revision = stored_revision + 1
                 cursor = connection.execute(
                     """
@@ -135,118 +146,69 @@ class SQLiteTaskStore:
             raise
 
     def list(self) -> list[AgentSession]:
-        with closing(self._connect()) as connection:
+        with closing(self.database.connect()) as connection:
             rows = connection.execute(
                 "SELECT snapshot_json FROM tasks ORDER BY updated_at DESC, task_id DESC"
             ).fetchall()
         return [AgentSession.model_validate_json(row[0]) for row in rows]
 
     def list_events(self, task_id: str) -> list[AgentEvent]:
-        safe_id = self._safe_id(task_id)
-        with closing(self._connect()) as connection:
-            if not self._task_exists(connection, safe_id):
-                raise KeyError(f"Unknown session: {safe_id}")
-            rows = connection.execute(
-                """
-                SELECT event_json
-                FROM events
-                WHERE task_id = ?
-                ORDER BY sequence
-                """,
-                (safe_id,),
-            ).fetchall()
-        return [AgentEvent.model_validate_json(row[0]) for row in rows]
+        payloads = self.database.read_json_records(
+            task_id,
+            table=DEVELOPMENT_LAYOUT.events,
+            json_column="event_json",
+            order_by=("sequence",),
+        )
+        return [AgentEvent.model_validate_json(payload) for payload in payloads]
 
     def list_decisions(self, task_id: str) -> list[DecisionRecord]:
-        safe_id = self._safe_id(task_id)
-        with closing(self._connect()) as connection:
-            if not self._task_exists(connection, safe_id):
-                raise KeyError(f"Unknown session: {safe_id}")
-            rows = connection.execute(
-                """
-                SELECT decision_json
-                FROM decisions
-                WHERE task_id = ?
-                ORDER BY created_at, decision_id
-                """,
-                (safe_id,),
-            ).fetchall()
-        return [DecisionRecord.model_validate_json(row[0]) for row in rows]
+        payloads = self.database.read_json_records(
+            task_id,
+            table="decisions",
+            json_column="decision_json",
+            order_by=("created_at", "decision_id"),
+        )
+        return [DecisionRecord.model_validate_json(payload) for payload in payloads]
 
     def list_artifacts(self, task_id: str) -> list[ArtifactRecord]:
-        safe_id = self._safe_id(task_id)
-        with closing(self._connect()) as connection:
-            if not self._task_exists(connection, safe_id):
-                raise KeyError(f"Unknown session: {safe_id}")
-            rows = connection.execute(
-                """
-                SELECT artifact_json
-                FROM artifacts
-                WHERE task_id = ?
-                ORDER BY created_at, artifact_id
-                """,
-                (safe_id,),
-            ).fetchall()
-        return [ArtifactRecord.model_validate_json(row[0]) for row in rows]
+        payloads = self.database.read_json_records(
+            task_id,
+            table="artifacts",
+            json_column="artifact_json",
+            order_by=("created_at", "artifact_id"),
+        )
+        return [ArtifactRecord.model_validate_json(payload) for payload in payloads]
 
     def list_runs(self, task_id: str) -> list[RuntimeRunRecord]:
-        safe_id = self._safe_id(task_id)
-        with closing(self._connect()) as connection:
-            if not self._task_exists(connection, safe_id):
-                raise KeyError(f"Unknown session: {safe_id}")
-            rows = connection.execute(
-                """
-                SELECT run_json
-                FROM runs
-                WHERE task_id = ?
-                ORDER BY started_at, run_id
-                """,
-                (safe_id,),
-            ).fetchall()
-        return [RuntimeRunRecord.model_validate_json(row[0]) for row in rows]
+        payloads = self.database.read_json_records(
+            task_id,
+            table=DEVELOPMENT_LAYOUT.runs,
+            json_column="run_json",
+            order_by=("started_at", "run_id"),
+        )
+        return [RuntimeRunRecord.model_validate_json(payload) for payload in payloads]
 
     def list_command_receipts(self, task_id: str) -> list[CommandReceipt]:
-        safe_id = self._safe_id(task_id)
-        with closing(self._connect()) as connection:
-            if not self._task_exists(connection, safe_id):
-                raise KeyError(f"Unknown session: {safe_id}")
-            rows = connection.execute(
-                """
-                SELECT receipt_json
-                FROM commands
-                WHERE task_id = ?
-                ORDER BY created_at, command_id
-                """,
-                (safe_id,),
-            ).fetchall()
-        return [CommandReceipt.model_validate_json(row[0]) for row in rows]
+        payloads = self.database.read_json_records(
+            task_id,
+            table=DEVELOPMENT_LAYOUT.commands,
+            json_column="receipt_json",
+            order_by=("created_at", "command_id"),
+        )
+        return [CommandReceipt.model_validate_json(payload) for payload in payloads]
 
     def replay_task_state(self, task_id: str) -> TaskState:
         """Rebuild lifecycle state from ordered transition facts and verify their chain."""
 
-        current = TaskState.CREATED
-        for event in self.list_events(task_id):
-            if event.type != EventType.STATE_TRANSITIONED:
-                continue
-            try:
-                source = TaskState(str(event.data["from"]))
-                target = TaskState(str(event.data["to"]))
-            except (KeyError, ValueError) as exc:
-                raise EventStoreCorruption(
-                    f"State event {event.id} has an invalid transition payload."
-                ) from exc
-            if source != current:
-                raise EventStoreCorruption(
-                    f"State event {event.id} expected {source.value}, replay is "
-                    f"currently {current.value}."
-                )
-            current = target
-        return current
+        return self.database.replay_state(
+            self.list_events(task_id),
+            EventStoreCorruption,
+            label="task",
+        )
 
     def _initialize(self) -> None:
-        with closing(self._connect()) as connection:
-            connection.executescript(
-                """
+        self.database.initialize(
+            """
                 CREATE TABLE IF NOT EXISTS tasks (
                     task_id TEXT PRIMARY KEY,
                     state TEXT NOT NULL,
@@ -349,74 +311,8 @@ class SQLiteTaskStore:
 
                 CREATE INDEX IF NOT EXISTS idx_commands_task_created
                 ON commands(task_id, created_at);
-                """
-            )
-            connection.commit()
-
-    def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=5)
-        connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA busy_timeout = 5000")
-        connection.execute("PRAGMA journal_mode = WAL")
-        return connection
-
-    def _append_new_events(
-        self,
-        connection: sqlite3.Connection,
-        session: AgentSession,
-    ) -> None:
-        row = connection.execute(
-            "SELECT COALESCE(MAX(sequence), 0) FROM events WHERE task_id = ?",
-            (session.id,),
-        ).fetchone()
-        next_sequence = int(row[0]) + 1
-        for event in session.events:
-            existing = connection.execute(
-                "SELECT task_id, sequence, event_json FROM events WHERE event_id = ?",
-                (event.id,),
-            ).fetchone()
-            if existing is not None:
-                if existing[0] != session.id:
-                    raise EventStoreCorruption(
-                        f"Event id {event.id} already belongs to another task."
-                    )
-                stored_event = AgentEvent.model_validate_json(existing[2])
-                candidate = event.model_copy(update={"sequence": int(existing[1])})
-                if candidate != stored_event:
-                    raise EventStoreCorruption(
-                        f"Persisted event {event.id} was modified after append."
-                    )
-                event.sequence = int(existing[1])
-                continue
-
-            if event.sequence is not None:
-                raise EventStoreCorruption(
-                    f"Unpersisted event {event.id} already has sequence {event.sequence}."
-                )
-            event.sequence = next_sequence
-            event_json = json.dumps(event.model_dump(mode="json"), ensure_ascii=False)
-            connection.execute(
-                """
-                INSERT INTO events(
-                    task_id, sequence, event_id, schema_version, event_type,
-                    timestamp, actor, correlation_id, causation_id, command_id, event_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    session.id,
-                    next_sequence,
-                    event.id,
-                    event.schema_version,
-                    event.type.value,
-                    event.created_at.isoformat(),
-                    event.actor,
-                    event.correlation_id,
-                    event.causation_id,
-                    event.command_id,
-                    event_json,
-                ),
-            )
-            next_sequence += 1
+            """
+        )
 
     def _append_new_decisions(
         self,
@@ -500,111 +396,6 @@ class SQLiteTaskStore:
                 ),
             )
 
-    def _upsert_runs(
-        self,
-        connection: sqlite3.Connection,
-        session: AgentSession,
-    ) -> None:
-        for run in session.runs:
-            existing = connection.execute(
-                "SELECT task_id, run_json FROM runs WHERE run_id = ?",
-                (run.id,),
-            ).fetchone()
-            if existing is None:
-                connection.execute(
-                    """
-                    INSERT INTO runs(
-                        run_id, task_id, state, mode, status, started_at,
-                        heartbeat_at, completed_at, run_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        run.id,
-                        session.id,
-                        run.state.value,
-                        run.mode,
-                        run.status.value,
-                        run.started_at.isoformat(),
-                        run.heartbeat_at.isoformat(),
-                        run.completed_at.isoformat() if run.completed_at else None,
-                        json.dumps(run.model_dump(mode="json"), ensure_ascii=False),
-                    ),
-                )
-                continue
-            if existing[0] != session.id:
-                raise EventStoreCorruption(f"Run id {run.id} already belongs to another task.")
-            stored = RuntimeRunRecord.model_validate_json(existing[1])
-            if stored.status != RunStatus.STARTED and stored != run:
-                raise EventStoreCorruption(
-                    f"Persisted terminal run {run.id} was modified after completion."
-                )
-            if stored.status == RunStatus.STARTED:
-                immutable_fields = (
-                    "task_id",
-                    "state",
-                    "mode",
-                    "owner_id",
-                    "owner_pid",
-                    "started_at",
-                )
-                if any(getattr(stored, field) != getattr(run, field) for field in immutable_fields):
-                    raise EventStoreCorruption(
-                        f"Persisted run {run.id} changed immutable identity fields."
-                    )
-                if run.heartbeat_at < stored.heartbeat_at:
-                    raise EventStoreCorruption(f"Run {run.id} heartbeat moved backwards.")
-                connection.execute(
-                    """
-                    UPDATE runs
-                    SET status = ?, heartbeat_at = ?, completed_at = ?, run_json = ?
-                    WHERE run_id = ?
-                    """,
-                    (
-                        run.status.value,
-                        run.heartbeat_at.isoformat(),
-                        run.completed_at.isoformat() if run.completed_at else None,
-                        json.dumps(run.model_dump(mode="json"), ensure_ascii=False),
-                        run.id,
-                    ),
-                )
-
-    def _append_command_receipts(
-        self,
-        connection: sqlite3.Connection,
-        session: AgentSession,
-    ) -> None:
-        for receipt in session.command_receipts:
-            existing = connection.execute(
-                "SELECT task_id, receipt_json FROM commands WHERE command_id = ?",
-                (receipt.command_id,),
-            ).fetchone()
-            if existing is not None:
-                if existing[0] != session.id:
-                    raise EventStoreCorruption(
-                        f"Command id {receipt.command_id} already belongs to another task."
-                    )
-                if CommandReceipt.model_validate_json(existing[1]) != receipt:
-                    raise EventStoreCorruption(
-                        f"Persisted command receipt {receipt.command_id} was modified."
-                    )
-                continue
-            connection.execute(
-                """
-                INSERT INTO commands(
-                    command_id, task_id, command_type, completed_version,
-                    created_at, receipt_json
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    receipt.command_id,
-                    session.id,
-                    receipt.command_type.value,
-                    receipt.completed_version,
-                    receipt.created_at.isoformat(),
-                    json.dumps(receipt.model_dump(mode="json"), ensure_ascii=False),
-                ),
-            )
-
     def _migrate_legacy_sessions(self) -> None:
         legacy_dir = self.data_dir / "sessions"
         if not legacy_dir.is_dir():
@@ -612,7 +403,7 @@ class SQLiteTaskStore:
         for path in sorted(legacy_dir.glob("*.json")):
             try:
                 session = AgentSession.model_validate_json(path.read_text(encoding="utf-8"))
-                with closing(self._connect()) as connection:
+                with closing(self.database.connect()) as connection:
                     exists = self._task_exists(connection, session.id)
                 if exists:
                     continue
@@ -660,29 +451,22 @@ class SQLiteTaskStore:
             )
         session.events = [*synthetic, *session.events]
 
-    @staticmethod
-    def _task_exists(connection: sqlite3.Connection, task_id: str) -> bool:
-        return (
-            connection.execute(
-                "SELECT 1 FROM tasks WHERE task_id = ?",
-                (task_id,),
-            ).fetchone()
-            is not None
-        )
+    def _task_exists(self, connection: sqlite3.Connection, task_id: str) -> bool:
+        return self.database.task_exists(connection, task_id)
 
     @staticmethod
     def _safe_id(task_id: str) -> str:
-        return str(UUID(task_id))
+        return SQLiteRuntimeDatabase.safe_id(task_id)
 
     @staticmethod
     def _snapshot_json(session: AgentSession) -> str:
-        return json.dumps(session.model_dump(mode="json"), ensure_ascii=False, indent=2)
+        return SQLiteRuntimeDatabase.snapshot_json(session)
 
     @staticmethod
     def _capture_mutable_store_fields(
         session: AgentSession,
     ) -> tuple[int, dict[str, int | None]]:
-        return session.revision, {event.id: event.sequence for event in session.events}
+        return SQLiteRuntimeDatabase.capture_mutable_fields(session)
 
     @staticmethod
     def _restore_mutable_store_fields(
@@ -690,6 +474,4 @@ class SQLiteTaskStore:
         revision: int,
         sequences: dict[str, int | None],
     ) -> None:
-        session.revision = revision
-        for event in session.events:
-            event.sequence = sequences.get(event.id)
+        SQLiteRuntimeDatabase.restore_mutable_fields(session, revision, sequences)

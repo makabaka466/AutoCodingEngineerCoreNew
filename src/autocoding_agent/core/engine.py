@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path, PureWindowsPath
 from uuid import uuid4
 
@@ -22,6 +21,7 @@ from autocoding_agent.core.hermes_consultation import (
     HermesConsultationCoordinator,
     hermes_followup_message,
 )
+from autocoding_agent.core.knowledge_context import retrieve_knowledge_context
 from autocoding_agent.core.models import (
     AgentDecision,
     AgentEvent,
@@ -29,7 +29,6 @@ from autocoding_agent.core.models import (
     AgentOutcome,
     AgentSession,
     AgentStatus,
-    AgentUsage,
     ApprovalScope,
     ChatMessage,
     EventType,
@@ -40,7 +39,6 @@ from autocoding_agent.core.policies import ExecutionPolicy
 from autocoding_agent.core.progress import (
     ProgressEvent,
     ProgressPhase,
-    ProgressProjector,
     ProgressSink,
     ProgressWorkflow,
     emit_progress,
@@ -48,10 +46,9 @@ from autocoding_agent.core.progress import (
 from autocoding_agent.core.recovery.models import RecoveryAction
 from autocoding_agent.core.runtime.models import (
     RunStatus,
-    RuntimeActivity,
-    RuntimeEventKind,
     RuntimeRunRecord,
 )
+from autocoding_agent.core.runtime_lifecycle import RuntimeLifecycle, merge_usage
 from autocoding_agent.core.search_policy import (
     MAX_SEARCH_REPAIR_ROUNDS,
     search_policy_repair_prompt,
@@ -67,7 +64,6 @@ from autocoding_agent.database_models import QueryObservation, QueryResult, sql_
 from autocoding_agent.database_prompt import compact_database_context
 from autocoding_agent.knowledge_rag.models import KnowledgeDomain
 from autocoding_agent.knowledge_rag.ports import KnowledgeRetriever
-from autocoding_agent.knowledge_rag.service import workspace_id_for
 from autocoding_agent.ports.database import DatabaseReader
 from autocoding_agent.ports.hermes_skills import HermesSkillService
 from autocoding_agent.ports.runtime import (
@@ -84,7 +80,19 @@ class PolicyViolation(RuntimeError):
 
 
 class AgentEngine:
-    """One task per session, with true multi-turn clarification and approval resume."""
+    """Coordinate one auditable software-development conversation.
+
+    Main flow:
+    1. enter the state matching inspect, implement, or verify;
+    2. prepare project knowledge and an optional implementation baseline;
+    3. run the state handler inside a durable Runtime envelope;
+    4. validate and record the model decision;
+    5. execute bounded host services such as Hermes or read-only SQL when requested;
+    6. stop for user input/approval, continue another model round, or persist completion.
+
+    Runtime bookkeeping and knowledge retrieval are shared components. This class keeps
+    only development-domain choices such as approval and modification recovery.
+    """
 
     def __init__(
         self,
@@ -134,6 +142,13 @@ class AgentEngine:
         self.max_query_rounds = max_query_rounds
         self.max_replan_rounds = max_replan_rounds
         self.owner_id = owner_id or str(uuid4())
+        self.runtime_lifecycle = RuntimeLifecycle(
+            workflow=ProgressWorkflow.DEVELOPMENT,
+            owner_id=self.owner_id,
+            save=self.sessions.save,
+            error_factory=PolicyViolation,
+            record_test_commands=True,
+        )
         self.knowledge_retriever = knowledge_retriever
         self.hermes = HermesConsultationCoordinator(hermes_skills, artifact_recorder)
         self.max_hermes_skill_rounds = max_hermes_skill_rounds
@@ -479,6 +494,8 @@ class AgentEngine:
         command: AgentCommand,
         progress_sink: ProgressSink | None = None,
     ) -> AgentOutcome:
+        """Run one idempotent user command and persist its terminal receipt."""
+
         emit_progress(
             progress_sink,
             ProgressEvent.for_phase(
@@ -515,53 +532,15 @@ class AgentEngine:
     ) -> str:
         if mode != AgentMode.INSPECT or self.knowledge_retriever is None:
             return ""
-        emit_progress(
-            progress_sink,
-            ProgressEvent.for_phase(
-                ProgressWorkflow.DEVELOPMENT,
-                ProgressPhase.RETRIEVING_KNOWLEDGE,
-                task_id=session.id,
-            ),
+        return retrieve_knowledge_context(
+            self.knowledge_retriever,
+            session,
+            query,
+            domain=KnowledgeDomain.DEVELOPMENT,
+            workflow=ProgressWorkflow.DEVELOPMENT,
+            command_id=command_id,
+            progress_sink=progress_sink,
         )
-        try:
-            result = self.knowledge_retriever.retrieve(
-                query,
-                domain=KnowledgeDomain.DEVELOPMENT,
-                project=session.project,
-                workspace_id=workspace_id_for(session.workspace),
-            )
-        except Exception as exc:
-            session.events.append(
-                AgentEvent(
-                    type=EventType.KNOWLEDGE_RETRIEVAL_FAILED,
-                    message=(
-                        "RAG knowledge retrieval failed; continuing without retrieved "
-                        "knowledge."
-                    ),
-                    actor="host",
-                    command_id=command_id,
-                    data={"error": " ".join(str(exc).split())[:800]},
-                )
-            )
-            return ""
-        session.events.append(
-            AgentEvent(
-                type=EventType.KNOWLEDGE_RETRIEVED,
-                message=f"Retrieved {len(result.hits)} manually indexed knowledge chunks.",
-                actor="host",
-                command_id=command_id,
-                data={
-                    "count": len(result.hits),
-                    "embedding_model": result.embedding_model,
-                    "simulated": result.simulated,
-                    "chunks": [
-                        {"chunk_id": item.chunk_id, "source": item.source_path}
-                        for item in result.hits
-                    ],
-                },
-            )
-        )
-        return result.prompt_context()
 
     def _duplicate_command_outcome(
         self,
@@ -606,6 +585,9 @@ class AgentEngine:
         command: AgentCommand,
         progress_sink: ProgressSink | None = None,
     ) -> AgentOutcome:
+        """Advance one development turn until it reaches a durable user-facing outcome."""
+
+        # 1. Make the authorized mode explicit before any Runtime or host operation.
         self._enter_mode_state(session, mode, command)
         session.messages.append(ChatMessage(role=MessageRole.USER, content=user_message))
         session.events.append(
@@ -618,6 +600,7 @@ class AgentEngine:
         session.updated_at = utc_now()
         self.sessions.save(session)
 
+        # 2. A write turn may start only after its pre-change evidence is durable.
         if mode == AgentMode.IMPLEMENT and self.artifact_recorder is not None:
             try:
                 self.artifact_recorder.record_baseline(session, command.id)
@@ -630,6 +613,7 @@ class AgentEngine:
                     command.id,
                 )
 
+        # 3. Assemble bounded project/capability/RAG context outside the Engine loop.
         capability_dir = self.capabilities.prepare(session.workspace, session.project)
         # The memory directory is outside the target workspace. Mount it only when no
         # write/command tool exists; resumed modes retain anything already read.
@@ -645,6 +629,8 @@ class AgentEngine:
         hermes_skill_rounds = 0
         consecutive_search_repair_rounds = 0
 
+        # 4. Each loop iteration is one auditable Runtime call. Host services can return
+        # evidence and intentionally schedule another iteration without hiding the boundary.
         while True:
             existing_runtime_session_id = session.runtime_session_id
             if existing_runtime_session_id is None:
@@ -652,7 +638,11 @@ class AgentEngine:
                 # replay a side-effecting first turn as a new session.
                 session.runtime_session_id = session.id
                 self.sessions.save(session)
-            run = self._start_runtime_run(session, mode, command.id)
+            run = self.runtime_lifecycle.start(
+                session,
+                mode=mode.value,
+                command_id=command.id,
+            )
             self.sessions.save(session)
             emit_progress(
                 progress_sink,
@@ -693,30 +683,32 @@ class AgentEngine:
                         capability_dir=readable_capability_dir,
                         run_id=run.id,
                         runtime_event_sink=lambda activity, active_run=run: (
-                            self._record_and_project_runtime_activity(
+                            self.runtime_lifecycle.record_activity(
                                 session,
                                 active_run,
                                 activity,
-                                command.id,
-                                mode,
-                                progress_sink,
+                                command_id=command.id,
+                                mode=mode.value,
+                                progress_sink=progress_sink,
                             )
                         ),
                     )
                 )
                 result = handler_result.runtime
             except Exception as exc:
+                # 5. Terminalize the run first; then choose bounded search repair,
+                # explicit recovery for write/verify, or a normal inspect failure.
                 run_status = (
                     RunStatus.INTERRUPTED
                     if isinstance(exc, RuntimeInterruptedError)
                     else RunStatus.FAILED
                 )
-                self._finish_runtime_run(
+                self.runtime_lifecycle.finish(
                     session,
                     run,
-                    run_status,
-                    str(exc),
-                    command.id,
+                    status=run_status,
+                    reason=str(exc),
+                    command_id=command.id,
                 )
                 self.sessions.save(session)
                 if (
@@ -776,12 +768,12 @@ class AgentEngine:
             # independent inspect turn may receive its own single bounded correction.
             consecutive_search_repair_rounds = 0
 
-            self._finish_runtime_run(
+            self.runtime_lifecycle.finish(
                 session,
                 run,
-                RunStatus.COMPLETED,
-                None,
-                command.id,
+                status=RunStatus.COMPLETED,
+                reason=None,
+                command_id=command.id,
                 runtime_session_id=result.runtime_session_id,
             )
             self.sessions.save(session)
@@ -809,9 +801,10 @@ class AgentEngine:
                     )
                 return self._fail(session, str(exc), command.id)
 
+            # 6. Accept only a validated structured decision, then persist its rationale.
             decision = result.decision
             session.runtime_session_id = result.runtime_session_id
-            session.last_usage = _merge_usage(session.last_usage, result.usage)
+            session.last_usage = merge_usage(session.last_usage, result.usage)
             session.events.append(
                 AgentEvent(
                     type=EventType.RUNTIME_FINISHED,
@@ -826,6 +819,8 @@ class AgentEngine:
                 runtime_session_id=result.runtime_session_id,
                 command_id=command.id,
             )
+            # 7. Hermes and SQL are host-controlled evidence branches. Their outputs return
+            # to the primary model; neither service can silently complete the task itself.
             if decision.status == AgentStatus.HERMES_SKILL_REQUIRED:
                 if hermes_skill_rounds >= self.max_hermes_skill_rounds:
                     return self._fail(
@@ -951,6 +946,8 @@ class AgentEngine:
                 self.sessions.save(session)
                 continue
 
+            # 8. A user-facing decision ends this command; completion also writes reusable
+            # capability and final-report artifacts on a best-effort basis.
             self._append_status_event(session, decision)
             if decision.status == AgentStatus.COMPLETED:
                 emit_progress(
@@ -1067,151 +1064,6 @@ class AgentEngine:
                 )
             )
         self.sessions.save(session)
-
-    def _start_runtime_run(
-        self,
-        session: AgentSession,
-        mode: AgentMode,
-        command_id: str,
-    ) -> RuntimeRunRecord:
-        run = RuntimeRunRecord(
-            task_id=session.id,
-            state=session.task_state,
-            mode=mode.value,
-            owner_id=self.owner_id,
-            owner_pid=os.getpid(),
-            runtime_session_id=session.runtime_session_id,
-        )
-        session.runs.append(run)
-        session.events.append(
-            AgentEvent(
-                type=EventType.RUNTIME_STARTED,
-                message=f"Started Runtime run for {mode.value} state handler.",
-                actor="host",
-                command_id=command_id,
-                correlation_id=run.id,
-                data={
-                    "run_id": run.id,
-                    "state": run.state.value,
-                    "mode": run.mode,
-                },
-            )
-        )
-        return run
-
-    def _record_runtime_activity(
-        self,
-        session: AgentSession,
-        run: RuntimeRunRecord,
-        activity: RuntimeActivity,
-        command_id: str,
-    ) -> None:
-        if activity.run_id != run.id or run.status != RunStatus.STARTED:
-            raise PolicyViolation("Runtime activity does not belong to the active run.")
-        run.heartbeat_at = max(run.heartbeat_at, activity.created_at)
-        run.activity_ids.append(activity.id)
-        event_type = {
-            RuntimeEventKind.TOOL_STARTED: EventType.TOOL_STARTED,
-            RuntimeEventKind.TOOL_FINISHED: EventType.TOOL_FINISHED,
-        }.get(activity.kind, EventType.RUNTIME_ACTIVITY)
-        event = AgentEvent(
-            type=event_type,
-            message=activity.summary,
-            actor="runtime",
-            command_id=command_id,
-            correlation_id=run.id,
-            data={
-                "activity_id": activity.id,
-                "run_id": run.id,
-                "kind": activity.kind.value,
-                "tool_name": activity.tool_name,
-                "tool_use_id": activity.tool_use_id,
-                **activity.data,
-            },
-            created_at=activity.created_at,
-        )
-        session.events.append(event)
-        if (
-            activity.kind == RuntimeEventKind.TOOL_FINISHED
-            and (activity.tool_name or "").casefold() == "bash"
-            and not bool(activity.data.get("is_error"))
-            and _is_test_command(str(activity.data.get("command") or ""))
-        ):
-            session.events.append(
-                AgentEvent(
-                    type=EventType.TEST_EXECUTED,
-                    message="The Runtime completed a recognized test command.",
-                    actor="runtime",
-                    command_id=command_id,
-                    correlation_id=run.id,
-                    causation_id=event.id,
-                    data={
-                        "run_id": run.id,
-                        "tool_use_id": activity.tool_use_id,
-                        "command": activity.data.get("command"),
-                        "succeeded": True,
-                        "host_verified": True,
-                    },
-                )
-            )
-        self.sessions.save(session)
-
-    def _record_and_project_runtime_activity(
-        self,
-        session: AgentSession,
-        run: RuntimeRunRecord,
-        activity: RuntimeActivity,
-        command_id: str,
-        mode: AgentMode,
-        progress_sink: ProgressSink | None,
-    ) -> None:
-        self._record_runtime_activity(session, run, activity, command_id)
-        progress = ProgressProjector.from_runtime(
-            activity,
-            workflow=ProgressWorkflow.DEVELOPMENT,
-            task_id=session.id,
-            mode=mode.value,
-        )
-        if progress is not None:
-            emit_progress(progress_sink, progress)
-
-    def _finish_runtime_run(
-        self,
-        session: AgentSession,
-        run: RuntimeRunRecord,
-        status: RunStatus,
-        reason: str | None,
-        command_id: str,
-        *,
-        runtime_session_id: str | None = None,
-    ) -> None:
-        if run.status != RunStatus.STARTED:
-            raise PolicyViolation(f"Runtime run {run.id} already has a terminal result.")
-        now = utc_now()
-        run.status = status
-        run.heartbeat_at = now
-        run.completed_at = now
-        run.terminal_reason = " ".join((reason or "").split())[:500] or None
-        run.runtime_session_id = runtime_session_id or run.runtime_session_id
-        event_type = {
-            RunStatus.COMPLETED: EventType.RUNTIME_COMPLETED,
-            RunStatus.FAILED: EventType.RUNTIME_FAILED,
-            RunStatus.INTERRUPTED: EventType.RUNTIME_INTERRUPTED,
-        }[status]
-        session.events.append(
-            AgentEvent(
-                type=event_type,
-                message=f"Runtime run {status.value}.",
-                actor="host",
-                command_id=command_id,
-                correlation_id=run.id,
-                data={
-                    "run_id": run.id,
-                    "mode": run.mode,
-                    "terminal_reason": run.terminal_reason,
-                },
-            )
-        )
 
     def _record_query_results(
         self,
@@ -1565,34 +1417,3 @@ class AgentEngine:
             usage=session.last_usage,
             events=session.events,
         )
-
-
-def _merge_usage(current: AgentUsage, new: AgentUsage) -> AgentUsage:
-    return AgentUsage(
-        input_tokens=current.input_tokens + new.input_tokens,
-        output_tokens=current.output_tokens + new.output_tokens,
-        cache_read_tokens=current.cache_read_tokens + new.cache_read_tokens,
-        cost_usd=(current.cost_usd or 0) + (new.cost_usd or 0),
-        duration_ms=(current.duration_ms or 0) + (new.duration_ms or 0),
-        turns=(current.turns or 0) + (new.turns or 0),
-    )
-
-
-def _is_test_command(command: str) -> bool:
-    normalized = " ".join(command.casefold().split())
-    markers = (
-        "pytest",
-        "python -m unittest",
-        "dotnet test",
-        "npm test",
-        "npm run test",
-        "pnpm test",
-        "yarn test",
-        "cargo test",
-        "go test",
-        "mvn test",
-        "mvnw test",
-        "gradle test",
-        "gradlew test",
-    )
-    return any(marker in normalized for marker in markers)
