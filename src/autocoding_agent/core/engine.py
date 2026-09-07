@@ -788,6 +788,30 @@ class AgentEngine:
                         run,
                         command.id,
                     )
+            # Inspect 模式没有 Edit/Write/Bash 权限，因此模型返回的 changed_files 只能是
+            # 对前一轮修改的历史复述，不能证明本轮发生了写入。续接“验证未运行”等场景时，
+            # DeepSeek/Claude 可能合理地带回该历史字段。宿主丢弃它并留下审计事件，真实改动
+            # 仍由 Implement 阶段的 Git 快照与 Artifact 判定，不能因模型字段绕过只读边界。
+            if mode == AgentMode.INSPECT and result.decision.changed_files:
+                reported_count = len(result.decision.changed_files)
+                result.decision.changed_files = []
+                session.events.append(
+                    AgentEvent(
+                        type=EventType.DECISION_REPAIRED,
+                        message=(
+                            "Cleared historical changed_files reported during a read-only "
+                            "inspect turn."
+                        ),
+                        actor="host",
+                        command_id=command.id,
+                        correlation_id=run.id,
+                        data={
+                            "repair": "clear_inspect_changed_files",
+                            "reported_count": reported_count,
+                            "workflow": "development",
+                        },
+                    )
+                )
             try:
                 self._validate_decision(result.decision, mode)
             except Exception as exc:
@@ -1232,10 +1256,6 @@ class AgentEngine:
 
     @staticmethod
     def _validate_decision(decision: AgentDecision, mode: AgentMode) -> None:
-        if mode == AgentMode.INSPECT and decision.changed_files:
-            raise PolicyViolation(
-                "The model reported file changes during a read-only inspect turn."
-            )
         if decision.status == AgentStatus.QUERY_REQUIRED and mode != AgentMode.INSPECT:
             raise PolicyViolation("Database queries are only available during inspect mode.")
         if decision.status == AgentStatus.HERMES_SKILL_REQUIRED and mode != AgentMode.INSPECT:

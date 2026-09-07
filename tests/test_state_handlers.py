@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
@@ -60,6 +61,21 @@ def test_registry_selects_handler_and_builds_permission_bound_turn(tmp_path: Pat
     assert result.turn.mode.value == "implement"
     assert "Edit" in result.turn.tools
     assert runtime.turn == result.turn
+
+
+def test_verify_handler_allows_current_python_test_runner_without_generic_bash(
+    tmp_path: Path,
+) -> None:
+    runtime = RecordingRuntime()
+    handler = VerifyHandler(runtime, ExecutionPolicy())
+
+    result = handler.execute(_context(tmp_path))
+
+    executable = str(Path(sys.executable).resolve())
+    assert "Bash" in result.turn.tools
+    assert f"Bash({executable} -m pytest:*)" in result.turn.allowed_tools
+    assert f"Bash({executable} -m ruff:*)" in result.turn.allowed_tools
+    assert "Bash" not in result.turn.allowed_tools
 
 
 def test_registry_rejects_duplicate_or_missing_handler(tmp_path: Path) -> None:

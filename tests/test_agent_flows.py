@@ -281,6 +281,44 @@ def test_multi_turn_clarification_preserves_full_history(tmp_path: Path) -> None
     ]
 
 
+def test_inspect_continuation_clears_historical_changed_files_instead_of_failing(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    runtime = ScriptedRuntime(
+        AgentDecision(
+            status=AgentStatus.NEEDS_INPUT,
+            message="The validation command did not run. Should I request it again?",
+        ),
+        AgentDecision(
+            status=AgentStatus.APPROVAL_REQUIRED,
+            message="Please approve the validation command.",
+            changed_files=["calculator.py"],
+            approval=ApprovalRequest(
+                scope=ApprovalScope.VERIFY,
+                reason="Run the already requested focused test.",
+                proposed_actions=["python -m pytest -q"],
+                proposal=None,
+            ),
+        ),
+    )
+    app = _app(tmp_path / "state-inspect-history", runtime)
+
+    first = app.start(workspace, "Fix calculator.py and validate it.")
+    continued = app.send(first.session_id, "Request validation again.")
+
+    assert continued.status == AgentStatus.APPROVAL_REQUIRED
+    assert continued.changed_files == []
+    repairs = [event for event in continued.events if event.type == EventType.DECISION_REPAIRED]
+    assert len(repairs) == 1
+    assert repairs[0].data == {
+        "repair": "clear_inspect_changed_files",
+        "reported_count": 1,
+        "workflow": "development",
+    }
+
+
 def test_development_flow_can_use_shared_read_only_database(tmp_path: Path) -> None:
     workspace = tmp_path / "repo"
     workspace.mkdir()

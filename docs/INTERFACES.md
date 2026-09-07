@@ -1,6 +1,6 @@
 # AutoCoding Engineer 接口与数据契约
 
-本文记录当前 `0.7.14` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
+本文记录当前 `0.7.15` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
 Runtime、持久化和状态契约。
 设计动机和运行流程见[架构说明](ARCHITECTURE.md)。
 
@@ -119,6 +119,14 @@ def build_application(
 | `inspect` | 澄清、搜索、阅读和诊断 |
 | `implement` | 用户批准后编辑或写入工作区文件 |
 | `verify` | 用户批准后执行白名单内的验证命令 |
+
+`verify` 的 `allowed_tools` 除固定的 `python/pytest/ruff/npm/dotnet/go/cargo/git` 前缀外，会加入
+当前 ACE 进程解析到的真实 `python.exe -m pytest/ruff` 绝对路径前缀，用于兼容 Windows
+`D:\python\python.exe` 和由 `pythonw.exe` 启动的桌面客户端；它不等同于开放任意 `Bash`。
+
+`AgentDecision.changed_files` 只表示当前 Runtime 轮产生的文件修改。inspect 没有写工具；模型若因
+续聊历史复述此前已批准的修改，宿主把该字段清空并追加 `decision_repaired`，而不是把历史事实
+误判为本轮越权写入。真实修改仍由 implement 前后 Git 快照、Patch Artifact 和 Runtime 活动审计。
 
 ### 2.4 其他枚举
 

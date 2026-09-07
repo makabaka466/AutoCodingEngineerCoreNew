@@ -1,6 +1,6 @@
 # AutoCoding Engineer 架构说明
 
-本文描述当前 `0.7.14` 代码已经实现的架构。数据字段、公共方法和命令行参数见
+本文描述当前 `0.7.15` 代码已经实现的架构。数据字段、公共方法和命令行参数见
 [接口与数据契约](INTERFACES.md)。
 
 ## 1. 项目目标
@@ -152,6 +152,12 @@ Skills 会在每一轮作为系统提示词的一部分显式加载。目前捆�
 所有模式当前都使用 `dontAsk`。如果模型需要当前模式之外的副作用，它必须返回
 `approval_required`，由应用把决定交还给用户，而不是让 Claude Code 临时弹出自己的
 权限询问。
+
+Python 验证命令除 `python -m pytest/ruff` 外，还会精确允许当前 ACE 进程解析到的真实
+`python.exe`（以及桌面端 `pythonw.exe` 同目录的 `python.exe`）运行这两个模块。规则绑定已存在
+的绝对执行器前缀，不使用任意路径通配符，也不会因此开放其他 Bash 命令。inspect 模式本身没有
+写工具；若模型续聊时把上轮修改文件复述进 `changed_files`，宿主清空该轮字段并记录
+`decision_repaired`，实际修改仍以 implement 阶段 Git 快照和 Artifact 为准。
 
 Claude Code 以 `--safe-mode` 启动，并使用空 setting sources、严格空 MCP 配置和 `--no-chrome`。
 安全模式隔离目标仓库与用户级 Claude 自定义项，同时保留显式白名单中的原生 `Read/Glob/Grep`；
