@@ -23,6 +23,7 @@ from autocoding_agent.database_models import (
 
 __all__ = [
     "DataQuery",
+    "IncidentCompletionKind",
     "IncidentContinuationDecision",
     "IncidentContinuationStatus",
     "IncidentDecision",
@@ -55,6 +56,13 @@ class IncidentQueryStage(StrEnum):
     BUSINESS_DATA = "business_data"
 
 
+class IncidentCompletionKind(StrEnum):
+    """本轮完成的调查深度，由模型根据用户真实目标选择。"""
+
+    PAGE_LOCATION = "page_location"
+    DIAGNOSIS = "diagnosis"
+
+
 class IncidentContinuationStatus(StrEnum):
     """Model-owned routing for a message sent after a completed incident cycle."""
 
@@ -69,6 +77,22 @@ class LocatedPage(BaseModel):
     route: NonEmptyText | None = None
     source_paths: list[NonEmptyText] = Field(default_factory=list)
     related_paths: list[NonEmptyText] = Field(default_factory=list)
+    matched_evidence: list[NonEmptyText] = Field(
+        min_length=1,
+        max_length=6,
+        description=(
+            "Independent current evidence that connects the user's page clue to this exact "
+            "candidate, such as menu identity plus matching source title or route."
+        ),
+    )
+    unresolved_conflicts: list[NonEmptyText] = Field(
+        default_factory=list,
+        max_length=4,
+        description=(
+            "Material mismatches between the user's clue, screenshot, menu mapping, and source. "
+            "A completed decision cannot retain any unresolved conflict."
+        ),
+    )
     explanation: NonEmptyText
 
 
@@ -81,6 +105,7 @@ class IncidentContinuationDecision(BaseModel):
     """Compact follow-up answer or escalation without replaying the full workflow prompt."""
 
     status: IncidentContinuationStatus
+    completion_kind: IncidentCompletionKind = IncidentCompletionKind.DIAGNOSIS
     message: NonEmptyText
     diagnosis: NonEmptyText | None = None
     recommended_actions: list[NonEmptyText] = Field(default_factory=list)
@@ -88,7 +113,11 @@ class IncidentContinuationDecision(BaseModel):
 
     @model_validator(mode="after")
     def validate_answer(self) -> IncidentContinuationDecision:
-        if self.status == IncidentContinuationStatus.ANSWER and self.diagnosis is None:
+        if (
+            self.status == IncidentContinuationStatus.ANSWER
+            and self.completion_kind == IncidentCompletionKind.DIAGNOSIS
+            and self.diagnosis is None
+        ):
             raise ValueError("diagnosis is required for a completed continuation answer")
         return self
 
@@ -97,10 +126,18 @@ class IncidentDecision(BaseModel):
     """One model decision in the incident investigation state machine."""
 
     status: IncidentStatus
+    completion_kind: IncidentCompletionKind = Field(
+        default=IncidentCompletionKind.DIAGNOSIS,
+        description=(
+            "Use page_location when the user only asks to locate or verify a page and its code. "
+            "Use diagnosis when the user asks why an incident happened or how to solve it."
+        ),
+    )
     message: NonEmptyText = Field(
         description=(
-            "Concise user-facing summary. For completed decisions, state the final conclusion "
-            "in one sentence; put the causal explanation in diagnosis."
+            "Concise user-facing summary. For completed diagnosis decisions, state the final "
+            "conclusion in one sentence and put the causal explanation in diagnosis. For "
+            "page_location, summarize only the verified page and source location."
         )
     )
     question: NonEmptyText | None = None
@@ -130,8 +167,8 @@ class IncidentDecision(BaseModel):
     recommended_actions: list[NonEmptyText] = Field(
         default_factory=list,
         description=(
-            "Concrete solutions or safe verification steps. At least one is required when the "
-            "incident is completed."
+            "Concrete solutions or safe verification steps. At least one is required for a "
+            "completed diagnosis; page_location may leave this empty."
         ),
     )
     confidence: float | None = Field(default=None, ge=0, le=1)
@@ -159,9 +196,12 @@ class IncidentDecision(BaseModel):
             raise ValueError(
                 "hermes_skill is only valid when status is hermes_skill_required"
             )
-        if self.status == IncidentStatus.COMPLETED:
-            if self.diagnosis is None:
-                raise ValueError("diagnosis is required when incident investigation is completed")
+        if (
+            self.status == IncidentStatus.COMPLETED
+            and self.completion_kind == IncidentCompletionKind.DIAGNOSIS
+            and self.diagnosis is None
+        ):
+            raise ValueError("diagnosis is required when incident investigation is completed")
         return self
 
 
@@ -218,6 +258,14 @@ class IncidentSession(BaseModel):
                 IncidentStatus.FAILED.value: TaskState.FAILED,
             }.get(status, TaskState.CREATED)
         last_decision = restored.get("last_decision")
+        located_page = restored.get("located_page")
+        if isinstance(located_page, dict) and "matched_evidence" not in located_page:
+            restored["located_page"] = {
+                **located_page,
+                "matched_evidence": [
+                    str(located_page.get("explanation") or "Legacy verified page evidence.")
+                ],
+            }
         if (
             isinstance(last_decision, dict)
             and str(last_decision.get("status") or "") == IncidentStatus.QUERY_REQUIRED.value
@@ -231,6 +279,22 @@ class IncidentSession(BaseModel):
                     else IncidentQueryStage.PAGE_LOOKUP.value
                 ),
             }
+            last_decision = restored["last_decision"]
+        if isinstance(last_decision, dict):
+            legacy_page = last_decision.get("page")
+            if isinstance(legacy_page, dict) and "matched_evidence" not in legacy_page:
+                restored["last_decision"] = {
+                    **last_decision,
+                    "page": {
+                        **legacy_page,
+                        "matched_evidence": [
+                            str(
+                                legacy_page.get("explanation")
+                                or "Legacy verified page evidence."
+                            )
+                        ],
+                    },
+                }
         restored.setdefault("version", 0)
         restored.setdefault("revision", 0)
         restored.setdefault("events", [])
@@ -251,6 +315,7 @@ class IncidentOutcome(BaseModel):
     session_id: str
     workspace: str
     status: IncidentStatus
+    completion_kind: IncidentCompletionKind = IncidentCompletionKind.DIAGNOSIS
     task_state: TaskState = TaskState.CREATED
     cycle_number: int = Field(default=1, ge=1)
     message: str

@@ -56,6 +56,7 @@ from autocoding_agent.database_models import (
 from autocoding_agent.database_prompt import compact_database_context
 from autocoding_agent.incident.capability_store import IncidentCapabilityStore
 from autocoding_agent.incident.models import (
+    IncidentCompletionKind,
     IncidentContinuationDecision,
     IncidentContinuationStatus,
     IncidentDecision,
@@ -275,6 +276,7 @@ class IncidentEngine:
         observations = session.query_observations[session.cycle_query_observation_start :]
         payload = {
             "previous_cycle": session.cycle_number,
+            "completion_kind": decision.completion_kind.value,
             "page": page.model_dump(mode="json"),
             "conclusion": decision.message,
             "diagnosis": decision.diagnosis,
@@ -500,6 +502,7 @@ class IncidentEngine:
             )
             try:
                 page_repaired = False
+                conflict_deferred = False
                 if continuation_context is not None:
                     route, usage = self._continuation_model_turn(
                         session,
@@ -575,6 +578,7 @@ class IncidentEngine:
                         [item.path for item in attachments],
                     )
                     decision, page_repaired = self._restore_verified_page(session, decision)
+                decision, conflict_deferred = self._defer_unresolved_page_conflict(decision)
                 self._validate_decision(decision)
             except RuntimePolicyBlockedError as exc:
                 # 第 4 步：源码搜索范围过大时，最多自动进行一次有界纠正。
@@ -666,6 +670,26 @@ class IncidentEngine:
                         },
                     )
                 )
+            if conflict_deferred:
+                session.events.append(
+                    AgentEvent(
+                        type=EventType.DECISION_REPAIRED,
+                        message=(
+                            "Deferred a page decision because the model reported unresolved "
+                            "identity conflicts."
+                        ),
+                        actor="host",
+                        command_id=command.id,
+                        correlation_id=run.id,
+                        data={
+                            "repair": "defer_unresolved_page_conflict",
+                            "decision_type": decision.status.value,
+                            "page": decision.page.name if decision.page else None,
+                            "cycle_number": session.cycle_number,
+                            "workflow": "incident",
+                        },
+                    )
+                )
 
             self.runtime_lifecycle.finish(
                 session,
@@ -697,6 +721,7 @@ class IncidentEngine:
                     correlation_id=run.id,
                     data={
                         "decision_type": decision.status.value,
+                        "completion_kind": decision.completion_kind.value,
                         "confidence": decision.confidence,
                         "page_paths": (
                             [*decision.page.source_paths, *decision.page.related_paths]
@@ -1049,7 +1074,11 @@ class IncidentEngine:
             ),
             IncidentStatus.COMPLETED: (
                 TaskState.COMPLETED,
-                "The incident Agent returned an evidence-backed diagnosis.",
+                (
+                    "The incident Agent verified the requested page and source location."
+                    if decision.completion_kind == IncidentCompletionKind.PAGE_LOCATION
+                    else "The incident Agent returned an evidence-backed diagnosis."
+                ),
             ),
             IncidentStatus.FAILED: (
                 TaskState.FAILED,
@@ -1322,13 +1351,17 @@ class IncidentEngine:
         route: IncidentContinuationDecision,
     ) -> IncidentDecision:
         page = session.located_page
-        if page is None or route.diagnosis is None:
+        if page is None or (
+            route.completion_kind == IncidentCompletionKind.DIAGNOSIS
+            and route.diagnosis is None
+        ):
             raise ValueError(
                 "A compact continuation answer requires the previously verified page and "
-                "an evidence-based diagnosis."
+                "an evidence-based diagnosis when the completion kind is diagnosis."
             )
         return IncidentDecision(
             status=IncidentStatus.COMPLETED,
+            completion_kind=route.completion_kind,
             message=route.message,
             page=page,
             diagnosis=route.diagnosis,
@@ -1424,6 +1457,34 @@ class IncidentEngine:
         )
 
     @staticmethod
+    def _defer_unresolved_page_conflict(
+        decision: IncidentDecision,
+    ) -> tuple[IncidentDecision, bool]:
+        """模型已声明页面冲突时，保守转为追问而不是接受结论或直接失败。"""
+
+        page = decision.page
+        requires_verified_identity = decision.status == IncidentStatus.COMPLETED or (
+            decision.status == IncidentStatus.QUERY_REQUIRED
+            and decision.query_stage == IncidentQueryStage.BUSINESS_DATA
+        )
+        if page is None or not page.unresolved_conflicts or not requires_verified_identity:
+            return decision, False
+        conflicts = "；".join(page.unresolved_conflicts[:2])
+        return (
+            IncidentDecision(
+                status=IncidentStatus.NEEDS_INPUT,
+                completion_kind=decision.completion_kind,
+                message="页面候选仍有未解决的身份冲突，需要确认后才能继续。",
+                question=(
+                    f"当前候选页面“{page.name}”存在以下冲突：{conflicts}。"
+                    "请确认它是否为异常页面，或补充准确的页面名称、菜单入口或源码路径。"
+                ),
+                page=page,
+            ),
+            True,
+        )
+
+    @staticmethod
     def _validate_decision(decision: IncidentDecision) -> None:
         requires_page = (
             decision.status == IncidentStatus.COMPLETED
@@ -1440,6 +1501,11 @@ class IncidentEngine:
             raise ValueError(
                 "At least one verified workspace-relative source path is required before "
                 "business-data queries or completion."
+            )
+        if requires_page and decision.page is not None and decision.page.unresolved_conflicts:
+            raise ValueError(
+                "Page identity still has unresolved conflicts; ask the user to confirm the "
+                "candidate or gather narrower mapping evidence before completion."
             )
         paths: list[str] = []
         if decision.page is not None:
@@ -1533,6 +1599,7 @@ class IncidentEngine:
             session_id=session.id,
             workspace=session.workspace,
             status=session.status,
+            completion_kind=decision.completion_kind,
             task_state=session.task_state,
             cycle_number=session.cycle_number,
             message=_user_facing_decision_message(decision),
@@ -1629,6 +1696,10 @@ solution that is already supported by the previous evidence. Give a concise fina
 `message`, explain why in `diagnosis`, include concrete safe actions when useful, and preserve the
 previous confidence unless the wording should become more cautious.
 
+Preserve `completion_kind=page_location` when answering only a clarification about the previously
+verified page or source location. If a page-location-only cycle is followed by a request for an
+incident cause or solution, return `investigate`; page identity alone is not diagnostic evidence.
+
 Return status `investigate` when the message adds a new symptom or environment, disputes the prior
 evidence, asks for current facts, or otherwise requires reading code, an image, or the database.
 In that case put only the concise reason for escalation in `message`; the host will run the full
@@ -1639,10 +1710,20 @@ structured result required by the supplied JSON Schema."""
 
 
 def _user_facing_decision_message(decision: IncidentDecision) -> str:
-    """保证每个已完成异常调查都有完整、易读的结论。"""
+    """按用户要求的调查深度生成完成消息，避免页面定位任务被扩成完整诊断。"""
 
     if decision.status != IncidentStatus.COMPLETED:
         return decision.message
+    if decision.completion_kind == IncidentCompletionKind.PAGE_LOCATION:
+        page = decision.page
+        if page is None:  # 正常情况下已被宿主校验拦截，这里只做防御性兜底。
+            return decision.message
+        source_paths = "\n".join(f"- {item}" for item in page.source_paths)
+        return (
+            f"页面定位\n{decision.message}\n\n"
+            f"代码位置\n{source_paths}\n\n"
+            f"定位依据\n{page.explanation}"
+        )
     recommended_actions = decision.recommended_actions or [
         "当前结论未包含可安全执行的修改方案；请补充缺失的运行证据后继续诊断。"
     ]

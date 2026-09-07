@@ -1,6 +1,6 @@
 # AutoCoding Engineer 接口与数据契约
 
-本文记录当前 `0.7.15` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
+本文记录当前 `0.7.16` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
 Runtime、持久化和状态契约。
 设计动机和运行流程见[架构说明](ARCHITECTURE.md)。
 
@@ -522,7 +522,7 @@ Runner/Popen 时跳过本机路径恢复，保留可替换 Runtime 的确定性�
 
 `--safe-mode` 与显式 `--tools/--allowedTools` 组合使用：前者阻止项目或用户自定义项改变本轮
 行为，后者只开放当前状态允许的原生工具。可观测 Runtime 还会检查每个流式 `Glob/Grep`
-调用：单轮组合预算为 8 次；Glob 不接受通配整个仓库或递归全扩展模式；目录级 Grep 必须设置
+调用：单轮组合预算为 8 次；Glob 不接受通配整个仓库或无明确子目录的递归全扩展模式；目录级 Grep 必须设置
 `glob/type` 和 `head_limit=1..100`；显式搜索路径必须位于 workspace、能力目录或附件目录。
 违反策略会产生 `RuntimeEventKind.POLICY_BLOCKED`，审计中只保存工具名、脱敏后的范围信息和阻断
 原因，不保存源码正文。`RuntimePolicyBlockedError` 还携带 policy、operation、脱敏 reason 和是否
@@ -942,13 +942,14 @@ outcome = incidents.start(
 - `query_required`：需要页面映射或业务数据，`query_stage` 和至少一条 `queries` 必填；
   `page_lookup` 可在页面未定位时查询映射，`business_data` 必须同时提供已验证的 `page`；可信路径
   可直接读取，不要求查询；
-- `completed`：诊断结束，`page`、`diagnosis` 以及至少一个已验证的页面源码路径必填；
+- `completed`：本轮结束，`page` 以及至少一个已验证的页面源码路径必填；`diagnosis` 类型还必须
+  提供异常原因，`page_location` 类型可以不提供诊断和建议；
 - `failed`：Runtime、契约或数据库边界失败。
 
 模型返回的 `IncidentDecision` 主要字段为：
 
 ```text
-status, message, question
+status, completion_kind: page_location | diagnosis, message, question
 page: LocatedPage | None
 query_stage: page_lookup | business_data | None
 queries: list[DataQuery] (最多 5 条)
@@ -959,8 +960,12 @@ confidence: float | None (0..1)
 automation_candidate: bool
 ```
 
-`LocatedPage` 保存名称、可选 route、页面源码路径、相关后端路径和定位依据。所有源码路径必须
+`LocatedPage` 保存名称、可选 route、页面源码路径、相关后端路径、`matched_evidence`、
+`unresolved_conflicts` 和定位依据。所有源码路径必须
 是安全的工作区相对路径；映射表返回的 URL 在打开当前代码验证前不能直接写成最终源码事实。
+匹配与冲突由模型根据当前对话、图片、菜单和源码判断；宿主不计算标题相似度，但
+`unresolved_conflicts` 非空时禁止 `completed` 和 `business_data`。若模型仍返回这两类决定，Engine
+将其规范化成带确认问题的 `needs_input`，并追加 `decision_repaired` 事件。
 模型契约要求每个 `business_data` 和 `completed` 决定都重复 `page`。为容忍模型在连续轮次中
 遗漏重复字段，`IncidentSession.located_page` 保存本 cycle 最近一次通过宿主校验且至少含一个
 源码路径的页面；后续决定漏传 `page` 时宿主可以恢复该对象并记录 `decision_repaired`。这不是
@@ -1208,7 +1213,7 @@ Runtime 决策后计数归零。`MAX_SEARCH_REPAIR_ROUNDS=1` 因而约束的是�
 路径和实际 `size_bytes` 的新 `MessageAttachment`；不会修改用户项目或原始剪贴板内容。桌面端在
 每次新建或继续异常对话前调用该方法，验证失败时保留待发附件并在状态栏提示重新粘贴。
 
-`IncidentOutcome.message` 和完成轮次的最终 Assistant 消息由宿主渲染为：
+`completion_kind=diagnosis` 时，`IncidentOutcome.message` 和完成轮次的最终 Assistant 消息由宿主渲染为：
 
 ```text
 结论
@@ -1227,6 +1232,10 @@ Runtime 决策后计数归零。`MAX_SEARCH_REPAIR_ROUNDS=1` 因而约束的是�
 结构化字段 `diagnosis`、`recommended_actions` 和 `confidence` 仍分别保留，供 API、能力文档与审计
 使用。桌面元数据区域同步使用“为什么出现这个异常”和“解决方法”标签。
 
+`completion_kind=page_location` 时改为“页面定位 / 代码位置 / 定位依据”，不显示异常原因和解决方法，
+也不要求业务数据查询。对应能力 Markdown 标题为“页面定位记录”；同一会话以后升级为诊断时仍追加
+到原文档。
+
 ## 17. 紧凑数据库上下文与异常续聊契约
 
 `compact_database_context(configured, reference)` 是开发和异常 Engine 共用的 Prompt 适配器。它
@@ -1238,14 +1247,16 @@ Runtime 决策后计数归零。`MAX_SEARCH_REPAIR_ROUNDS=1` 因而约束的是�
 ```python
 class IncidentContinuationDecision(BaseModel):
     status: Literal["answer", "investigate"]
+    completion_kind: Literal["page_location", "diagnosis"]
     message: str
     diagnosis: str | None
     recommended_actions: list[str]
     confidence: float | None
 ```
 
-`answer` 必须提供 `diagnosis`，并使用已有 `LocatedPage` 形成标准完成结果；`investigate` 只表达需要
-深度调查的原因。该路由使用新的 Claude session、空 `history`、`tools=[]` 和
+`diagnosis` 类型的 `answer` 必须提供 `diagnosis`，并使用已有 `LocatedPage` 形成标准完成结果；
+页面定位说明可保持 `page_location`。若页面定位完成后用户开始询问根因或解决方法，路由必须返回
+`investigate`，不能仅凭页面身份生成诊断。`investigate` 只表达需要深度调查的原因。该路由使用新的 Claude session、空 `history`、`tools=[]` 和
 `allowed_tools=[]`，不会覆盖主调查的 `session.runtime_session_id`。有新图片时绕过紧凑路由，
 直接进入完整图片/页面调查。Claude CLI 命令构造器以 `--tools ""` 明确关闭工具，并且只有非空
 列表才发送 `--allowedTools`。

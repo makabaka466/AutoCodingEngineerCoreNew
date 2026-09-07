@@ -31,6 +31,12 @@ def test_recursive_extension_only_glob_is_blocked(tmp_path: Path) -> None:
     assert "禁止通配整个项目" in violation.reason
 
 
+def test_extension_glob_inside_explicit_candidate_subtree_is_allowed(tmp_path: Path) -> None:
+    guard = BoundedSearchGuard(str(tmp_path))
+
+    assert guard.inspect("Glob", {"pattern": "**/CKClient/**/*.cs"}) is None
+
+
 def test_grep_requires_bounded_output_and_file_scope(tmp_path: Path) -> None:
     guard = BoundedSearchGuard(str(tmp_path))
 

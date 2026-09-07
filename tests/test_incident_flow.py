@@ -33,6 +33,7 @@ from autocoding_agent.incident.capability_store import IncidentCapabilityStore
 from autocoding_agent.incident.engine import IncidentEngine
 from autocoding_agent.incident.models import (
     DataQuery,
+    IncidentCompletionKind,
     IncidentContinuationDecision,
     IncidentContinuationStatus,
     IncidentDecision,
@@ -162,6 +163,7 @@ def _page() -> LocatedPage:
         route="/orders/:id",
         source_paths=["src/pages/order.tsx"],
         related_paths=["src/api/orders.py"],
+        matched_evidence=["The route and request handler match the report."],
         explanation="The route and request handler match the report.",
     )
 
@@ -204,12 +206,61 @@ def test_completed_incident_requires_a_verified_page_source_path() -> None:
         page=LocatedPage(
             name="Order details",
             route="/orders/:id",
+            matched_evidence=["The route candidate came from current mapping data."],
             explanation="Only a route candidate was found.",
         ),
         diagnosis="The route has not yet been verified against source code.",
     )
     with pytest.raises(ValueError, match="verified workspace-relative source path"):
         IncidentEngine._validate_decision(decision)
+
+
+def test_completed_incident_rejects_unresolved_page_identity_conflict() -> None:
+    page = _page().model_copy(
+        update={"unresolved_conflicts": ["The user title does not match the form title."]}
+    )
+    decision = IncidentDecision(
+        status=IncidentStatus.COMPLETED,
+        completion_kind=IncidentCompletionKind.PAGE_LOCATION,
+        message="Candidate located.",
+        page=page,
+    )
+
+    with pytest.raises(ValueError, match="unresolved conflicts"):
+        IncidentEngine._validate_decision(decision)
+
+
+def test_model_reported_page_conflict_is_converted_to_focused_question(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace-page-conflict"
+    workspace.mkdir()
+    candidate = _page().model_copy(
+        update={"unresolved_conflicts": ["The menu title omits the vendor clue."]}
+    )
+    runtime = ScriptedStructuredRuntime(
+        [
+            IncidentDecision(
+                status=IncidentStatus.COMPLETED,
+                completion_kind=IncidentCompletionKind.PAGE_LOCATION,
+                message="Candidate found.",
+                page=candidate,
+            )
+        ]
+    )
+    engine = IncidentEngine(runtime, JsonIncidentStore(tmp_path / "data-page-conflict"), None)
+
+    outcome = engine.start(workspace, "Locate the vendor upload page", "Vendor upload")
+
+    assert outcome.status == IncidentStatus.NEEDS_INPUT
+    assert outcome.task_state == TaskState.WAITING_INPUT
+    assert outcome.page == candidate
+    assert "The menu title omits the vendor clue." in (outcome.question or "")
+    assert any(
+        event.type == EventType.DECISION_REPAIRED
+        and event.data.get("repair") == "defer_unresolved_page_conflict"
+        for event in outcome.events
+    )
 
 
 def test_pinned_workspace_guidance_stays_separate_by_flow(tmp_path: Path) -> None:
@@ -335,6 +386,61 @@ def test_incident_flow_locates_page_queries_data_and_diagnoses(tmp_path: Path) -
         ProgressPhase.SAVING_CAPABILITY,
         ProgressPhase.COMPLETED,
     ]
+
+
+def test_incident_page_location_scope_stops_without_diagnosis_or_business_query(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    source = workspace / "MESClient" / "CKClient" / "CustomYieldUpLoad.cs"
+    source.parent.mkdir(parents=True)
+    source.write_text("public class CustomYieldUpLoad {}", encoding="utf-8")
+    runtime = ScriptedStructuredRuntime(
+        [
+            IncidentDecision(
+                status=IncidentStatus.COMPLETED,
+                completion_kind=IncidentCompletionKind.PAGE_LOCATION,
+                message="已确认小米良率上传页面的代码位置。",
+                page=LocatedPage(
+                    name="小米良率数据上传",
+                    route="Ckhy.MES.Client.CKClient.CustomYieldUpLoad",
+                    source_paths=["MESClient/CKClient/CustomYieldUpLoad.cs"],
+                    matched_evidence=["菜单路由、类名和源码中的窗体身份一致。"],
+                    explanation="菜单路由、类名和当前源码中的窗体身份一致。",
+                ),
+            )
+        ]
+    )
+    database = FakeDatabase()
+    data_dir = tmp_path / "data"
+    engine = IncidentEngine(
+        runtime,
+        JsonIncidentStore(data_dir),
+        database,
+        capabilities=IncidentCapabilityStore(data_dir),
+        model="test-model",
+    )
+
+    outcome = engine.start(
+        workspace,
+        "只确认小米良率上传页面对应的代码位置，不做异常诊断。",
+        "小米良率上传",
+    )
+
+    assert outcome.status == IncidentStatus.COMPLETED
+    assert outcome.completion_kind == IncidentCompletionKind.PAGE_LOCATION
+    assert outcome.diagnosis is None
+    assert outcome.recommended_actions == []
+    assert database.queries == []
+    assert "页面定位\n已确认小米良率上传页面的代码位置。" in outcome.message
+    assert "代码位置\n- MESClient/CKClient/CustomYieldUpLoad.cs" in outcome.message
+    assert "定位依据\n菜单路由、类名和当前源码中的窗体身份一致。" in outcome.message
+    assert "为什么出现这个异常" not in outcome.message
+    assert "解决方法" not in outcome.message
+    assert outcome.capability_document is not None
+    document = Path(outcome.capability_document).read_text(encoding="utf-8")
+    assert "# 页面定位记录：小米良率数据上传" in document
+    assert "## 定位结论" in document
 
 
 def test_incident_flow_injects_retrieved_knowledge_and_audits_it(
@@ -468,6 +574,50 @@ def test_completed_incident_reopens_and_appends_to_one_capability_document(
     assert event_types.count(EventType.TASK_REOPENED) == 1
     assert event_types.count(EventType.TASK_COMPLETED) == 2
     assert event_types.count(EventType.CAPABILITY_SAVED) == 2
+
+
+def test_page_location_follow_up_stays_compact_without_inventing_diagnosis(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace-page-location-follow-up"
+    workspace.mkdir()
+    runtime = ScriptedStructuredRuntime(
+        [
+            IncidentDecision(
+                status=IncidentStatus.COMPLETED,
+                completion_kind=IncidentCompletionKind.PAGE_LOCATION,
+                message="The page was located.",
+                page=_page(),
+            ),
+            IncidentContinuationDecision(
+                status=IncidentContinuationStatus.ANSWER,
+                completion_kind=IncidentCompletionKind.PAGE_LOCATION,
+                message="The same route still points to the verified source file.",
+            ),
+        ]
+    )
+    state = tmp_path / "data-page-location-follow-up"
+    engine = IncidentEngine(
+        runtime,
+        JsonIncidentStore(state),
+        None,
+        capabilities=IncidentCapabilityStore(state),
+    )
+
+    first = engine.start(workspace, "Locate the order page", "/orders/42")
+    second = engine.send(first.session_id, "Repeat the verified source path.")
+
+    assert second.status == IncidentStatus.COMPLETED
+    assert second.completion_kind == IncidentCompletionKind.PAGE_LOCATION
+    assert second.diagnosis is None
+    assert "页面定位" in second.message
+    assert "为什么出现这个异常" not in second.message
+    assert len(runtime.turns) == 2
+    assert runtime.turns[1].tools == []
+    assert Path(first.capability_document or "") == Path(second.capability_document or "")
+    assert "## 后续定位轮次 2" in Path(second.capability_document or "").read_text(
+        encoding="utf-8"
+    )
 
 
 def test_completed_follow_up_escalates_without_losing_verified_page(
@@ -1136,6 +1286,13 @@ def test_incident_contract_requires_question_query_and_completed_diagnosis() -> 
             message="Done",
             page=_page(),
         )
+    page_location = IncidentDecision(
+        status=IncidentStatus.COMPLETED,
+        completion_kind=IncidentCompletionKind.PAGE_LOCATION,
+        message="Located",
+        page=_page(),
+    )
+    assert page_location.diagnosis is None
 
 
 def test_legacy_query_decision_infers_stage_even_when_task_state_exists() -> None:

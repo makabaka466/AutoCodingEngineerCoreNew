@@ -33,6 +33,7 @@ class CompleteIncidentRuntime:
                     name="Orders",
                     route="/orders/:id",
                     source_paths=["src/orders.py"],
+                    matched_evidence=["The route matches the report."],
                     explanation="The route matches the report.",
                 ),
                 diagnosis="The persisted state explains the page symptom.",
@@ -96,6 +97,7 @@ def test_sqlite_incident_store_imports_legacy_json_without_overwriting_it(
         page=LocatedPage(
             name="Orders",
             source_paths=["src/orders.py"],
+            matched_evidence=["Legacy page evidence."],
             explanation="Legacy page evidence.",
         ),
         diagnosis="Legacy root cause.",
@@ -110,6 +112,8 @@ def test_sqlite_incident_store_imports_legacy_json_without_overwriting_it(
         mode="json",
         exclude={"task_state", "version", "revision", "events", "runs", "command_receipts"},
     )
+    payload["last_decision"]["page"].pop("matched_evidence")
+    payload["last_decision"]["page"].pop("unresolved_conflicts")
     source = legacy_dir / f"{legacy.id}.json"
     original = json.dumps(payload, ensure_ascii=False, indent=2)
     source.write_text(original, encoding="utf-8")
@@ -118,6 +122,9 @@ def test_sqlite_incident_store_imports_legacy_json_without_overwriting_it(
     restored = store.load(legacy.id)
 
     assert restored.task_state == TaskState.COMPLETED
+    assert restored.last_decision is not None
+    assert restored.last_decision.page is not None
+    assert restored.last_decision.page.matched_evidence == ["Legacy page evidence."]
     assert store.replay_task_state(legacy.id) == TaskState.COMPLETED
     assert source.read_text(encoding="utf-8") == original
     assert any(event.actor == "migration" for event in store.list_events(legacy.id))

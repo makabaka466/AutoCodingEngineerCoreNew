@@ -37,6 +37,7 @@ class CompleteAfterResumeRuntime:
                 page=LocatedPage(
                     name="Orders",
                     source_paths=["src/orders.py"],
+                    matched_evidence=["The page was rechecked after recovery."],
                     explanation="The page was rechecked after recovery.",
                 ),
                 diagnosis="The task resumed from current read-only evidence.",

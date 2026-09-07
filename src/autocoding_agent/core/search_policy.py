@@ -25,7 +25,9 @@ and small. The model decides what evidence is relevant; the host enforces only t
   class, route, or relative URL, derive an exact filename first (for example
   `**/FCModelUpload.cs`) and use that narrow Glob before asking the user for a path.
 - Never use wildcard-only or repository-wide patterns such as `*`, `**`, `**/*`, `**/*.cs`, or
-  equivalent all-extension scans. Do not list the repository to discover what might be useful.
+  equivalent all-extension scans. An extension Glob is allowed only when it includes an explicit
+  evidence-backed candidate subtree such as `**/CKClient/**/*.cs`. Do not list the repository to
+  discover what might be useful.
 - Use Grep only for a distinctive symbol, title, route, message, or configuration key inside an
   already plausible file or subtree. Always provide `path`, a file `glob` or `type` unless `path`
   is one exact file, and `head_limit` between 1 and {MAX_GREP_RESULTS}.
@@ -191,9 +193,17 @@ def _is_repository_wide_glob(pattern: str) -> bool:
         return True
     basename = pattern.rsplit("/", 1)[-1]
     # Recursive extension-only scans (for example **/*.cs or **/*.{ts,tsx})
-    # are broad even though their suffix is syntactically specific.
+    # are broad even though their suffix is syntactically specific. A literal directory segment
+    # such as **/CKClient/**/*.cs is different: it is a bounded candidate subtree surfaced by
+    # page/menu evidence, so listing filenames there is permitted while content Grep remains capped.
     if "**" in pattern and re.fullmatch(r"\*+(?:\.\{?[^/{}]+(?:,[^/{}]+)*\}?)?", basename):
-        return True
+        directory_segments = pattern.split("/")[:-1]
+        has_literal_directory = any(
+            segment not in {"", ".", "*", "**"}
+            and not re.search(r"[*?\[\]{}]", segment)
+            for segment in directory_segments
+        )
+        return not has_literal_directory
     return False
 
 

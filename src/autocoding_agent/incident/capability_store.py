@@ -22,6 +22,7 @@ from autocoding_agent.adapters.capability_store import (
     sync_knowledge_documents,
 )
 from autocoding_agent.incident.models import (
+    IncidentCompletionKind,
     IncidentDecision,
     IncidentSession,
     QueryObservation,
@@ -129,6 +130,7 @@ class IncidentCapabilityStore:
                         "last_cycle_number": max(recorded),
                         "cycle_objective": cycle["cycle_objective"],
                         "outcome": cycle["outcome"],
+                        "completion_kind": cycle["completion_kind"],
                         "model": model,
                         "completed_at": session.updated_at.isoformat(),
                         "updated_at": session.updated_at.isoformat(),
@@ -160,6 +162,7 @@ class IncidentCapabilityStore:
             "problem": safe(session.problem),
             "cycle_objective": safe(session.cycle_objective or session.problem),
             "outcome": safe(decision.message),
+            "completion_kind": decision.completion_kind.value,
             "document": relative_document,
             "model": model,
             "completed_at": session.updated_at.isoformat(),
@@ -184,6 +187,7 @@ class IncidentCapabilityStore:
     ) -> dict[str, Any]:
         return {
             "cycle_number": session.cycle_number,
+            "completion_kind": decision.completion_kind.value,
             "cycle_objective": safe(session.cycle_objective or session.problem),
             "outcome": safe(decision.message),
             "diagnosis": safe(decision.diagnosis or decision.message),
@@ -220,6 +224,9 @@ class IncidentCapabilityStore:
         def bullets(values: list[str], empty: str) -> str:
             return "\n".join(f"- {safe(item)}" for item in values) or f"- {empty}"
 
+        is_location = decision.completion_kind == IncidentCompletionKind.PAGE_LOCATION
+        document_title = "页面定位记录" if is_location else "异常能力"
+        conclusion_title = "定位结论" if is_location else "诊断结论"
         return capability_frontmatter(
             workflow="incident",
             session_id=session.id,
@@ -228,7 +235,7 @@ class IncidentCapabilityStore:
             model=model,
             created_at=session.updated_at.isoformat(),
             updated_at=session.updated_at.isoformat(),
-        ) + f"""# 异常能力：{page_name}
+        ) + f"""# {document_title}：{page_name}
 
 ## 适用问题
 
@@ -243,7 +250,7 @@ class IncidentCapabilityStore:
 - 路由：{route}
 {bullets(paths, "本次未记录代码路径。")}
 
-## 诊断结论
+## {conclusion_title}
 
 {safe(decision.diagnosis or decision.message)}
 
@@ -288,9 +295,19 @@ class IncidentCapabilityStore:
         def bullets(values: list[str], empty: str) -> str:
             return "\n".join(f"- {safe(item)}" for item in values) or f"- {empty}"
 
+        conclusion_title = (
+            "定位结论"
+            if decision.completion_kind == IncidentCompletionKind.PAGE_LOCATION
+            else "诊断结论"
+        )
+        cycle_title = (
+            "后续定位轮次"
+            if decision.completion_kind == IncidentCompletionKind.PAGE_LOCATION
+            else "后续诊断轮次"
+        )
         return f"""---
 
-## 后续诊断轮次 {session.cycle_number}
+## {cycle_title} {session.cycle_number}
 
 - 本轮问题：{safe(session.cycle_objective or session.problem)}
 - 完成时间：{session.updated_at.isoformat()}
@@ -301,7 +318,7 @@ class IncidentCapabilityStore:
 
 {bullets(paths, "本轮未记录代码路径。")}
 
-### 诊断结论
+### {conclusion_title}
 
 {safe(decision.diagnosis or decision.message)}
 

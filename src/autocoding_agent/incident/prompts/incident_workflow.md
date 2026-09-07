@@ -9,6 +9,20 @@ contains the abnormal behavior, which page candidate best matches the evidence, 
 relevant, and what the evidence proves. Do not replace those judgments with filename, OCR keyword,
 color, or exception-text rules.
 
+## 0. Match the investigation depth to the user's current goal
+
+Choose the current cycle's depth from semantic intent, never a keyword rule:
+
+- `page_location`: locate or verify a page and source. Stop after one relative source path is
+  verified; do not query business data or invent cause/remediation.
+- `diagnosis`: the user needs cause or solution; follow the full evidence workflow.
+- If depth is materially ambiguous, ask one focused question.
+
+Keep `page_location` compact: use an exact Glob, bounded Grep, or at most 200 relevant Read lines to
+verify identity. Do not read a whole large business file or trace downstream code. Return one
+sentence, paths, and two to four decisive `matched_evidence` items. For a diagnosis, include only
+evidence affecting the cause or next safe action.
+
 ## Permission boundary
 
 - This workflow is diagnostic only. You have Read, Glob, and Grep tools.
@@ -75,6 +89,11 @@ If the selected project defines a mapping query, use a staged, bounded investiga
 4. Never request an unbounded mapping table scan and never derive page-search terms only from error
    text.
 
+Preserve independent identity clues in fuzzy terms. Prefer a bounded conjunction of a vendor/product
+clue and business function. A generic-function match that drops a distinctive clue is only an
+alternative: run one remaining bounded lookup or ask for confirmation. Its source lacking that clue
+does not prove the candidate is a user alias.
+
 Use semantic judgment to compare returned names, relative URLs/routes, selected project knowledge,
 and current repository structure. A mapping URL is a location clue, not proof. Open candidate
 source and verify that its form/page title, controls, routes, events, or request entry match the
@@ -82,6 +101,12 @@ report. If a screenshot exists, compare a few meaningful visible features with t
 do not claim a pixel-perfect comparison. If a candidate clearly conflicts with the image, do not
 force the match. Select another bounded candidate only when the combined evidence is genuinely
 strong; otherwise ask the user to confirm which page is abnormal.
+
+For every structured `page`, put the independent supporting facts in `matched_evidence` and any
+material mismatch in `unresolved_conflicts`. Do not hide a title, route, screenshot, or functional
+conflict inside a positive explanation. If any conflict remains unresolved, return `needs_input`
+with that candidate and ask one confirmation question; never return `completed` or request
+`business_data` yet.
 
 ## 4. Trace the smallest relevant code path
 
@@ -128,20 +153,24 @@ parameterized, read-only queries. The host executes the structured plan automati
   SQL error, correct the minimal query without changing its semantic stage. If evidence is still
   missing, state the gap rather than pretending the query succeeded.
 
-## 6. Finish only with a verified page and evidence chain
+## 6. Finish only with evidence appropriate to the selected depth
 
 Return `completed` only after the page identity and at least one workspace-relative page source path
 have been verified. When the user started from a source path, derive the reported page/form name
-from current code and record it in the structured page result. Explain the relevant code location,
-database evidence when used, diagnosis or bounded candidate causes, confidence, recommended next
-action, and whether the pattern is a useful future automation candidate. It is valid to say the
-root cause is not proven.
+from current code and record it in the structured page result.
 
-Every `completed` decision must be directly useful to the user: make `message` a one-sentence final
+For `completion_kind=page_location`, return the verified `page` and a concise `message`; `diagnosis`
+and `recommended_actions` may be empty. For `completion_kind=diagnosis`, explain the relevant code
+location, database evidence when used, diagnosis or bounded candidate causes, confidence,
+recommended next action, and whether the pattern is a useful future automation candidate. It is
+valid to say the root cause is not proven.
+
+Every completed diagnosis must be directly useful to the user: make `message` a one-sentence final
 conclusion, make `diagnosis` explain why the exception happened as an evidence-backed causal chain,
 and provide at least one concrete item in `recommended_actions`. Clearly label the conclusion as a
-confirmed root cause, high-probability cause, or hypothesis requiring verification. When evidence is
-incomplete, give the safest verification step as part of the solution instead of overstating certainty.
+confirmed root cause, high-probability cause, or hypothesis requiring verification. When evidence
+is incomplete, give the safest verification step as part of the solution instead of overstating
+certainty.
 
 A completed incident may be reopened by a later user message. Treat it as a new investigation cycle
 in the same conversation: reuse relevant history and page context, but recheck current code and

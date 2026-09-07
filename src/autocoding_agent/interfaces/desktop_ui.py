@@ -1937,6 +1937,12 @@ class DesktopClient:
                 if decision.page.related_paths:
                     details.append("关联代码")
                     details.extend(f"• {item}" for item in decision.page.related_paths)
+                if decision.page.matched_evidence:
+                    details.append("页面匹配依据")
+                    details.extend(f"• {item}" for item in decision.page.matched_evidence)
+                if decision.page.unresolved_conflicts:
+                    details.append("待确认的页面冲突")
+                    details.extend(f"• {item}" for item in decision.page.unresolved_conflicts)
             if decision.diagnosis:
                 details.append(f"为什么出现这个异常\n{decision.diagnosis}")
             if decision.findings:
