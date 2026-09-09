@@ -89,8 +89,10 @@ class LocatedPage(BaseModel):
         default_factory=list,
         max_length=4,
         description=(
-            "Material mismatches between the user's clue, screenshot, menu mapping, and source. "
-            "A completed decision cannot retain any unresolved conflict."
+            "Only unresolved PAGE IDENTITY mismatches between user title, screenshot, menu "
+            "mapping and source page. Missing production logs/schema or uncertain causes are "
+            "diagnostic gaps, not page conflicts; put them in diagnosis/findings/question. "
+            "A completed decision cannot retain any page identity conflict."
         ),
     )
     explanation: NonEmptyText
@@ -105,6 +107,13 @@ class IncidentContinuationDecision(BaseModel):
     """Compact follow-up answer or escalation without replaying the full workflow prompt."""
 
     status: IncidentContinuationStatus
+    reuse_verified_page: bool = Field(
+        default=False,
+        description=(
+            "True only when the latest message still concerns the previously verified page. "
+            "False for a different, denied, or uncertain page; then request investigation."
+        ),
+    )
     completion_kind: IncidentCompletionKind = IncidentCompletionKind.DIAGNOSIS
     message: NonEmptyText
     diagnosis: NonEmptyText | None = None
@@ -126,6 +135,15 @@ class IncidentDecision(BaseModel):
     """One model decision in the incident investigation state machine."""
 
     status: IncidentStatus
+    reuse_verified_page: bool = Field(
+        default=False,
+        description=(
+            "Explicitly confirm the previously verified page is still relevant to the latest "
+            "user message. Only then may the host restore an omitted page. False for a denied, "
+            "different, or uncertain page. A new verified page must be supplied in page. "
+            "Tool reads alone do not bind it: the first business-data decision must include page."
+        ),
+    )
     completion_kind: IncidentCompletionKind = Field(
         default=IncidentCompletionKind.DIAGNOSIS,
         description=(

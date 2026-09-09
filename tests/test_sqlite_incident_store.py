@@ -11,6 +11,7 @@ from autocoding_agent.core.models import AgentUsage, EventType, RuntimeTurn
 from autocoding_agent.core.state_machine.models import TaskState
 from autocoding_agent.incident.engine import IncidentEngine
 from autocoding_agent.incident.models import (
+    IncidentContinuationDecision,
     IncidentDecision,
     IncidentSession,
     IncidentStatus,
@@ -25,6 +26,15 @@ class CompleteIncidentRuntime:
         turn: RuntimeTurn,
         response_model: type[IncidentDecision],
     ) -> StructuredRuntimeResult[IncidentDecision]:
+        if response_model is IncidentContinuationDecision:
+            return StructuredRuntimeResult(
+                output=IncidentContinuationDecision(
+                    status="answer", reuse_verified_page=True,
+                    message="The same page remains affected.",
+                    diagnosis="The persisted state explains the page symptom.",
+                ),
+                runtime_session_id=turn.session_id, usage=AgentUsage(turns=1),
+            )
         return StructuredRuntimeResult(
             output=IncidentDecision(
                 status=IncidentStatus.COMPLETED,

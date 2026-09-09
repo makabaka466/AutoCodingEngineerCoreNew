@@ -1,6 +1,6 @@
 # AutoCoding Engineer 接口与数据契约
 
-本文记录当前 `0.7.16` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
+本文记录当前 `0.7.17` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
 Runtime、持久化和状态契约。
 设计动机和运行流程见[架构说明](ARCHITECTURE.md)。
 
@@ -950,6 +950,7 @@ outcome = incidents.start(
 
 ```text
 status, completion_kind: page_location | diagnosis, message, question
+reuse_verified_page: bool = False
 page: LocatedPage | None
 query_stage: page_lookup | business_data | None
 queries: list[DataQuery] (最多 5 条)
@@ -966,10 +967,14 @@ automation_candidate: bool
 匹配与冲突由模型根据当前对话、图片、菜单和源码判断；宿主不计算标题相似度，但
 `unresolved_conflicts` 非空时禁止 `completed` 和 `business_data`。若模型仍返回这两类决定，Engine
 将其规范化成带确认问题的 `needs_input`，并追加 `decision_repaired` 事件。
-模型契约要求每个 `business_data` 和 `completed` 决定都重复 `page`。为容忍模型在连续轮次中
-遗漏重复字段，`IncidentSession.located_page` 保存本 cycle 最近一次通过宿主校验且至少含一个
-源码路径的页面；后续决定漏传 `page` 时宿主可以恢复该对象并记录 `decision_repaired`。这不是
-放宽页面前置条件：没有已验证页面、路径为空/越界或进入新 cycle 时都不能自动补全。
+`unresolved_conflicts` 仅用于页面身份；缺少生产记录、部署版本或根因证据不能填入此字段。
+这类缺口放在 `diagnosis/findings/question` 中，不能因为缺少现场日志而重新要求确认页面名称。
+`IncidentSession.located_page` 只缓存已通过校验、无冲突且进入 `business_data/completed` 的页面，
+待确认候选不能更新缓存。模型省略 `page` 时必须明确设置 `reuse_verified_page=true` 才允许恢复
+已有无冲突页面，并记录 `decision_repaired`。首次漏填且无可复用页面时，以
+`request_missing_page_evidence` 事件要求模型利用已读证据补齐，暂不执行其 SQL；每个用户命令
+最多一次，重复遗漏记为 `defer_missing_verified_page` 并安全转为 `needs_input`。源码路径为空
+或越界仍拒绝。默认 False 保持旧记录可加载，但不会替旧记录暗中授予页面复用权限。
 `DataQuery` 保存名称、用途、SQL、命名参数和 1–100 的请求行数，默认
 为 100；参数契约优先使用 `:name`，参数字典键写不带前缀的 `name`。SQL Server 适配器还安全
 兼容 `@name`，统一转换成 ODBC `?` 后按出现顺序独立绑定，绝不插值。数据库适配器仍会应用更小的主机上限。结果数量未知时，开发与异常 Prompt 都要求模型
@@ -983,7 +988,8 @@ automation_candidate: bool
 `IncidentSession` 与开发会话一样保存 `cycle_number/cycle_objective` 和当前轮查询审计起点；另外
 保存总尝试数 `query_rounds`、成功页面查询数 `page_query_rounds`、成功业务查询数
 `business_query_rounds` 和 SQL 失败纠错数 `query_repair_rounds`。四项在 completed 会话续聊进入
-新 cycle 时重置，同时清空 `located_page`，但历史 Observation/Event 不清空；
+新 cycle 时重置；`located_page` 可作为历史上下文保留，是否仍是同一页面由模型明确判断，不能
+无条件自动补齐。路由否认复用、重新查菜单或存在页面冲突时撤销旧绑定；历史 Observation/Event 不清空；
 `IncidentOutcome` 只返回本 cycle 的查询摘要，Session/Event 继续保留全部历史审计。
 
 ### 11.3 `DatabaseReader`
@@ -1247,6 +1253,7 @@ Runtime 决策后计数归零。`MAX_SEARCH_REPAIR_ROUNDS=1` 因而约束的是�
 ```python
 class IncidentContinuationDecision(BaseModel):
     status: Literal["answer", "investigate"]
+    reuse_verified_page: bool = False
     completion_kind: Literal["page_location", "diagnosis"]
     message: str
     diagnosis: str | None
@@ -1260,3 +1267,7 @@ class IncidentContinuationDecision(BaseModel):
 `allowed_tools=[]`，不会覆盖主调查的 `session.runtime_session_id`。有新图片时绕过紧凑路由，
 直接进入完整图片/页面调查。Claude CLI 命令构造器以 `--tools ""` 明确关闭工具，并且只有非空
 列表才发送 `--allowedTools`。
+
+即使模型错误返回 `answer`，只要 `reuse_verified_page=false` 或由 `page_location` 摘要直接升级
+为 `diagnosis`，宿主也会转入完整调查，并以事件保留模型状态、实际状态和升级原因。新页面必须重新
+提供并核对身份，不能借用上一个页面的诊断。紧凑续聊本身不能读工具，因此适用范围仅限已有证据。

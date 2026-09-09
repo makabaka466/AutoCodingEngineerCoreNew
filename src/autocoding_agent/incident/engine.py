@@ -184,8 +184,9 @@ class IncidentEngine:
         )
         validated_attachments = self._validate_attachments(attachments or [])
         page = session.page_hint or (
-            "Not provided as a separate field; infer it from the user description or attached "
-            "screenshot, and ask one focused question if it still cannot be located."
+            "No separate page hint. Use only page identity actually supplied in the conversation "
+            "or screenshot. If the user only describes a symptom, ask which page before discovery; "
+            "do not infer the affected page from knowledge examples or matching code behavior."
         )
         message = f"Problem:\n{session.problem}\n\nPage hint:\n{page}"
         return self._execute(
@@ -423,6 +424,21 @@ class IncidentEngine:
         """推进一次异常对话，直到补充信息、失败或诊断结果被可靠保存。"""
 
         attachments = attachments or []
+        # 兼容旧版本快照：当时可能把等待确认的候选写入了已验证缓存。
+        # 进入新命令前撤销该绑定，不能让新的显式复用标志替旧候选补办确认。
+        if (
+            session.located_page is not None
+            and session.last_decision is not None
+            and session.last_decision.status == IncidentStatus.NEEDS_INPUT
+            and session.last_decision.page is not None
+        ):
+            session.located_page = None
+            session.events.append(AgentEvent(
+                type=EventType.DECISION_REPAIRED,
+                message="Discarded a legacy page binding that was still awaiting confirmation.",
+                actor="host", command_id=command.id,
+                data={"repair": "discard_unconfirmed_legacy_page", "workflow": "incident"},
+            ))
         # 第 1 步：模型读取上下文前，先持久化本轮消息和附件身份信息。
         emit_progress(
             progress_sink,
@@ -475,6 +491,7 @@ class IncidentEngine:
             )
         hermes_skill_rounds = 0
         consecutive_search_repair_rounds = 0
+        page_correction_used = False
 
         # 第 3 步：每次循环对应一个可持久化的 Runtime Run。SQL/Hermes 证据可以触发
         # 下一次模型调用，但每个调用边界都可以审计和回放。
@@ -512,7 +529,29 @@ class IncidentEngine:
                         command.id,
                         progress_sink,
                     )
-                    if route.status == IncidentContinuationStatus.INVESTIGATE:
+                    # 紧凑摘要没有新增证据：页面变化或定位升级诊断时，不能直接复用旧结论。
+                    previous_kind = json.loads(continuation_context).get("completion_kind")
+                    requires_investigation = (
+                        route.status == IncidentContinuationStatus.INVESTIGATE
+                        or not route.reuse_verified_page
+                        or (
+                            previous_kind == IncidentCompletionKind.PAGE_LOCATION.value
+                            and route.completion_kind == IncidentCompletionKind.DIAGNOSIS
+                        )
+                    )
+                    if requires_investigation:
+                        # 宿主升级的原因单独记录，不能把拒绝的紧凑答案当作调查结论回灌。
+                        routing_reason = route.message
+                        if not route.reuse_verified_page:
+                            session.located_page = None
+                            routing_reason = "The latest page identity is different or uncertain."
+                        elif (
+                            previous_kind == IncidentCompletionKind.PAGE_LOCATION.value
+                            and route.completion_kind == IncidentCompletionKind.DIAGNOSIS
+                        ):
+                            routing_reason = (
+                                "Page-location evidence alone cannot explain the cause."
+                            )
                         self.runtime_lifecycle.finish(
                             session,
                             run,
@@ -526,14 +565,19 @@ class IncidentEngine:
                             AgentEvent(
                                 type=EventType.RUNTIME_FINISHED,
                                 message=(
-                                    "The compact continuation router requested a full "
-                                    "incident investigation."
+                                    "Full incident investigation is required after compact routing."
                                 ),
                                 actor="model",
                                 command_id=command.id,
                                 correlation_id=run.id,
                                 data={
-                                    "status": route.status.value,
+                                    "status": IncidentContinuationStatus.INVESTIGATE.value,
+                                    "model_status": route.status.value,
+                                    "reuse_verified_page": route.reuse_verified_page,
+                                    "host_escalated": (
+                                        route.status == IncidentContinuationStatus.ANSWER
+                                    ),
+                                    "reason": routing_reason,
                                     "prompt_profile": "continuation_compact",
                                     "workflow": "incident",
                                 },
@@ -543,8 +587,8 @@ class IncidentEngine:
                             ChatMessage(
                                 role=MessageRole.SYSTEM,
                                 content=(
-                                    "Agent 判断该追问包含新的事实或需要重新核对，正在进入完整"
-                                    "只读调查；已定位页面会继续复用。"
+                                    "该追问需要补充证据或重新核对，正在进入完整"
+                                    "只读调查；仅在确认同一页面时复用定位证据。"
                                 ),
                             )
                         )
@@ -553,7 +597,7 @@ class IncidentEngine:
                             "Continue with a full read-only investigation for the user's latest "
                             "follow-up. Reuse the verified page when still relevant, but verify "
                             "new facts. Latest user follow-up:\n"
-                            f"{user_message}\n\nRouter reason: {route.message}"
+                            f"{user_message}\n\nInvestigation reason: {routing_reason}"
                         )
                         knowledge_context = self._retrieve_knowledge(
                             session,
@@ -579,6 +623,9 @@ class IncidentEngine:
                     )
                     decision, page_repaired = self._restore_verified_page(session, decision)
                 decision, conflict_deferred = self._defer_unresolved_page_conflict(decision)
+                page_correction_requested = (
+                    conflict_deferred and decision.page is None and not page_correction_used
+                )
                 self._validate_decision(decision)
             except RuntimePolicyBlockedError as exc:
                 # 第 4 步：源码搜索范围过大时，最多自动进行一次有界纠正。
@@ -642,8 +689,24 @@ class IncidentEngine:
 
             # 第 5 步：只根据已经验证的页面证据修复可确定的字段遗漏；调用外部宿主服务前，
             # 必须先审计模型决策。
-            if decision.page is not None and decision.page.source_paths:
+            if (
+                decision.page is not None
+                and decision.page.source_paths
+                and not decision.page.unresolved_conflicts
+                and (
+                    decision.status == IncidentStatus.COMPLETED
+                    or decision.query_stage == IncidentQueryStage.BUSINESS_DATA
+                )
+            ):
                 session.located_page = decision.page
+            elif (
+                not decision.reuse_verified_page
+                or decision.page is not None
+                or decision.query_stage == IncidentQueryStage.PAGE_LOOKUP
+            ):
+                # 待确认候选仅留在 last_decision 中展示，不提升为已确认页面。
+                # 否认/切换/重新查菜单时撤销旧绑定；历史证据仍保留在事件和对话中。
+                session.located_page = None
             if page_repaired:
                 session.events.append(
                     AgentEvent(
@@ -675,14 +738,22 @@ class IncidentEngine:
                     AgentEvent(
                         type=EventType.DECISION_REPAIRED,
                         message=(
-                            "Deferred a page decision because the model reported unresolved "
-                            "identity conflicts."
+                            "Deferred a page decision because verified identity was missing "
+                            "or had unresolved conflicts."
                         ),
                         actor="host",
                         command_id=command.id,
                         correlation_id=run.id,
                         data={
-                            "repair": "defer_unresolved_page_conflict",
+                            "repair": (
+                                "request_missing_page_evidence"
+                                if page_correction_requested
+                                else (
+                                    "defer_unresolved_page_conflict"
+                                    if decision.page is not None
+                                    else "defer_missing_verified_page"
+                                )
+                            ),
                             "decision_type": decision.status.value,
                             "page": decision.page.name if decision.page else None,
                             "cycle_number": session.cycle_number,
@@ -731,6 +802,29 @@ class IncidentEngine:
                     },
                 )
             )
+            if page_correction_requested:
+                # 页面可能已经在工具上下文中核实，仅结构化响应漏填。每个用户命令只补问
+                # 模型一次，不执行被拒绝的 SQL，不猜路径，也不立即把格式问题转嫁给用户。
+                page_correction_used = True
+                pending_message = (
+                    "The host could not accept your last decision: page was omitted and no "
+                    "explicitly reusable, host-accepted page is available. No business SQL "
+                    "from that decision was executed. Correct the structured response using "
+                    "the page evidence you already read: include page.name, workspace-relative "
+                    "source_paths, matched_evidence, and any page-identity conflicts. A "
+                    "reuse_verified_page flag is not a substitute for a newly verified page. "
+                    "Do not repeat existing queries or invent paths. If actual identity evidence "
+                    "is insufficient, return needs_input with a focused question. Missing "
+                    "production evidence belongs in findings/question, not page conflicts."
+                )
+                session.messages.append(ChatMessage(
+                    role=MessageRole.SYSTEM,
+                    content=(
+                        "Agent 漏填页面证据，正在进行一次有界补全；"
+                        "尚未执行该决策中的业务 SQL。"
+                    ),
+                ))
+                continue
             # 第 6 步：Hermes 只提供候选经验，结果必须返回主模型核验，不能直接形成结论。
             if decision.status == IncidentStatus.HERMES_SKILL_REQUIRED:
                 if hermes_skill_rounds >= self.max_hermes_skill_rounds:
@@ -1361,6 +1455,7 @@ class IncidentEngine:
             )
         return IncidentDecision(
             status=IncidentStatus.COMPLETED,
+            reuse_verified_page=True,
             completion_kind=route.completion_kind,
             message=route.message,
             page=page,
@@ -1440,7 +1535,13 @@ class IncidentEngine:
                 and decision.query_stage == IncidentQueryStage.BUSINESS_DATA
             )
         )
-        if not requires_page or decision.page is not None or session.located_page is None:
+        if (
+            not requires_page
+            or not decision.reuse_verified_page
+            or decision.page is not None
+            or session.located_page is None
+            or session.located_page.unresolved_conflicts
+        ):
             return decision, False
         return decision.model_copy(update={"page": session.located_page}), True
 
@@ -1450,8 +1551,10 @@ class IncidentEngine:
         if page is None:
             return ""
         return (
-            "The verified page remains bound to this investigation cycle. Repeat it in every "
-            "business_data or completed structured decision:\n"
+            "Previously verified page (historical evidence, not proof of the latest target). "
+            "Set reuse_verified_page=true only after confirming the latest user message still "
+            "concerns this page. For a denied, different, or uncertain page, set false and "
+            "resolve the new page or ask a focused question:\n"
             + json.dumps(page.model_dump(mode="json"), ensure_ascii=False)
             + "\n\n"
         )
@@ -1460,14 +1563,26 @@ class IncidentEngine:
     def _defer_unresolved_page_conflict(
         decision: IncidentDecision,
     ) -> tuple[IncidentDecision, bool]:
-        """模型已声明页面冲突时，保守转为追问而不是接受结论或直接失败。"""
+        """缺少已验证页面或模型声明冲突时转为追问，不带着旧绑定执行 SQL。"""
 
         page = decision.page
         requires_verified_identity = decision.status == IncidentStatus.COMPLETED or (
             decision.status == IncidentStatus.QUERY_REQUIRED
             and decision.query_stage == IncidentQueryStage.BUSINESS_DATA
         )
-        if page is None or not page.unresolved_conflicts or not requires_verified_identity:
+        if not requires_verified_identity:
+            return decision, False
+        if page is None:
+            return (
+                IncidentDecision(
+                    status=IncidentStatus.NEEDS_INPUT,
+                    completion_kind=decision.completion_kind,
+                    message="当前异常页面尚未确认，暂未执行业务数据查询或生成诊断结论。",
+                    question="请确认本次异常的页面名称、菜单入口或源码路径，是否仍为上一页面？",
+                ),
+                True,
+            )
+        if not page.unresolved_conflicts:
             return decision, False
         conflicts = "；".join(page.unresolved_conflicts[:2])
         return (
@@ -1695,10 +1810,16 @@ Return status `answer` when the user is asking for an explanation, clarification
 solution that is already supported by the previous evidence. Give a concise final conclusion in
 `message`, explain why in `diagnosis`, include concrete safe actions when useful, and preserve the
 previous confidence unless the wording should become more cautious.
+Correcting unsupported wording without new facts can also use `answer`. Do not promote a prior
+hypothesis to fact or label the connected database's environment without evidence. Keep the
+headline as qualified as the detailed diagnosis.
 
 Preserve `completion_kind=page_location` when answering only a clarification about the previously
 verified page or source location. If a page-location-only cycle is followed by a request for an
 incident cause or solution, return `investigate`; page identity alone is not diagnostic evidence.
+
+Set `reuse_verified_page=true` only when the latest message still concerns the verified page.
+For a different, denied, or uncertain page, set false and return `investigate`.
 
 Return status `investigate` when the message adds a new symptom or environment, disputes the prior
 evidence, asks for current facts, or otherwise requires reading code, an image, or the database.
@@ -1744,7 +1865,11 @@ def _user_facing_decision_message(decision: IncidentDecision) -> str:
 def _source_search_enabled(session: IncidentSession) -> bool:
     """只有当前轮次取得页面证据后，才开放原生源码搜索。"""
 
-    if session.located_page is not None and session.located_page.source_paths:
+    if (
+        session.located_page is not None
+        and session.located_page.source_paths
+        and not session.located_page.unresolved_conflicts
+    ):
         return True
     observations = session.query_observations[session.cycle_query_observation_start :]
     return any(

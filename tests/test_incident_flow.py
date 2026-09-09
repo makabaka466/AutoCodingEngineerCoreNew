@@ -255,12 +255,164 @@ def test_model_reported_page_conflict_is_converted_to_focused_question(
     assert outcome.status == IncidentStatus.NEEDS_INPUT
     assert outcome.task_state == TaskState.WAITING_INPUT
     assert outcome.page == candidate
+    assert engine.get_session(outcome.session_id).located_page is None
     assert "The menu title omits the vendor clue." in (outcome.question or "")
     assert any(
         event.type == EventType.DECISION_REPAIRED
         and event.data.get("repair") == "defer_unresolved_page_conflict"
         for event in outcome.events
     )
+
+
+@pytest.mark.parametrize("conflicted", [False, True])
+@pytest.mark.parametrize("legacy_cached", [False, True])
+def test_unconfirmed_candidate_cannot_authorize_followup_query(
+    tmp_path: Path, conflicted: bool, legacy_cached: bool,
+):
+    """用户否认候选后，即使模型漏填页面也不能把业务 SQL 套在旧候选上。"""
+    candidate = _page().model_copy(update={
+        "unresolved_conflicts": ["Screenshot does not match"] if conflicted else [],
+    })
+    runtime = ScriptedStructuredRuntime([
+        IncidentDecision(
+            status=IncidentStatus.NEEDS_INPUT, page=candidate,
+            message="Candidate only.", question="Is this the affected page?",
+        ),
+        IncidentDecision(
+            status=IncidentStatus.QUERY_REQUIRED, reuse_verified_page=True,
+            message="Checking data.", query_stage=IncidentQueryStage.BUSINESS_DATA,
+            queries=[DataQuery(name="old_page_data", purpose="Check data", sql="SELECT 1")],
+        ),
+        IncidentDecision(
+            status=IncidentStatus.NEEDS_INPUT, message="The old candidate was denied.",
+            question="What is the correct page name?",
+        ),
+    ])
+    database = FakeDatabase()
+    engine = IncidentEngine(runtime, JsonIncidentStore(tmp_path / "data"), database)
+    first = engine.start(tmp_path, "The upload page has an error")
+    assert engine.get_session(first.session_id).located_page is None
+    if legacy_cached:
+        # 模拟旧版本已经把未确认候选保存进 SQLite/JSON 快照的兼容场景。
+        old_session = engine.get_session(first.session_id)
+        old_session.located_page = candidate
+        engine.sessions.save(old_session)
+    second = engine.send(first.session_id, "No, that is not the affected page.")
+    assert second.status == IncidentStatus.NEEDS_INPUT
+    assert second.page is None
+    assert database.queries == []
+    assert runtime.turns[1].tools == ["Read"]
+    repairs = [event.data.get("repair") for event in second.events]
+    assert repairs.count("discard_unconfirmed_legacy_page") == int(legacy_cached)
+
+
+def test_page_switch_revokes_previous_binding_before_new_investigation(tmp_path: Path):
+    runtime = ScriptedStructuredRuntime([
+        IncidentDecision(
+            status=IncidentStatus.COMPLETED, page=_page(),
+            message="Located.", completion_kind=IncidentCompletionKind.PAGE_LOCATION,
+        ),
+        IncidentContinuationDecision(
+            status=IncidentContinuationStatus.INVESTIGATE, reuse_verified_page=False,
+            message="The user has switched pages.",
+        ),
+        IncidentDecision(
+            status=IncidentStatus.COMPLETED, reuse_verified_page=True,
+            message="Cannot reuse the old page.", diagnosis="Unsupported inference.",
+        ),
+        IncidentDecision(
+            status=IncidentStatus.NEEDS_INPUT, message="New page evidence is missing.",
+            question="Which payment page?",
+        ),
+    ])
+    engine = IncidentEngine(runtime, JsonIncidentStore(tmp_path / "data"), None)
+    first = engine.start(tmp_path, "Locate Orders")
+    second = engine.send(first.session_id, "Now investigate the payment page.")
+    assert second.status == IncidentStatus.NEEDS_INPUT
+    assert second.page is None
+    assert runtime.turns[2].tools == ["Read"]
+    assert engine.get_session(first.session_id).located_page is None
+
+
+@pytest.mark.parametrize("reuse", [False, True])
+def test_full_decision_requires_explicit_same_page_reuse(tmp_path: Path, reuse: bool):
+    runtime = ScriptedStructuredRuntime([
+        IncidentDecision(
+            status=IncidentStatus.QUERY_REQUIRED, page=_page(),
+            message="Checking data.", query_stage=IncidentQueryStage.BUSINESS_DATA,
+            queries=[DataQuery(name="order", purpose="Check order", sql="SELECT 1")],
+        ),
+        IncidentDecision(
+            status=IncidentStatus.COMPLETED, reuse_verified_page=reuse,
+            message="Checked.", diagnosis="The request boundary explains the symptom.",
+        ),
+        IncidentDecision(
+            status=IncidentStatus.NEEDS_INPUT, message="Page reuse was not confirmed.",
+            question="Which page is affected?",
+        ),
+    ])
+    engine = IncidentEngine(runtime, JsonIncidentStore(tmp_path / "data"), FakeDatabase())
+    outcome = engine.start(tmp_path, "Investigate Orders")
+    assert outcome.status == (IncidentStatus.COMPLETED if reuse else IncidentStatus.NEEDS_INPUT)
+    assert outcome.page == (_page() if reuse else None)
+
+
+@pytest.mark.parametrize("corrected", [False, True])
+def test_missing_first_page_gets_one_model_correction_before_query(tmp_path: Path, corrected: bool):
+    """有界补齐结构遗漏；再次遗漏则追问，绝不通过历史候选或布尔标志放行业务 SQL。"""
+    query = DataQuery(name="order", purpose="Check order", sql="SELECT 1")
+    omitted = IncidentDecision(
+        status=IncidentStatus.QUERY_REQUIRED, reuse_verified_page=True,
+        message="Read the source, now check data.",
+        query_stage=IncidentQueryStage.BUSINESS_DATA, queries=[query],
+    )
+    runtime = ScriptedStructuredRuntime([
+        omitted,
+        omitted.model_copy(update={"page": _page()}) if corrected else omitted,
+        IncidentDecision(
+            status=IncidentStatus.COMPLETED, reuse_verified_page=True,
+            message="Checked the evidence.", diagnosis="The row confirms the code branch.",
+        ),
+    ])
+    database = FakeDatabase()
+    engine = IncidentEngine(runtime, JsonIncidentStore(tmp_path / "data"), database)
+    outcome = engine.start(tmp_path, "Inspect Orders")
+    assert outcome.status == (IncidentStatus.COMPLETED if corrected else IncidentStatus.NEEDS_INPUT)
+    assert database.queries == ([query] if corrected else [])
+    assert len(runtime.turns) == (3 if corrected else 2)
+    assert "No business SQL" in runtime.turns[1].user_message
+    assert "Do not repeat existing queries or invent paths" in runtime.turns[1].user_message
+    repairs = [event.data.get("repair") for event in outcome.events]
+    assert repairs.count("request_missing_page_evidence") == 1
+    assert repairs.count("defer_missing_verified_page") == (0 if corrected else 1)
+
+
+def test_location_only_summary_cannot_be_promoted_to_diagnosis_by_router(tmp_path: Path):
+    runtime = ScriptedStructuredRuntime([
+        IncidentDecision(
+            status=IncidentStatus.COMPLETED, page=_page(),
+            message="Located.", completion_kind=IncidentCompletionKind.PAGE_LOCATION,
+        ),
+        IncidentContinuationDecision(
+            status=IncidentContinuationStatus.ANSWER, reuse_verified_page=True,
+            message="Guess.", diagnosis="Not supported by page identity alone.",
+        ),
+        IncidentDecision(
+            status=IncidentStatus.COMPLETED, page=_page(),
+            message="Source checked.", diagnosis="A newly inspected code path explains it.",
+        ),
+    ])
+    engine = IncidentEngine(runtime, JsonIncidentStore(tmp_path / "data"), None)
+    first = engine.start(tmp_path, "Locate Orders")
+    second = engine.send(first.session_id, "Why is it failing?")
+    assert second.status == IncidentStatus.COMPLETED
+    assert second.diagnosis == "A newly inspected code path explains it."
+    assert len(runtime.turns) == 3
+    assert runtime.turns[1].tools == []
+    assert runtime.turns[2].tools == ["Read", "Glob", "Grep"]
+    assert "Page-location evidence alone" in runtime.turns[2].user_message
+    assert "Guess." not in runtime.turns[2].user_message
+    assert any(event.data.get("host_escalated") is True for event in second.events)
 
 
 def test_pinned_workspace_guidance_stays_separate_by_flow(tmp_path: Path) -> None:
@@ -498,6 +650,7 @@ def test_completed_incident_reopens_and_appends_to_one_capability_document(
             IncidentContinuationDecision(
                 status=IncidentContinuationStatus.ANSWER,
                 message="Follow-up diagnosis complete.",
+                reuse_verified_page=True,
                 diagnosis="The additional symptom has the same request boundary.",
                 recommended_actions=["Reuse the verified endpoint boundary."],
                 confidence=0.8,
@@ -593,6 +746,7 @@ def test_page_location_follow_up_stays_compact_without_inventing_diagnosis(
                 status=IncidentContinuationStatus.ANSWER,
                 completion_kind=IncidentCompletionKind.PAGE_LOCATION,
                 message="The same route still points to the verified source file.",
+                reuse_verified_page=True,
             ),
         ]
     )
@@ -636,10 +790,12 @@ def test_completed_follow_up_escalates_without_losing_verified_page(
             IncidentContinuationDecision(
                 status=IncidentContinuationStatus.INVESTIGATE,
                 message="The user reported a new environment-specific symptom.",
+                reuse_verified_page=True,
             ),
             IncidentDecision(
                 status=IncidentStatus.COMPLETED,
                 message="The new symptom was checked against the existing page.",
+                reuse_verified_page=True,
                 diagnosis="The new environment changes the request boundary.",
                 recommended_actions=["Verify the environment-specific endpoint setting."],
             ),
@@ -860,6 +1016,7 @@ def test_incident_flow_restores_verified_page_when_model_omits_it(
             IncidentDecision(
                 status=IncidentStatus.QUERY_REQUIRED,
                 message="Checking one additional detail.",
+                reuse_verified_page=True,
                 query_stage=IncidentQueryStage.BUSINESS_DATA,
                 queries=[second_query],
             ),
@@ -867,6 +1024,7 @@ def test_incident_flow_restores_verified_page_when_model_omits_it(
                 status=IncidentStatus.COMPLETED,
                 message="Diagnosis complete.",
                 diagnosis="The second row confirms the affected state.",
+                reuse_verified_page=True,
             ),
         ]
     )

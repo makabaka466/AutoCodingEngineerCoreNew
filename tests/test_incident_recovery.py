@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -7,6 +11,7 @@ from autocoding_agent.adapters.sqlite_incident_store import SQLiteIncidentStore
 from autocoding_agent.config import Settings
 from autocoding_agent.core.models import AgentEvent, AgentUsage, EventType, RuntimeTurn
 from autocoding_agent.core.recovery.models import RecoveryAction
+from autocoding_agent.core.recovery.scanner import _pid_is_alive
 from autocoding_agent.core.runtime.models import RunStatus, RuntimeRunRecord
 from autocoding_agent.core.state_machine.machine import AgentStateMachine
 from autocoding_agent.core.state_machine.models import TaskState
@@ -95,3 +100,77 @@ def test_orphaned_incident_run_pauses_and_resumes_without_automatic_replay(
     assert completed.task_state == TaskState.COMPLETED
     assert runtime.calls == 1
     assert SQLiteIncidentStore(data_dir).replay_task_state(session.id) == TaskState.COMPLETED
+
+
+def test_real_owner_process_is_not_killed_and_can_recover_after_interruption(tmp_path: Path):
+    """真实宿主进程持久化 Run 后中断，验证重启扫描和显式恢复；不调用外部服务。"""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    data_dir = tmp_path / "data"
+    settings = Settings(data_dir=data_dir, hermes_skills_enabled=False)
+    store = SQLiteIncidentStore(data_dir)
+    child = subprocess.Popen(
+        [sys.executable, str(Path(__file__).resolve()), str(workspace), str(data_dir)],
+        env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")},
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    try:
+        deadline = time.monotonic() + 15
+        sessions = []
+        while time.monotonic() < deadline:
+            sessions = store.list()
+            if sessions and sessions[0].runs:
+                break
+            if child.poll() is not None:
+                raise AssertionError(child.communicate()[1].decode(errors="replace"))
+            time.sleep(0.05)
+        assert sessions and sessions[0].runs, "Worker did not persist a Runtime run"
+        session_id = sessions[0].id
+        run_id = sessions[0].runs[0].id
+        assert sessions[0].runs[0].owner_pid == child.pid
+
+        # 第二个宿主启动也不能终止或接管仍活跃的第一个宿主。
+        runtime = CompleteAfterResumeRuntime()
+        other = build_incident_application(settings=settings, runtime=runtime)
+        assert other.recovery_scan.recovered_task_ids == []
+        assert other.recovery_scan.skipped_live_run_ids == [run_id]
+        assert _pid_is_alive(child.pid)
+        assert child.poll() is None
+        assert runtime.calls == 0
+
+        # 只终止本测试创建的确切子进程，不扫描或关闭用户的 ACE/Claude 进程。
+        child.terminate()
+        child.wait(timeout=5)
+        assert not _pid_is_alive(child.pid)
+        restarted = build_incident_application(settings=settings, runtime=runtime)
+        paused = restarted.get_session(session_id)
+        assert paused.task_state == TaskState.PAUSED
+        assert paused.runs[0].status == RunStatus.INTERRUPTED
+        assert runtime.calls == 0
+        assert store.replay_task_state(session_id) == TaskState.PAUSED
+
+        completed = restarted.resume(session_id, RecoveryAction.READ_ONLY_INSPECT)
+        assert completed.task_state == TaskState.COMPLETED
+        assert runtime.calls == 1
+        assert store.replay_task_state(session_id) == TaskState.COMPLETED
+        final = store.load(session_id)
+        assert [run.status for run in final.runs] == [RunStatus.INTERRUPTED, RunStatus.COMPLETED]
+        assert len([e for e in final.events if e.type == EventType.TASK_COMPLETED]) == 1
+    finally:
+        if child.poll() is None:
+            child.terminate()
+        child.communicate(timeout=5)
+
+
+if __name__ == "__main__":
+    class PendingRuntime:
+        def run_structured(self, turn, response_model):
+            # 宿主在进入 Runtime 前已提交 SQLite，等待父测试主动模拟进程中断。
+            time.sleep(30)
+            raise TimeoutError("Test owner was not interrupted in time")
+
+    build_incident_application(
+        settings=Settings(data_dir=Path(sys.argv[2]), hermes_skills_enabled=False),
+        runtime=PendingRuntime(),
+    ).start(Path(sys.argv[1]), "Investigate the test page")

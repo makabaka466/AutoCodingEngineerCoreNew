@@ -84,10 +84,41 @@ class OrphanedRunScanner:
 
 
 def _pid_is_alive(pid: int) -> bool:
+    """只读检查进程；未知权限状态按存活处理，避免误接管活跃任务。"""
+
+    if pid <= 0:
+        return False
     if pid == os.getpid():
         return True
+    if os.name == "nt":
+        return _windows_pid_is_alive(pid)
     try:
         os.kill(pid, 0)
-    except OSError:
+    except ProcessLookupError:
         return False
+    except OSError:
+        return True
     return True
+
+
+def _windows_pid_is_alive(pid: int) -> bool:
+    # Windows 的 os.kill(pid, 0) 实际调用 TerminateProcess，不能用于探活。
+    # 仅申请 SYNCHRONIZE 权限，零等待观察句柄；从不申请终止或写权限。
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    handle = kernel32.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
+    if not handle:
+        return ctypes.get_last_error() != 87  # ERROR_INVALID_PARAMETER：PID 不存在
+    try:
+        # WAIT_OBJECT_0 表示进程已退出；超时或查询失败都不能作为接管依据。
+        return kernel32.WaitForSingleObject(handle, 0) != 0
+    finally:
+        kernel32.CloseHandle(handle)
