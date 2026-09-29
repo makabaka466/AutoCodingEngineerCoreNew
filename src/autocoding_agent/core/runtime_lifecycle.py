@@ -24,6 +24,7 @@ from autocoding_agent.core.runtime.models import (
     RuntimeRunRecord,
 )
 from autocoding_agent.core.state_machine.models import TaskState
+from autocoding_agent.core.workflow import read_fingerprint
 
 
 class RuntimeAggregate(Protocol):
@@ -132,6 +133,16 @@ class RuntimeLifecycle:
             created_at=activity.created_at,
         )
         session.events.append(event)
+        # 成功读取时仅保存源码指纹；后续引用必须仍对应同一内容，绝不存储文件正文。
+        if (
+            activity.kind == RuntimeEventKind.TOOL_FINISHED
+            and (activity.tool_name or "").casefold() == "read"
+            and not activity.data.get("is_error", True)
+            and hasattr(session, "workspace")
+        ):
+            fingerprint = read_fingerprint(session.workspace, str(activity.data.get("path") or ""))
+            if fingerprint:
+                event.data["content_sha256"] = fingerprint
         if self.record_test_commands:
             self._record_completed_test(session, run, activity, command_id, event.id)
         self.save(session)

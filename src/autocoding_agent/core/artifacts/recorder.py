@@ -21,6 +21,7 @@ from autocoding_agent.core.models import (
     EventType,
 )
 from autocoding_agent.core.runtime.models import RuntimeRunRecord
+from autocoding_agent.core.workflow import assessment_text
 from autocoding_agent.ports.artifact_store import ArtifactStore
 
 
@@ -237,6 +238,8 @@ class ArtifactRecorder:
 ## Outcome
 
 {decision.message}
+
+{assessment_text(decision.assessment)}
 
 ## Model-reported changed files
 

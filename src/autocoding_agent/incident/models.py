@@ -14,6 +14,7 @@ from autocoding_agent.core.hermes import HermesSkillObservation, HermesSkillRequ
 from autocoding_agent.core.models import AgentEvent, AgentUsage, ChatMessage, utc_now
 from autocoding_agent.core.runtime.models import RuntimeRunRecord
 from autocoding_agent.core.state_machine.models import CommandReceipt, TaskState
+from autocoding_agent.core.workflow import WorkflowAssessment
 from autocoding_agent.database_models import (
     DataQuery,
     QueryObservation,
@@ -107,6 +108,9 @@ class IncidentContinuationDecision(BaseModel):
     """Compact follow-up answer or escalation without replaying the full workflow prompt."""
 
     status: IncidentContinuationStatus
+    assessment: WorkflowAssessment | None = Field(
+        default=None, description="依据已有证据回答或升级调查的阶段评估，不得提升历史结论等级。"
+    )
     reuse_verified_page: bool = Field(
         default=False,
         description=(
@@ -135,6 +139,9 @@ class IncidentDecision(BaseModel):
     """One model decision in the incident investigation state machine."""
 
     status: IncidentStatus
+    assessment: WorkflowAssessment | None = Field(
+        default=None, description="阶段推进依据、证据出处与本轮交付等级；None 兼容历史会话。"
+    )
     reuse_verified_page: bool = Field(
         default=False,
         description=(
@@ -333,6 +340,9 @@ class IncidentOutcome(BaseModel):
     session_id: str
     workspace: str
     status: IncidentStatus
+    assessment: WorkflowAssessment | None = Field(
+        default=None, description="核对证据出处后的阶段评估；诊断结束不表示修复已执行。"
+    )
     completion_kind: IncidentCompletionKind = IncidentCompletionKind.DIAGNOSIS
     task_state: TaskState = TaskState.CREATED
     cycle_number: int = Field(default=1, ge=1)

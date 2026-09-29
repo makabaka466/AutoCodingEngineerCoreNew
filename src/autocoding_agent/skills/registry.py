@@ -6,6 +6,7 @@ from pathlib import Path
 
 from autocoding_agent.core.models import AgentMode
 from autocoding_agent.core.search_policy import BOUNDED_SEARCH_RULES
+from autocoding_agent.core.workflow import WORKFLOW_RULES
 
 
 class SkillRegistry:
@@ -51,6 +52,8 @@ class SkillRegistry:
 The model owns semantic decisions: interpret the request, decide whether it is clear enough,
 select relevant files, investigate relationships, diagnose, plan, and judge completion. Do not
 replace that judgment with filename or keyword heuristics.
+
+{WORKFLOW_RULES}
 
 This turn is in {mode.value!r} mode. The host only exposes tools authorized for that mode.
 - inspect: read and search only. If a useful change or command is needed, return

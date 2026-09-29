@@ -7,6 +7,8 @@ from pathlib import Path
 
 from autocoding_agent.application import AgentApplication, build_application
 from autocoding_agent.core.models import AgentStatus, ApprovalScope, MessageRole
+from autocoding_agent.core.progress import PROGRESS_LABELS, ProgressEvent
+from autocoding_agent.core.workflow import RESULT_LABELS, assessment_text
 
 
 def main() -> None:
@@ -52,6 +54,28 @@ def main() -> None:
             role = "user" if item.role == MessageRole.USER else "assistant"
             with st.chat_message(role):
                 st.markdown(item.content)
+
+        decision = session.last_decision
+        if decision and decision.assessment:
+            assessment = decision.assessment
+            label = (
+                RESULT_LABELS[assessment.result]
+                if session.status == AgentStatus.COMPLETED
+                else PROGRESS_LABELS[assessment.phase]
+            )
+            with st.container(border=True):
+                st.markdown(f"**当前状态：{label}**")
+                st.text(assessment_text(assessment))
+
+    # 位于对话下方，回调只投影内核事件；Streamlit 自有 spinner 表达真实执行等待。
+    progress_placeholder = st.empty()
+
+    def show_progress(event: ProgressEvent) -> None:
+        progress_placeholder.info(
+            event.label + (f" · {event.detail}" if event.detail else "")
+        )
+
+    if session:
 
         if session.pending_approval:
             approval = session.pending_approval
@@ -107,15 +131,15 @@ def main() -> None:
                 disabled=legacy_modify,
             ):
                 with st.spinner("Claude Code 正在继续任务…"):
-                    application.approve(session.id)
+                    application.approve(session.id, progress_sink=show_progress)
                 st.rerun()
             if reject_col.button("拒绝或要求调整", use_container_width=True):
                 with st.spinner("正在继续只读处理…"):
-                    application.reject(session.id, reason)
+                    application.reject(session.id, reason, progress_sink=show_progress)
                 st.rerun()
 
         if session.status == AgentStatus.COMPLETED:
-            st.success(f"第 {session.cycle_number} 轮任务已完成")
+            st.success(f"第 {session.cycle_number} 轮任务已结束，可继续追问")
             if session.capability_document:
                 st.caption(f"能力文档：{session.capability_document}")
             st.info("可以在下方继续追问或补充要求；也可以点击左侧“新建任务”。")
@@ -132,9 +156,11 @@ def main() -> None:
         with st.spinner("Claude Code 正在处理…"):
             try:
                 if st.session_state.session_id:
-                    outcome = application.send(st.session_state.session_id, prompt)
+                    outcome = application.send(
+                        st.session_state.session_id, prompt, progress_sink=show_progress
+                    )
                 else:
-                    outcome = application.start(workspace, prompt)
+                    outcome = application.start(workspace, prompt, progress_sink=show_progress)
                     st.session_state.session_id = outcome.session_id
             except Exception as exc:
                 st.error(str(exc))

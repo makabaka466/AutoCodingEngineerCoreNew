@@ -33,6 +33,11 @@ from autocoding_agent.core.progress import (
 )
 from autocoding_agent.core.recovery.models import RecoveryAction
 from autocoding_agent.core.state_machine.models import TaskState
+from autocoding_agent.core.workflow import (
+    RESULT_LABELS,
+    assessment_progress_text,
+    assessment_text,
+)
 from autocoding_agent.database_models import (
     QueryObservation,
     QueryObservationStatus,
@@ -242,6 +247,7 @@ class GlassPanel(tk.Canvas):
         if not self._autosize_height:
             window_options["height"] = inner_height
         self.itemconfigure(self._content_window, **window_options)
+
 
 STATUS_PRESENTATION: dict[AgentStatus | None, tuple[str, str]] = {
     None: ("就绪", COLORS["muted"]),
@@ -569,8 +575,8 @@ class RoundedButton(tk.Canvas):
         elif self._hovered:
             fill = str(self._button_options["activebackground"])
         primary = self._button_options["background"] == COLORS["accent"]
-        outline = COLORS["accent"] if self._focused else (
-            fill if primary else COLORS["border_strong"]
+        outline = (
+            COLORS["accent"] if self._focused else (fill if primary else COLORS["border_strong"])
         )
         canvas_width = max(self.winfo_width(), self.winfo_reqwidth())
         canvas_height = max(self.winfo_height(), 44)
@@ -647,9 +653,7 @@ class DesktopClient:
         self.embedding_service = embedding_service or EmbeddingSetupService()
         self.rag_service = rag_service
         if self.rag_service is None and application is None:
-            self.rag_service = build_configured_rag_service(
-                embedding_setup=self.embedding_service
-            )
+            self.rag_service = build_configured_rag_service(embedding_setup=self.embedding_service)
         workspace_state = self.workspace_service.inspect()
         self._applications_injected = application is not None or incident_application is not None
         self._settings_dialog: SystemSettingsDialog | None = None
@@ -707,6 +711,7 @@ class DesktopClient:
         self.status_var = tk.StringVar(value="就绪")
         self.activity_var = tk.StringVar(value="等待新任务")
         self.activity_detail_var = tk.StringVar(value="开发与异常处理共用实时进度")
+        self.workflow_detail_var = tk.StringVar(value="模型判断推进条件，系统控制执行边界")
         self.task_title_var = tk.StringVar(value="新开发任务")
         self.flow_caption_var = tk.StringVar(value="开发流程 · AI 工程工作台")
         self.overview_today_var = tk.StringVar(value="0")
@@ -856,9 +861,7 @@ class DesktopClient:
             active_background=COLORS["panel_hover"],
             anchor="w",
         )
-        self.knowledge_database_button.grid(
-            row=5, column=0, sticky="ew", padx=8, pady=(0, 6)
-        )
+        self.knowledge_database_button.grid(row=5, column=0, sticky="ew", padx=8, pady=(0, 6))
 
         self.log_button = self._button(
             sidebar,
@@ -966,7 +969,7 @@ class DesktopClient:
             highlightbackground=COLORS["progress_border"],
         )
         self.activity_frame.grid(
-            row=0,
+            row=2,
             column=0,
             columnspan=2,
             sticky="ew",
@@ -976,7 +979,7 @@ class DesktopClient:
         self.activity_frame.grid_columnconfigure(2, weight=1)
         tk.Label(
             self.activity_frame,
-            text="当前进度",
+            text="当前状态",
             font=("Microsoft YaHei UI", 8, "bold"),
             fg=COLORS["muted"],
             bg=COLORS["progress_accent_soft"],
@@ -1021,6 +1024,42 @@ class DesktopClient:
             anchor="w",
         )
         self.activity_detail_label.pack(side="left", anchor="w", padx=(10, 0))
+        self.activity_spinner = self.activity_dot.create_arc(
+            2,
+            2,
+            14,
+            14,
+            start=0,
+            extent=260,
+            style="arc",
+            outline=COLORS["progress_accent"],
+            width=2,
+            state="hidden",
+        )
+        self.workflow_detail_label = tk.Label(
+            self.activity_frame,
+            textvariable=self.workflow_detail_var,
+            font=("Microsoft YaHei UI", 8),
+            fg=COLORS["muted"],
+            bg=COLORS["progress_accent_soft"],
+            anchor="w",
+            justify="left",
+            wraplength=560,
+        )
+        self.workflow_detail_label.grid(
+            row=1,
+            column=0,
+            columnspan=3,
+            sticky="ew",
+            padx=14,
+            pady=(0, 8),
+        )
+        self.activity_frame.bind(
+            "<Configure>",
+            lambda event: self.workflow_detail_label.configure(
+                wraplength=max(220, event.width - 28)
+            ),
+        )
         self.transcript = tk.Text(
             transcript_frame,
             height=1,
@@ -1138,9 +1177,7 @@ class DesktopClient:
         self.transcript_menu.add_command(
             label="复制所选文本", command=self._copy_selected_transcript
         )
-        self.transcript_menu.add_command(
-            label="全选对话", command=self._select_all_transcript
-        )
+        self.transcript_menu.add_command(label="全选对话", command=self._select_all_transcript)
 
         self.approval_frame = tk.Frame(
             main,
@@ -1157,9 +1194,7 @@ class DesktopClient:
             fg=COLORS["warning"],
             bg=COLORS["warning_soft"],
         )
-        self.approval_title.grid(
-            row=0, column=0, columnspan=2, sticky="ew", padx=16, pady=(12, 5)
-        )
+        self.approval_title.grid(row=0, column=0, columnspan=2, sticky="ew", padx=16, pady=(12, 5))
         self.approval_text = tk.Text(
             self.approval_frame,
             height=9,
@@ -1182,9 +1217,7 @@ class DesktopClient:
         self.approval_text.configure(yscrollcommand=approval_scroll.set, state="disabled")
 
         approval_actions = tk.Frame(self.approval_frame, bg=COLORS["warning_soft"])
-        approval_actions.grid(
-            row=2, column=0, columnspan=2, sticky="ew", padx=10, pady=(7, 11)
-        )
+        approval_actions.grid(row=2, column=0, columnspan=2, sticky="ew", padx=10, pady=(7, 11))
         approval_actions.grid_columnconfigure(0, weight=1)
         self.reject_button = self._button(
             approval_actions,
@@ -1555,12 +1588,10 @@ class DesktopClient:
         sessions = self._recent_sessions
         today = datetime.now().astimezone().date()
         completed = sum(
-            item.status in {AgentStatus.COMPLETED, IncidentStatus.COMPLETED}
-            for item in sessions
+            item.status in {AgentStatus.COMPLETED, IncidentStatus.COMPLETED} for item in sessions
         )
         failed = sum(
-            item.status in {AgentStatus.FAILED, IncidentStatus.FAILED}
-            for item in sessions
+            item.status in {AgentStatus.FAILED, IncidentStatus.FAILED} for item in sessions
         )
         active = max(0, len(sessions) - completed - failed)
         today_count = sum(item.created_at.astimezone().date() == today for item in sessions)
@@ -1572,15 +1603,12 @@ class DesktopClient:
 
         dates = [today - timedelta(days=offset) for offset in range(6, -1, -1)]
         self._trend_counts = [
-            sum(item.created_at.astimezone().date() == day for item in sessions)
-            for day in dates
+            sum(item.created_at.astimezone().date() == day for item in sessions) for day in dates
         ]
         self._draw_task_trend()
 
         try:
-            knowledge_count = len(
-                self.knowledge_service.list_branches(self._knowledge_domain())
-            )
+            knowledge_count = len(self.knowledge_service.list_branches(self._knowledge_domain()))
         except Exception:
             knowledge_count = 0
         self.knowledge_health_var.set(
@@ -1597,9 +1625,7 @@ class DesktopClient:
                 self._model_ready_cache = False
         model_ready = self._model_ready_cache
         self.model_health_var.set("可用" if model_ready else "未配置")
-        self.model_health_label.configure(
-            fg=COLORS["success"] if model_ready else COLORS["muted"]
-        )
+        self.model_health_label.configure(fg=COLORS["success"] if model_ready else COLORS["muted"])
 
         if self._database_ready_cache is None:
             try:
@@ -1646,9 +1672,7 @@ class DesktopClient:
                 )
         for offset in (6, 3, 0):
             x = left + (6 - offset) * step
-            label = (datetime.now().astimezone().date() - timedelta(days=offset)).strftime(
-                "%m-%d"
-            )
+            label = (datetime.now().astimezone().date() - timedelta(days=offset)).strftime("%m-%d")
             canvas.create_text(
                 x,
                 height - 10,
@@ -1733,16 +1757,10 @@ class DesktopClient:
         self.development_flow_button.set_selected(is_development)
         self.incident_flow_button.set_selected(not is_development)
         self.flow_caption_var.set(
-            "开发流程 · AI 工程工作台"
-            if is_development
-            else "异常处理 · 页面与业务数据联合诊断"
+            "开发流程 · AI 工程工作台" if is_development else "异常处理 · 页面与业务数据联合诊断"
         )
-        self.new_task_button.configure(
-            text="新建开发任务" if is_development else "新建异常诊断"
-        )
-        self.prompt_placeholder.configure(
-            text=self._default_prompt_placeholder_text()
-        )
+        self.new_task_button.configure(text="新建开发任务" if is_development else "新建异常诊断")
+        self.prompt_placeholder.configure(text=self._default_prompt_placeholder_text())
         self._refresh_project_options()
 
     def _reset_progress_display(self) -> None:
@@ -1751,10 +1769,9 @@ class DesktopClient:
         self._pending_progress_event = None
         self._progress_changed_at = 0.0
         self.activity_var.set("等待新任务" if self.session_id is None else "会话已载入")
+        self.workflow_detail_var.set("模型判断推进条件，系统控制执行边界")
         self.activity_detail_var.set(
-            "开发流程已就绪"
-            if self.flow == FlowKind.DEVELOPMENT
-            else "异常处理流程已就绪"
+            "开发流程已就绪" if self.flow == FlowKind.DEVELOPMENT else "异常处理流程已就绪"
         )
         if hasattr(self, "activity_label"):
             self._set_progress_text_color(COLORS["text"])
@@ -1859,6 +1876,8 @@ class DesktopClient:
         decision = session.last_decision
         if decision is not None:
             details: list[str] = []
+            if decision.assessment:
+                details.append(assessment_text(decision.assessment))
             if decision.evidence:
                 details.append("依据")
                 details.extend(
@@ -1870,9 +1889,7 @@ class DesktopClient:
                 details.extend(f"• {item}" for item in decision.changed_files)
             if decision.test_summary:
                 details.append(f"验证\n{decision.test_summary}")
-            cycle_observations = session.query_observations[
-                session.cycle_query_observation_start :
-            ]
+            cycle_observations = session.query_observations[session.cycle_query_observation_start :]
             if cycle_observations:
                 details.append("数据查询")
                 details.extend(_format_query_observation(item) for item in cycle_observations)
@@ -1913,6 +1930,7 @@ class DesktopClient:
             else:
                 self.status_var.set("任务执行失败，可以补充信息重试或新建任务。")
         self._sync_controls()
+        self._present_session_state(session)
 
     def _render_incident_session(self, session: IncidentSession) -> None:
         self._current_task_state = session.task_state
@@ -1928,6 +1946,8 @@ class DesktopClient:
         decision = session.last_decision
         if decision is not None:
             details: list[str] = []
+            if decision.assessment:
+                details.append(assessment_text(decision.assessment))
             if decision.page:
                 route = f" · {decision.page.route}" if decision.page.route else ""
                 details.append(f"定位页面\n{decision.page.name}{route}")
@@ -1948,9 +1968,7 @@ class DesktopClient:
             if decision.findings:
                 details.append("发现")
                 details.extend(f"• {item.summary}" for item in decision.findings)
-            cycle_observations = session.query_observations[
-                session.cycle_query_observation_start :
-            ]
+            cycle_observations = session.query_observations[session.cycle_query_observation_start :]
             if cycle_observations:
                 details.append("数据查询")
                 details.extend(_format_query_observation(item) for item in cycle_observations)
@@ -1982,8 +2000,7 @@ class DesktopClient:
         self.prompt_placeholder.configure(text=self._default_prompt_placeholder_text())
         if session.status == IncidentStatus.COMPLETED:
             self.status_var.set(
-                f"第 {session.cycle_number} 轮异常诊断已完成。"
-                "可以继续追问、补充现象，或新建诊断。"
+                f"第 {session.cycle_number} 轮异常诊断已完成。可以继续追问、补充现象，或新建诊断。"
             )
             self.send_button.configure(text="继续对话")
             self.prompt_placeholder.configure(text="继续追问，或者补充新的异常线索…")
@@ -2000,6 +2017,49 @@ class DesktopClient:
             else:
                 self.status_var.set("异常诊断失败，可补充信息重试；详情请查看本地日志。")
         self._sync_controls()
+        self._present_session_state(session)
+
+    def _present_session_state(self, session: AgentSession | IncidentSession) -> None:
+        """历史会话按持久状态还原；轮次结束不自动表示问题已修复。"""
+        if self._busy:
+            return
+        phase = {
+            TaskState.CREATED: ProgressPhase.PREPARING_CONTEXT,
+            TaskState.INSPECTING: ProgressPhase.INSPECTING_CODE,
+            TaskState.QUERYING_DATA: ProgressPhase.QUERYING_DATABASE,
+            TaskState.WAITING_INPUT: ProgressPhase.WAITING_INPUT,
+            TaskState.WAITING_MODIFY_APPROVAL: ProgressPhase.WAITING_APPROVAL,
+            TaskState.WAITING_VERIFY_APPROVAL: ProgressPhase.WAITING_APPROVAL,
+            TaskState.IMPLEMENTING: ProgressPhase.MODIFYING_CODE,
+            TaskState.VERIFYING: ProgressPhase.VERIFYING_CHANGE,
+            TaskState.REPLANNING: ProgressPhase.PLANNING_CHANGE,
+            TaskState.PAUSED: ProgressPhase.RECOVERING,
+            TaskState.RECOVERY_REQUIRED: ProgressPhase.RECOVERING,
+            TaskState.COMPLETED: ProgressPhase.COMPLETED,
+            TaskState.FAILED: ProgressPhase.FAILED,
+            TaskState.CANCELLED: ProgressPhase.FAILED,
+        }[session.task_state]
+        assessment = session.last_decision.assessment if session.last_decision else None
+        event = ProgressEvent.for_phase(
+            ProgressWorkflow(self.flow.value),
+            phase,
+            task_id=session.id,
+            active=False,
+        )
+        if session.task_state == TaskState.COMPLETED and assessment:
+            event.label = RESULT_LABELS[assessment.result]
+            self.status_badge.configure(text=event.label)
+        elif session.task_state in {TaskState.PAUSED, TaskState.RECOVERY_REQUIRED}:
+            event.label = "任务已暂停，等待选择恢复方式"
+        elif session.task_state == TaskState.CANCELLED:
+            event.label = "任务已取消"
+        elif session.task_state == TaskState.WAITING_VERIFY_APPROVAL:
+            event.label = "等待验证命令授权"
+        self._present_progress(event, immediate=True)
+        if assessment:
+            self.workflow_detail_var.set(assessment_progress_text(assessment))
+        else:
+            self.workflow_detail_var.set("历史会话未声明证据等级，可继续对话补充调查。")
 
     @staticmethod
     def _message_display_content(message: object) -> str:
@@ -2152,9 +2212,7 @@ class DesktopClient:
         if not state.configured or state.config is None:
             self.status_var.set("Embedding 配置尚未就绪。")
             return
-        self.rag_service = build_configured_rag_service(
-            embedding_setup=self.embedding_service
-        )
+        self.rag_service = build_configured_rag_service(embedding_setup=self.embedding_service)
         active_development = self._flow_session_ids[FlowKind.DEVELOPMENT]
         active_incident = self._flow_session_ids[FlowKind.INCIDENT]
         if not self._applications_injected and not active_development:
@@ -2257,17 +2315,12 @@ class DesktopClient:
     def _open_knowledge_management(self) -> None:
         if self._busy:
             return
-        if (
-            self._knowledge_dialog is not None
-            and self._knowledge_dialog.window.winfo_exists()
-        ):
+        if self._knowledge_dialog is not None and self._knowledge_dialog.window.winfo_exists():
             self._knowledge_dialog.window.lift()
             self._knowledge_dialog.window.focus_force()
             return
         if self.rag_service is None:
-            self.rag_service = build_configured_rag_service(
-                embedding_setup=self.embedding_service
-            )
+            self.rag_service = build_configured_rag_service(embedding_setup=self.embedding_service)
         self._knowledge_dialog = KnowledgeManagementDialog(
             self.root,
             self.rag_service,
@@ -2281,9 +2334,7 @@ class DesktopClient:
         attachments = list(self._pending_attachments)
         if self.flow == FlowKind.INCIDENT and attachments:
             try:
-                attachments = [
-                    self.attachment_store.prepare_for_send(item) for item in attachments
-                ]
+                attachments = [self.attachment_store.prepare_for_send(item) for item in attachments]
             except IncidentAttachmentError as exc:
                 logger.warning(
                     "incident_attachment_prepare_failed session_id=%s error=%s",
@@ -2383,9 +2434,7 @@ class DesktopClient:
         message: str,
         attachments: list[MessageAttachment] | None = None,
     ) -> None:
-        attachment_note = (
-            f"\n[已附加 {len(attachments)} 张异常截图]" if attachments else ""
-        )
+        attachment_note = f"\n[已附加 {len(attachments)} 张异常截图]" if attachments else ""
         self.transcript.configure(state="normal")
         self.transcript.insert("end", "你\n", "user_name")
         self.transcript.insert("end", f"{message}{attachment_note}\n\n", "message")
@@ -2454,9 +2503,7 @@ class DesktopClient:
             self.attachment_frame.grid_remove()
             return
         total_bytes = sum(item.size_bytes for item in self._pending_attachments)
-        self.attachment_status_var.set(
-            f"已粘贴 {count} 张异常截图 · {total_bytes / 1024:.1f} KiB"
-        )
+        self.attachment_status_var.set(f"已粘贴 {count} 张异常截图 · {total_bytes / 1024:.1f} KiB")
         self.attachment_frame.grid()
 
     def _approve(self) -> None:
@@ -2608,6 +2655,13 @@ class DesktopClient:
         self._busy = busy
         self._busy_label = label
         self._busy_tick = 0
+        self._progress_animation_token += 1
+        self._pending_progress_event = None
+        if busy:
+            self.workflow_detail_var.set("正在获取证据；关键阶段返回后展示推进依据和证据缺口。")
+        else:
+            self.activity_dot.itemconfigure(self.activity_spinner, state="hidden")
+            self.activity_dot.itemconfigure(self.activity_dot_oval, state="normal")
         self._sync_controls()
         if busy:
             workflow = (
@@ -2652,10 +2706,15 @@ class DesktopClient:
         *,
         immediate: bool = False,
     ) -> None:
+        if immediate or not event.active:
+            self._transition_progress(event, immediate=True)
+            return
         if self._progress_event is not None and event.phase == self._progress_event.phase:
             self._progress_event = event
             self.activity_detail_var.set(event.detail or "")
             self.status_var.set(event.label)
+            if event.assessment_summary:
+                self.workflow_detail_var.set(event.assessment_summary)
             return
         elapsed = time.monotonic() - self._progress_changed_at
         if not immediate and self._progress_event is not None and elapsed < 0.65:
@@ -2718,25 +2777,33 @@ class DesktopClient:
         self.activity_var.set(event.label)
         self.activity_detail_var.set(event.detail or "")
         self.status_var.set(event.label)
+        if event.assessment_summary:
+            self.workflow_detail_var.set(event.assessment_summary)
 
     def _set_progress_text_color(self, color: str) -> None:
         self.activity_label.configure(fg=color)
-        self.activity_detail_label.configure(
-            fg=_blend_hex(color, COLORS["muted"], 0.55)
-        )
+        self.activity_detail_label.configure(fg=_blend_hex(color, COLORS["muted"], 0.55))
 
     def _animate_progress_pulse(self) -> None:
         if not hasattr(self, "activity_dot"):
             return
-        if self._busy:
-            pulse = ("#667EEA", "#7F91ED", "#A5B4FC", "#7F91ED")
-            color = pulse[self._progress_pulse_tick % len(pulse)]
+        if self._busy and self._progress_event and self._progress_event.active:
             self._progress_pulse_tick += 1
+            self.activity_dot.itemconfigure(self.activity_dot_oval, state="hidden")
+            self.activity_dot.itemconfigure(
+                self.activity_spinner,
+                state="normal",
+                start=-(self._progress_pulse_tick * 24) % 360,
+            )
         else:
-            color = "#B8C2D1"
             self._progress_pulse_tick = 0
-        self.activity_dot.itemconfigure(self.activity_dot_oval, fill=color)
-        self.root.after(220, self._animate_progress_pulse)
+            self.activity_dot.itemconfigure(self.activity_spinner, state="hidden")
+            self.activity_dot.itemconfigure(
+                self.activity_dot_oval,
+                fill="#B8C2D1",
+                state="normal",
+            )
+        self.root.after(80, self._animate_progress_pulse)
 
     def _set_status(self, status: AgentStatus | IncidentStatus | None) -> None:
         self._current_status = status
@@ -2796,9 +2863,7 @@ class DesktopClient:
             self.recovery_replan_button.configure(state="disabled")
         self.sessions_list.configure(state="normal" if not self._busy else "disabled")
         self.model_config_button.configure(state="normal" if not self._busy else "disabled")
-        self.knowledge_database_button.configure(
-            state="normal" if not self._busy else "disabled"
-        )
+        self.knowledge_database_button.configure(state="normal" if not self._busy else "disabled")
         self.development_flow_button.set_enabled(not self._busy)
         self.incident_flow_button.set_enabled(
             not self._busy and self.incident_application is not None
@@ -2835,9 +2900,7 @@ class DesktopClient:
             self.approval_text.configure(state="disabled")
             self.reject_button.configure(text="取消任务", command=self._cancel_recovery)
             self.approve_button.configure(text="只读检查", command=self._resume_recovery)
-            self.recovery_replan_button.configure(
-                text="重新规划", command=self._replan_recovery
-            )
+            self.recovery_replan_button.configure(text="重新规划", command=self._replan_recovery)
             self.recovery_replan_button.grid(row=0, column=2, padx=4)
             self.approve_button.grid_configure(column=3)
             self.approval_frame.grid(
@@ -3027,9 +3090,7 @@ def main() -> None:
             sqlserver_service=sqlserver_service,
             workspace_service=workspace_service,
             embedding_service=embedding_service,
-            rag_service=build_configured_rag_service(
-                embedding_setup=embedding_service
-            ),
+            rag_service=build_configured_rag_service(embedding_setup=embedding_service),
         )
         if not workspace_service.inspect().configured:
             root.after(100, lambda: client and client._open_system_settings("workspace"))

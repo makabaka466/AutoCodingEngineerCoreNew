@@ -1,6 +1,6 @@
 # AutoCoding Engineer 架构说明
 
-本文描述当前 `0.7.17` 代码已经实现的架构。数据字段、公共方法和命令行参数见
+本文描述当前 `0.8.0` 代码已经实现的架构。数据字段、公共方法和命令行参数见
 [接口与数据契约](INTERFACES.md)。
 
 ## 1. 项目目标
@@ -777,3 +777,21 @@ Claude CLI 对话。若现有证据足以回答，宿主直接完成新 cycle �
 
 完整调查 Prompt 的稳定内容保持固定顺序，动态阶段说明放在末尾，避免破坏模型提供方的前缀缓存。
 优化的是重复上下文和空转轮次，不减少源码工具、数据库权限校验、事件、恢复或最终诊断字段。
+
+## 18. 阶段评估与证据边界（0.8.0）
+
+core/workflow.py 提供两套流程共用的 WorkflowAssessment 与 ResultKind，不改变既有 TaskState。
+模型申明 phase、confirmed、reason、missing、evidence 和 result；Engine 在记录决定前调用
+bind_assessment，把相对源码路径、查询名称、验证工具 ID 关联到真实本轮事件。event_id/verified
+由宿主重新填充，不接受模型自报值。新 cycle 撤销旧证据自动背书；新实施阶段使之前的验证失效。
+成功 Read 时对工作区内不超过 4 MiB 的文件保存完成时指纹，不存正文；完成决定时核对当前指纹。
+这证明文件来源记录可核对，不证明模型的语义判断或产线因果。
+
+诊断的 cause_confirmed 必须引用本轮已读源码、所有引用可核对且没有申明的因果缺口，否则降为
+hypothesis。验证的 verified 必须引用零退出码的实际命令、没有申明的缺口；Runtime 没有明确退出码
+时保守显示 modified_unverified。命令成功不自动证明测试选择充分，这仍由模型判断。
+查询预算耗尽与 Runtime 故障分开：在既有 inspect 状态中请求一次 partial 总结，重复 SQL 请求
+转 needs_input，保留审计。业务状态和 UI 进度仍相互独立；心跳只表示存活，不改业务阶段。
+
+历史记录中 assessment 可为 None。新模型通过提示词要求提供评估；缺失时宿主生成保守摘要，
+不直接把旧的 completed 当成修复成功。尚未实现以程序替代模型判断因果，也未证明真实模型质量提升。

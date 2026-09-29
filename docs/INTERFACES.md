@@ -1,6 +1,6 @@
 # AutoCoding Engineer 接口与数据契约
 
-本文记录当前 `0.7.17` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
+本文记录当前 `0.8.0` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
 Runtime、持久化和状态契约。
 设计动机和运行流程见[架构说明](ARCHITECTURE.md)。
 
@@ -1271,3 +1271,16 @@ class IncidentContinuationDecision(BaseModel):
 即使模型错误返回 `answer`，只要 `reuse_verified_page=false` 或由 `page_location` 摘要直接升级
 为 `diagnosis`，宿主也会转入完整调查，并以事件保留模型状态、实际状态和升级原因。新页面必须重新
 提供并核对身份，不能借用上一个页面的诊断。紧凑续聊本身不能读工具，因此适用范围仅限已有证据。
+
+## 18. 阶段评估与交付契约（0.8.0）
+
+AgentDecision、IncidentDecision、IncidentContinuationDecision、两套 Outcome 新增可空 assessment。
+WorkflowAssessment 字段：phase（ProgressPhase）、confirmed（最多六条事实摘要）、reason（公开推进理由）、
+missing（最多六项缺口）、evidence（最多十二项引用）、result（ResultKind）。WorkflowEvidence 的 kind 为
+code/query/validation，reference 为相对文件路径/查询名称/工具调用 ID；event_id 和 verified 是宿主
+核对后的实际操作引用，不能当作因果证明。模型缺少该字段时兼容加载并保守处理。
+
+ResultKind：unspecified、analysis、page_located、hypothesis、cause_confirmed、modified_unverified、
+verified、partial。completed 仍指本工作轮次结束；不增加 TaskState，不改变原有审批/恢复 API。
+ProgressEvent 新增可空 assessment_summary；active=False 表示当前没有自主执行，不包括等待输入和授权。
+桌面展示阶段与公开理由，备用 Web 共用同一回调。Runtime 心跳不再覆盖最近的实际工具阶段。

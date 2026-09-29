@@ -14,6 +14,7 @@ from autocoding_agent.core.audit.models import DecisionRecord, RiskLevel
 from autocoding_agent.core.hermes import HermesSkillObservation, HermesSkillRequest
 from autocoding_agent.core.runtime.models import RuntimeRunRecord
 from autocoding_agent.core.state_machine.models import CommandReceipt, TaskState
+from autocoding_agent.core.workflow import WorkflowAssessment
 from autocoding_agent.database_models import DataQuery, QueryObservation
 
 NonEmptyText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
@@ -171,6 +172,9 @@ class AgentDecision(BaseModel):
     """The only machine-readable decision accepted from the model runtime."""
 
     status: AgentStatus
+    assessment: WorkflowAssessment | None = Field(
+        default=None, description="阶段推进依据、证据出处与本轮结果等级；None 兼容历史会话。"
+    )
     message: str
     reason: str | None = None
     alternatives: list[str] = Field(default_factory=list)
@@ -337,6 +341,9 @@ class AgentOutcome(BaseModel):
     session_id: str
     workspace: str
     status: AgentStatus
+    assessment: WorkflowAssessment | None = Field(
+        default=None, description="宿主核对证据引用后的阶段评估与本轮交付等级。"
+    )
     task_state: TaskState = TaskState.CREATED
     cycle_number: int = Field(default=1, ge=1)
     message: str

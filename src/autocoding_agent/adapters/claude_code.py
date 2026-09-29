@@ -807,6 +807,13 @@ def _stream_activities(
             tool_use_id = str(block.get("tool_use_id") or "") or None
             tool_name, data = tool_context.get(tool_use_id or "", ("unknown", {}))
             is_error = bool(block.get("is_error", False))
+            # 仅认可 Runtime 明确提供的退出码，不从模型文本或自然语言输出猜测成功。
+            tool_result = envelope.get("tool_use_result")
+            exit_code = None
+            if isinstance(tool_result, dict):
+                candidate = tool_result.get("exit_code", tool_result.get("exitCode"))
+                if isinstance(candidate, int) and not isinstance(candidate, bool):
+                    exit_code = candidate
             activities.append(
                 RuntimeActivity(
                     run_id=run_id,
@@ -818,7 +825,7 @@ def _stream_activities(
                     ),
                     tool_name=tool_name,
                     tool_use_id=tool_use_id,
-                    data={**data, "is_error": is_error},
+                    data={**data, "is_error": is_error, "exit_code": exit_code},
                 )
             )
     return activities

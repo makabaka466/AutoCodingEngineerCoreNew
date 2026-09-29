@@ -29,6 +29,7 @@ from autocoding_agent.core.models import (
 )
 from autocoding_agent.core.progress import ProgressPhase
 from autocoding_agent.core.state_machine.models import TaskState
+from autocoding_agent.core.workflow import ResultKind
 from autocoding_agent.incident.capability_store import IncidentCapabilityStore
 from autocoding_agent.incident.engine import IncidentEngine
 from autocoding_agent.incident.models import (
@@ -77,6 +78,43 @@ class ScriptedStructuredRuntime:
             runtime_session_id=turn.session_id,
             usage=AgentUsage(input_tokens=10, output_tokens=5, turns=1),
         )
+
+
+@pytest.mark.parametrize("repeat_after_budget", [False, True])
+def test_query_budget_preserves_evidence_and_requests_one_final_summary(
+    tmp_path: Path, repeat_after_budget: bool,
+) -> None:
+    query = DataQuery(
+        name="order_state", purpose="核对订单状态。", sql="SELECT id FROM orders", max_rows=1,
+    )
+    request = IncidentDecision(
+        status=IncidentStatus.QUERY_REQUIRED, message="核对订单。", page=_page(),
+        query_stage=IncidentQueryStage.BUSINESS_DATA, queries=[query],
+    )
+    conclusion = IncidentDecision(
+        status=IncidentStatus.COMPLETED, message="已有证据不足以确认触发条件。", page=_page(),
+        diagnosis="当前只能确认代码路径，尚缺现场记录。",
+        recommended_actions=["补充现场日志。"],
+    )
+    runtime = ScriptedStructuredRuntime([
+        request.model_copy(deep=True), request.model_copy(deep=True),
+        request.model_copy(deep=True) if repeat_after_budget else conclusion,
+    ])
+    database = FakeDatabase()
+    engine = IncidentEngine(
+        runtime, JsonIncidentStore(tmp_path / "state"), database, max_business_query_rounds=1,
+    )
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    result = engine.start(workspace, "订单页面异常。", "/orders/42")
+    assert len(database.queries) == 1
+    assert len(runtime.turns) == 3
+    assert "budget" in runtime.turns[-1].user_message
+    assert result.status == (
+        IncidentStatus.NEEDS_INPUT if repeat_after_budget else IncidentStatus.COMPLETED
+    )
+    assert result.assessment.result == ResultKind.PARTIAL
+    assert len(result.query_observations) == 1
 
 
 class FakeDatabase:

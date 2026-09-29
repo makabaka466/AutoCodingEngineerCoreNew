@@ -12,6 +12,7 @@ from typing import Any
 from pydantic import BaseModel
 
 from autocoding_agent.core.models import AgentDecision, AgentSession, CapabilityDraft
+from autocoding_agent.core.workflow import assessment_text
 
 
 class CapabilityReceipt(BaseModel):
@@ -271,6 +272,8 @@ class CapabilityStore:
 - 本轮目标：{safe(session.cycle_objective or session.goal)}
 - 工作轮次：{session.cycle_number}
 - 结果：{safe(decision.message)}
+
+{safe(assessment_text(decision.assessment))}
 - 变更文件：{", ".join(safe(path) for path in decision.changed_files) or "无"}
 """
 
@@ -295,6 +298,8 @@ class CapabilityStore:
 - 本轮目标：{safe(session.cycle_objective or session.goal)}
 - 完成时间：{session.updated_at.isoformat()}
 - 本轮结果：{safe(decision.message)}
+
+{safe(assessment_text(decision.assessment))}
 - 变更文件：{", ".join(safe(path) for path in decision.changed_files) or "无"}
 
 ### 总结

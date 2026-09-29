@@ -34,7 +34,12 @@ class DecisionRecorder:
             message=f"Recorded {decision.status.value} decision rationale.",
             actor=actor,
             command_id=command_id,
-            data={"decision_type": decision.status.value},
+            data={
+                "decision_type": decision.status.value,
+                "assessment": (
+                    decision.assessment.model_dump(mode="json") if decision.assessment else None
+                ),
+            },
         )
         evidence = [EvidenceRef(path=item.path, summary=item.summary) for item in decision.evidence]
         evidence_paths = {item.path for item in evidence if item.path}

@@ -35,6 +35,7 @@ from autocoding_agent.core.models import (
 )
 from autocoding_agent.core.progress import ProgressPhase
 from autocoding_agent.core.state_machine.models import TaskState
+from autocoding_agent.core.workflow import ResultKind
 from autocoding_agent.database_models import DataQuery, QueryResult
 from autocoding_agent.knowledge_rag.models import (
     KnowledgeDomain,
@@ -161,6 +162,27 @@ def _settings(data_dir: Path) -> Settings:
 
 def _app(data_dir: Path, runtime: ScriptedRuntime) -> AgentApplication:
     return build_application(settings=_settings(data_dir), runtime=runtime)
+
+
+def test_development_query_budget_returns_partial_analysis(tmp_path: Path) -> None:
+    query = DataQuery(name="order_state", purpose="核对状态。", sql="SELECT id FROM orders")
+    request = AgentDecision(status=AgentStatus.QUERY_REQUIRED, message="查状态。", queries=[query])
+    runtime = ScriptedRuntime(
+        request.model_copy(deep=True), request.model_copy(deep=True),
+        AgentDecision(status=AgentStatus.COMPLETED, message="尚缺现场日志，当前仅有候选原因。"),
+    )
+    database = FakeDatabase()
+    settings = _settings(tmp_path / "state").model_copy(update={"database_max_query_rounds": 1})
+    app = build_application(settings=settings, runtime=runtime, database=database)
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    outcome = app.start(workspace, "调查订单状态。")
+    assert outcome.status == AgentStatus.COMPLETED
+    assert outcome.assessment.result == ResultKind.PARTIAL
+    assert len(database.queries) == 1
+    assert len(runtime.turns) == 3
+    assert "budget" in runtime.turns[-1].user_message
+    assert len(outcome.query_observations) == 1
 
 
 def _capability(title: str = "Trace upload consistency") -> CapabilityDraft:

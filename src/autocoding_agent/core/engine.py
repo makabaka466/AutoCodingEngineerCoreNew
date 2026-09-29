@@ -60,6 +60,14 @@ from autocoding_agent.core.state_machine.models import (
     CommandReceipt,
     TaskState,
 )
+from autocoding_agent.core.workflow import (
+    RESULT_LABELS,
+    ResultKind,
+    WorkflowAssessment,
+    assessment_progress_text,
+    bind_assessment,
+    evidence_catalog,
+)
 from autocoding_agent.database_models import QueryObservation, QueryResult, sql_fingerprint
 from autocoding_agent.database_prompt import compact_database_context
 from autocoding_agent.knowledge_rag.models import KnowledgeDomain
@@ -341,9 +349,7 @@ class AgentEngine:
             f"The user declined the requested {approval.scope.value} scope.{detail} "
             "Continue without that permission and provide the best truthful alternative."
         )
-        return self._run_command(
-            session, message, AgentMode.INSPECT, command, progress_sink
-        )
+        return self._run_command(session, message, AgentMode.INSPECT, command, progress_sink)
 
     def resume(
         self,
@@ -627,6 +633,7 @@ class AgentEngine:
         )
         hermes_skill_rounds = 0
         consecutive_search_repair_rounds = 0
+        budget_closure_requested = False
 
         # 第 4 步：每次循环只对应一次可审计的 Runtime 调用。宿主服务可以返回证据并触发
         # 下一次模型调用，但每次调用边界都会单独记录，不会被隐藏。
@@ -676,8 +683,13 @@ class AgentEngine:
                                 session.project,
                                 self.hermes.catalog_prompt(),
                             )
-                            + (f"\n\n<retrieved_knowledge>\n{knowledge_context}\n"
-                               "</retrieved_knowledge>" if knowledge_context else "")
+                            + evidence_catalog(session)
+                            + (
+                                f"\n\n<retrieved_knowledge>\n{knowledge_context}\n"
+                                "</retrieved_knowledge>"
+                                if knowledge_context
+                                else ""
+                            )
                         ),
                         capability_dir=readable_capability_dir,
                         run_id=run.id,
@@ -826,6 +838,36 @@ class AgentEngine:
 
             # 第 6 步：只接受通过契约校验的结构化决策，并持久化其理由和证据。
             decision = result.decision
+            if budget_closure_requested:
+                if decision.status == AgentStatus.QUERY_REQUIRED:
+                    decision = AgentDecision(
+                        status=AgentStatus.NEEDS_INPUT,
+                        message="本轮查询额度已用完，请补充现场日志或异常记录以继续调查。",
+                        evidence=decision.evidence,
+                    )
+                if decision.assessment is None:
+                    decision.assessment = WorkflowAssessment(
+                        phase=ProgressPhase.ANALYZING_REQUEST,
+                        reason="查询额度已耗尽，保留已有调查结果并明确证据缺口。",
+                        missing=["需要补充现场证据或在下一轮继续调查。"],
+                    )
+                decision.assessment.result = ResultKind.PARTIAL
+            supplied_assessment = decision.assessment is not None
+            decision.assessment = bind_assessment(session, decision, mode=mode.value)
+            if supplied_assessment and decision.status in {
+                AgentStatus.QUERY_REQUIRED, AgentStatus.HERMES_SKILL_REQUIRED
+            }:
+                emit_progress(
+                    progress_sink,
+                    ProgressEvent.for_phase(
+                        ProgressWorkflow.DEVELOPMENT,
+                        decision.assessment.phase,
+                        task_id=session.id,
+                        assessment_summary=assessment_progress_text(decision.assessment),
+                        active=decision.status
+                        in {AgentStatus.QUERY_REQUIRED, AgentStatus.HERMES_SKILL_REQUIRED},
+                    ),
+                )
             session.runtime_session_id = result.runtime_session_id
             session.last_usage = merge_usage(session.last_usage, result.usage)
             session.events.append(
@@ -933,6 +975,20 @@ class AgentEngine:
             session.updated_at = utc_now()
 
             if decision.status == AgentStatus.QUERY_REQUIRED:
+                if session.query_rounds >= self.max_query_rounds:
+                    budget_closure_requested = True
+                    pending_message = (
+                        "The read-only query budget is exhausted. Do not request more SQL. "
+                        "Summarize existing evidence and named missing facts. Return completed "
+                        "with assessment.result partial, or needs_input for one specific fact. "
+                        "Do not claim an unproven cause or a runtime failure."
+                    )
+                    self.state_machine.transition(
+                        session, TaskState.INSPECTING,
+                        reason="Query budget exhausted; requested a partial evidence summary.",
+                        command_id=command.id, expected_version=session.version,
+                    )
+                    continue
                 emit_progress(
                     progress_sink,
                     ProgressEvent.for_phase(
@@ -1399,15 +1455,17 @@ class AgentEngine:
             AgentStatus.COMPLETED: ProgressPhase.COMPLETED,
             AgentStatus.FAILED: ProgressPhase.FAILED,
         }.get(session.status, ProgressPhase.FAILED)
-        emit_progress(
-            progress_sink,
-            ProgressEvent.for_phase(
-                ProgressWorkflow.DEVELOPMENT,
-                phase,
-                task_id=session.id,
-                active=phase not in {ProgressPhase.COMPLETED, ProgressPhase.FAILED},
-            ),
+        assessment = session.last_decision.assessment if session.last_decision else None
+        event = ProgressEvent.for_phase(
+            ProgressWorkflow.DEVELOPMENT,
+            phase,
+            task_id=session.id,
+            active=False,
+            assessment_summary=assessment_progress_text(assessment),
         )
+        if phase == ProgressPhase.COMPLETED and assessment:
+            event.label = RESULT_LABELS[assessment.result]
+        emit_progress(progress_sink, event)
 
     @staticmethod
     def _to_outcome(session: AgentSession) -> AgentOutcome:
@@ -1418,6 +1476,7 @@ class AgentEngine:
             session_id=session.id,
             workspace=session.workspace,
             status=session.status,
+            assessment=decision.assessment,
             task_state=session.task_state,
             cycle_number=session.cycle_number,
             message=decision.message,
@@ -1427,9 +1486,7 @@ class AgentEngine:
             changed_files=decision.changed_files,
             test_summary=decision.test_summary,
             capability_document=session.capability_document,
-            query_observations=session.query_observations[
-                session.cycle_query_observation_start :
-            ],
+            query_observations=session.query_observations[session.cycle_query_observation_start :],
             hermes_skill_observations=session.hermes_skill_observations[
                 session.cycle_hermes_observation_start :
             ],

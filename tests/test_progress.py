@@ -70,3 +70,10 @@ def test_progress_event_trims_details_and_sink_failure_is_non_fatal() -> None:
         raise RuntimeError("UI disconnected")
 
     emit_progress(broken_sink, event)
+
+
+def test_heartbeat_does_not_replace_last_observed_business_phase() -> None:
+    assert ProgressProjector.from_runtime(
+        RuntimeActivity(run_id="run-1", kind=RuntimeEventKind.HEARTBEAT, summary="Alive."),
+        workflow=ProgressWorkflow.INCIDENT, task_id="task-1", mode="inspect",
+    ) is None

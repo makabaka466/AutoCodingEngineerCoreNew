@@ -16,6 +16,7 @@ from autocoding_agent.adapters.claude_code import (
     ClaudeCodeError,
     ClaudeCodeRuntime,
     _command_line_chars,
+    _stream_activities,
     _validate_command_line_length,
 )
 from autocoding_agent.config import Settings
@@ -23,6 +24,20 @@ from autocoding_agent.core.models import AgentMode, RuntimeTurn
 from autocoding_agent.core.runtime.models import RuntimeEventKind
 from autocoding_agent.incident.models import IncidentDecision, IncidentStatus
 from autocoding_agent.ports.runtime import RuntimePolicyBlockedError
+
+
+@pytest.mark.parametrize("reported,expected", [(0, 0), (1, 1), ("0", None), (True, None)])
+def test_stream_exit_code_requires_explicit_numeric_runtime_metadata(reported, expected) -> None:
+    activities = _stream_activities(
+        {"type": "user", "tool_use_result": {"exitCode": reported}, "message": {
+            "content": [{"type": "tool_result", "tool_use_id": "test-1", "is_error": False,
+                         "content": "All tests passed; Exit code: 0"}],
+        }},
+        run_id="run-1", workspace="D:/repo",
+        tool_context={"test-1": ("Bash", {"command": "python -m pytest"})},
+    )
+    assert activities[0].data["exit_code"] == expected
+    assert "All tests passed" not in str(activities[0].data)
 
 
 def _settings(tmp_path: Path, **overrides: object) -> Settings:

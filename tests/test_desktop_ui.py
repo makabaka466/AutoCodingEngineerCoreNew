@@ -10,6 +10,7 @@ import pytest
 
 from autocoding_agent.config import Settings
 from autocoding_agent.core.models import (
+    AgentDecision,
     AgentOutcome,
     AgentSession,
     AgentStatus,
@@ -29,6 +30,7 @@ from autocoding_agent.core.progress import (
 )
 from autocoding_agent.core.recovery.models import RecoveryAction
 from autocoding_agent.core.state_machine.models import TaskState
+from autocoding_agent.core.workflow import ResultKind, WorkflowAssessment
 from autocoding_agent.database_models import QueryObservation, QueryObservationStatus
 from autocoding_agent.embedding_setup import (
     EmbeddingConnectionConfig,
@@ -812,6 +814,85 @@ def test_light_theme_and_configured_workspace_keep_composer_compact(
     assert client.status_badge.cget("highlightthickness") == 1
     assert COLORS["progress_accent"] == "#667EEA"
     assert client.activity_frame.cget("background") == COLORS["progress_accent_soft"]
+
+
+def test_status_below_conversation_rotates_only_while_executing(root: tk.Toplevel) -> None:
+    client = DesktopClient(root, FakeApplication())  # type: ignore[arg-type]
+    assert int(client.activity_frame.grid_info()["row"]) > int(client.transcript.grid_info()["row"])
+    client._set_busy(True, "处理中")
+    client._animate_progress_pulse()
+    angle = client.activity_dot.itemcget(client.activity_spinner, "start")
+    client._animate_progress_pulse()
+    assert client.activity_dot.itemcget(client.activity_spinner, "start") != angle
+    assert client.activity_dot.itemcget(client.activity_spinner, "state") == "normal"
+
+    client._present_progress(ProgressEvent.for_phase(
+        ProgressWorkflow.DEVELOPMENT, ProgressPhase.WAITING_INPUT, active=False,
+    ))
+    client._animate_progress_pulse()
+    assert client.activity_dot.itemcget(client.activity_spinner, "state") == "hidden"
+    client._set_busy(False)
+
+
+def test_history_restores_result_and_missing_evidence_without_loading(root: tk.Toplevel) -> None:
+    assessment = WorkflowAssessment(
+        phase=ProgressPhase.COMPLETED, reason="修改已写入，尚未运行验证。",
+        missing=["需要运行相关测试。"], result=ResultKind.MODIFIED_UNVERIFIED,
+    )
+    session = _session(AgentStatus.COMPLETED)
+    session.task_state = TaskState.COMPLETED
+    session.last_decision = AgentDecision(
+        status=AgentStatus.COMPLETED, message="修改完成。", assessment=assessment,
+    )
+    client = DesktopClient(root, FakeApplication([session]))  # type: ignore[arg-type]
+    client.session_id = session.id
+    client._render_session(session)
+    assert client.activity_var.get() == "修改完成，尚未验证"
+    assert "需要运行相关测试" in client.workflow_detail_var.get()
+    assert "推进依据" in client.transcript.get("1.0", "end")
+    assert not client._progress_event.active
+    assert client.activity_dot.itemcget(client.activity_spinner, "state") == "hidden"
+
+
+def test_long_evidence_summary_keeps_compact_window_composer_visible(root: tk.Toplevel) -> None:
+    session = _session(AgentStatus.NEEDS_INPUT)
+    session.task_state = TaskState.WAITING_INPUT
+    session.last_decision = AgentDecision(
+        status=AgentStatus.NEEDS_INPUT, message="请补充现场证据。",
+        assessment=WorkflowAssessment(
+            phase=ProgressPhase.WAITING_INPUT,
+            reason="已核对页面入口，但缺少现场日志。" * 30,
+            missing=["仍需确认对应异常记录与部署版本。" * 20] * 6,
+            result=ResultKind.HYPOTHESIS,
+        ),
+    )
+    client = DesktopClient(root, FakeApplication([session]))  # type: ignore[arg-type]
+    client.session_id = session.id
+    client._render_session(session)
+    root.geometry("980x720")
+    root.deiconify()
+    root.update_idletasks()
+    assert client.activity_frame.winfo_height() < 160
+    assert client.prompt_input.winfo_rooty() + client.prompt_input.winfo_height() <= (
+        root.winfo_rooty() + root.winfo_height()
+    )
+    assert "…" in client.workflow_detail_var.get()
+    assert session.last_decision.assessment.reason in client.transcript.get("1.0", "end")
+
+
+def test_terminal_status_cancels_pending_phase_animation(root: tk.Toplevel) -> None:
+    client = DesktopClient(root, FakeApplication())  # type: ignore[arg-type]
+    client._set_busy(True, "处理中")
+    client._present_progress(ProgressEvent.for_phase(
+        ProgressWorkflow.DEVELOPMENT, ProgressPhase.INSPECTING_CODE,
+    ))
+    assert client._pending_progress_event is not None
+    client._present_progress(ProgressEvent.for_phase(
+        ProgressWorkflow.DEVELOPMENT, ProgressPhase.COMPLETED, active=False,
+    ))
+    client._flush_pending_progress()
+    assert client._progress_event.phase == ProgressPhase.COMPLETED
+    assert client._pending_progress_event is None
 
 
 def test_progress_queue_keeps_worker_busy_and_uses_curated_copy(root: tk.Toplevel) -> None:

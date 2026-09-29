@@ -77,6 +77,9 @@ class ProgressEvent(BaseModel):
     phase: ProgressPhase
     label: str
     detail: str | None = None
+    assessment_summary: str | None = Field(
+        default=None, description="关键阶段的公开推进依据和证据缺口，不含思维链。"
+    )
     active: bool = True
     created_at: datetime = Field(default_factory=_utc_now)
 
@@ -89,6 +92,7 @@ class ProgressEvent(BaseModel):
         task_id: str | None = None,
         detail: str | None = None,
         active: bool = True,
+        assessment_summary: str | None = None,
     ) -> ProgressEvent:
         return cls(
             task_id=task_id,
@@ -97,6 +101,7 @@ class ProgressEvent(BaseModel):
             label=PROGRESS_LABELS[phase],
             detail=_safe_detail(detail),
             active=active,
+            assessment_summary=assessment_summary,
         )
 
 
@@ -139,12 +144,8 @@ class ProgressProjector:
                 task_id=task_id,
             )
         if activity.kind == RuntimeEventKind.HEARTBEAT:
-            return ProgressEvent.for_phase(
-                workflow,
-                cls._phase_for_mode(mode, workflow),
-                task_id=task_id,
-                detail="模型仍在处理",
-            )
+            # 心跳仅证明进程存活，不能把最近的读代码/查数据阶段改成另一业务阶段。
+            return None
         if activity.kind != RuntimeEventKind.TOOL_STARTED:
             return None
 

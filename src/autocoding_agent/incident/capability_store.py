@@ -21,6 +21,7 @@ from autocoding_agent.adapters.capability_store import (
     session_index_records,
     sync_knowledge_documents,
 )
+from autocoding_agent.core.workflow import assessment_text
 from autocoding_agent.incident.models import (
     IncidentCompletionKind,
     IncidentDecision,
@@ -254,6 +255,8 @@ class IncidentCapabilityStore:
 
 {safe(decision.diagnosis or decision.message)}
 
+{safe(assessment_text(decision.assessment))}
+
 ## 证据与发现
 
 {bullets(findings, "本次未记录额外发现。")}
@@ -321,6 +324,8 @@ class IncidentCapabilityStore:
 ### {conclusion_title}
 
 {safe(decision.diagnosis or decision.message)}
+
+{safe(assessment_text(decision.assessment))}
 
 ### 证据与发现
 
