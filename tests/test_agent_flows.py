@@ -37,6 +37,12 @@ from autocoding_agent.core.progress import ProgressPhase
 from autocoding_agent.core.state_machine.models import TaskState
 from autocoding_agent.core.workflow import ResultKind
 from autocoding_agent.database_models import DataQuery, QueryResult
+from autocoding_agent.incident.models import (
+    IncidentCompletionKind,
+    IncidentDecision,
+    IncidentSession,
+    IncidentStatus,
+)
 from autocoding_agent.knowledge_rag.models import (
     KnowledgeDomain,
     KnowledgeHit,
@@ -1023,3 +1029,105 @@ def test_development_flow_continues_when_hermes_is_unavailable(tmp_path: Path) -
     assert session.hermes_skill_observations[0].error == (
         "Hermes model is not configured. token=[REDACTED]"
     )
+
+
+def _diagnosed_incident(workspace: Path) -> IncidentSession:
+    return IncidentSession(
+        workspace=str(workspace), problem="Upload leaves partial state", project="生物",
+        status=IncidentStatus.COMPLETED,
+        last_decision=IncidentDecision(
+            status=IncidentStatus.COMPLETED, message="Partial upload state.",
+            diagnosis="Two writes lack a shared transaction.",
+            recommended_actions=["Make both writes atomic."],
+        ),
+    )
+
+
+def test_incident_handoff_is_read_only_until_reviewed_and_survives_restart(tmp_path: Path):
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    runtime = ScriptedRuntime(
+        _approval(ApprovalScope.MODIFY), _approval(ApprovalScope.VERIFY), _completed(),
+        _approval(ApprovalScope.MODIFY),
+    )
+    state = tmp_path / "state"
+    app = _app(state, runtime)
+    incident = _diagnosed_incident(workspace)
+    first = app.start_incident_remediation(incident)
+    assert first.task_state == TaskState.WAITING_MODIFY_APPROVAL
+    assert len(runtime.turns) == 1
+    assert runtime.turns[0].mode == AgentMode.INSPECT
+    assert "Two writes lack" in runtime.turns[0].user_message
+    assert "影响" in runtime.turns[0].user_message
+    assert not list(workspace.iterdir())
+    saved = app.get_session(first.session_id)
+    assert saved.source_incident_key == f"{incident.id}:1"
+    assert incident.task_state == TaskState.COMPLETED
+    assert incident.runtime_session_id is None
+
+    restarted = _app(state, runtime)
+    duplicate = restarted.start_incident_remediation(incident)
+    assert duplicate.session_id == first.session_id
+    assert len(runtime.turns) == 1
+    after_modify = restarted.approve(first.session_id)
+    assert runtime.turns[-1].mode == AgentMode.IMPLEMENT
+    assert after_modify.task_state == TaskState.WAITING_VERIFY_APPROVAL
+    restarted.approve(first.session_id)
+    assert runtime.turns[-1].mode == AgentMode.VERIFY
+    incident.cycle_number = 2
+    next_cycle = restarted.start_incident_remediation(incident)
+    assert next_cycle.session_id != first.session_id
+    assert runtime.turns[-1].mode == AgentMode.INSPECT
+
+
+@pytest.mark.parametrize("invalid", ["unfinished", "page_only", "cancelled", "no_solution"])
+def test_incident_handoff_rejects_non_diagnosis_without_runtime(tmp_path: Path, invalid: str):
+    incident = _diagnosed_incident(tmp_path)
+    if invalid == "unfinished":
+        incident.status = IncidentStatus.NEEDS_INPUT
+    elif invalid == "page_only":
+        incident.last_decision.completion_kind = IncidentCompletionKind.PAGE_LOCATION
+    elif invalid == "cancelled":
+        incident.task_state = TaskState.CANCELLED
+    else:
+        incident.last_decision.recommended_actions = []
+    runtime = ScriptedRuntime()
+    app = _app(tmp_path / "state", runtime)
+    with pytest.raises(ValueError, match="完成异常诊断"):
+        app.start_incident_remediation(incident)
+    assert not runtime.turns
+    assert not app.list_sessions()
+
+
+@pytest.mark.parametrize("missing", ["path", "impact", "validation"])
+def test_remediation_requires_complete_plan_before_approval(tmp_path: Path, missing: str):
+    approval = _approval(ApprovalScope.MODIFY)
+    proposal = approval.approval.proposal
+    if missing == "path":
+        proposal.changes[0].path = None
+    else:
+        setattr(proposal, missing, [])
+    runtime = ScriptedRuntime(approval)
+    app = _app(tmp_path / "state", runtime)
+    outcome = app.start_incident_remediation(_diagnosed_incident(tmp_path))
+    assert outcome.status == AgentStatus.FAILED
+    assert "影响和验证计划" in outcome.message
+    assert app.get_session(outcome.session_id).pending_approval is None
+    with pytest.raises(ValueError, match="pending approval"):
+        app.approve(outcome.session_id)
+    assert [turn.mode for turn in runtime.turns] == [AgentMode.INSPECT]
+
+
+def test_restored_remediation_approval_is_checked_again_before_writes(tmp_path: Path):
+    runtime = ScriptedRuntime(_approval(ApprovalScope.MODIFY))
+    state = tmp_path / "state"
+    app = _app(state, runtime)
+    outcome = app.start_incident_remediation(_diagnosed_incident(tmp_path))
+    saved = app.get_session(outcome.session_id)
+    saved.pending_approval.proposal.impact = []
+    app._engine.sessions.save(saved)
+    restarted = _app(state, runtime)
+    with pytest.raises(RuntimeError, match="影响和验证计划"):
+        restarted.approve(outcome.session_id)
+    assert [turn.mode for turn in runtime.turns] == [AgentMode.INSPECT]
+    assert restarted.get_session(outcome.session_id).task_state == TaskState.WAITING_MODIFY_APPROVAL

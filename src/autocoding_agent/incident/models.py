@@ -184,7 +184,8 @@ class IncidentDecision(BaseModel):
     diagnosis: NonEmptyText | None = Field(
         default=None,
         description=(
-            "Why the incident happened, including the evidence-backed causal chain and an "
+            "Brief causal explanation in 1-3 sentences; do not repeat message, tool logs, SQL, "
+            "or the full investigation process. Include the evidence-backed causal chain and an "
             "explicit certainty level when the root cause is not fully proven."
         ),
     )
@@ -192,7 +193,8 @@ class IncidentDecision(BaseModel):
     recommended_actions: list[NonEmptyText] = Field(
         default_factory=list,
         description=(
-            "Concrete solutions or safe verification steps. At least one is required for a "
+            "A concise actionable solution list, normally 1-3 items; avoid generic advice and "
+            "repeated evidence. Concrete solutions or safe verification steps are required for a "
             "completed diagnosis; page_location may leave this empty."
         ),
     )
@@ -265,6 +267,18 @@ class IncidentSession(BaseModel):
     command_receipts: list[CommandReceipt] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
+
+    @property
+    def can_remediate(self) -> bool:
+        """只有完成诊断且有解决方向的当前轮次可以被用户手动交接。"""
+        decision = self.last_decision
+        return bool(
+            self.status == IncidentStatus.COMPLETED
+            and self.task_state == TaskState.COMPLETED
+            and decision and decision.status == IncidentStatus.COMPLETED
+            and decision.completion_kind == IncidentCompletionKind.DIAGNOSIS
+            and decision.diagnosis and decision.recommended_actions
+        )
 
     @model_validator(mode="before")
     @classmethod

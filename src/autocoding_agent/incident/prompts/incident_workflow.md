@@ -180,3 +180,10 @@ cycles.
 The host writes completed incidents into incident-only capability Markdown. Do not modify that
 memory yourself. Single-incident rows, screenshots, and temporary conclusions belong to the task
 record; only reviewed reusable conclusions should later enter long-term indexed knowledge.
+
+
+## 简洁交付
+完成异常诊断时，message 只用一句话总结异常，diagnosis 用 1-3 句说明原因及不确定性，
+recommended_actions 通常只保留 1-3 项具体解决步骤。不要重复调查过程、SQL、工具日志、
+长篇背景或空泛建议。宿主展示“异常总结”和“解决方案”，详细证据另行查看。
+诊断保持只读；如需要修改代码，告知用户可手动进入异常处理，先审阅修复方案后批准修改。

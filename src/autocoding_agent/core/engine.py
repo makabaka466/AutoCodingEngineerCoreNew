@@ -29,6 +29,7 @@ from autocoding_agent.core.models import (
     AgentOutcome,
     AgentSession,
     AgentStatus,
+    ApprovalRequest,
     ApprovalScope,
     ChatMessage,
     EventType,
@@ -166,6 +167,7 @@ class AgentEngine:
         message: str,
         project: str | None = None,
         *,
+        source_incident_key: str | None = None,
         progress_sink: ProgressSink | None = None,
     ) -> AgentOutcome:
         canonical = Path(workspace).expanduser().resolve(strict=True)
@@ -179,6 +181,7 @@ class AgentEngine:
             project=project.strip() if project and project.strip() else None,
             database_reference=self.database_reference,
             cycle_objective=message.strip(),
+            source_incident_key=source_incident_key,
         )
         session.events.append(
             AgentEvent(
@@ -280,6 +283,8 @@ class AgentEngine:
                 "This saved approval predates change proposals. Send a revised instruction so "
                 "the Agent can inspect the current code and present a proposal first."
             )
+        if session.source_incident_key:
+            self._validate_remediation_proposal(approval)
         expected_state = (
             TaskState.WAITING_MODIFY_APPROVAL
             if approval.scope == ApprovalScope.MODIFY
@@ -826,6 +831,8 @@ class AgentEngine:
                 )
             try:
                 self._validate_decision(result.decision, mode)
+                if session.source_incident_key and result.decision.approval:
+                    self._validate_remediation_proposal(result.decision.approval)
             except Exception as exc:
                 if mode in {AgentMode.IMPLEMENT, AgentMode.VERIFY}:
                     return self._require_recovery(
@@ -1309,6 +1316,22 @@ class AgentEngine:
         session.updated_at = utc_now()
         self.sessions.save(session)
         return self._to_outcome(session)
+
+    @staticmethod
+    def _validate_remediation_proposal(approval: ApprovalRequest) -> None:
+        """异常处理必须交付完整可审阅方案，旧快照也不能绕过此检查。"""
+        if approval.scope != ApprovalScope.MODIFY:
+            return
+        proposal = approval.proposal
+        if (
+            proposal is None
+            or not proposal.impact
+            or not proposal.validation
+            or any(not change.path for change in proposal.changes)
+        ):
+            raise PolicyViolation(
+                "异常处理方案必须列明文件、修改前后、目标效果、影响和验证计划；请补充方案后再批准。"
+            )
 
     @staticmethod
     def _validate_decision(decision: AgentDecision, mode: AgentMode) -> None:

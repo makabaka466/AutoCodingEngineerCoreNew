@@ -1,6 +1,6 @@
 # AutoCoding Engineer 接口与数据契约
 
-本文记录当前 `0.8.0` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
+本文记录当前 `0.9.0` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
 Runtime、持久化和状态契约。
 设计动机和运行流程见[架构说明](ARCHITECTURE.md)。
 
@@ -45,6 +45,7 @@ def build_application(
 
 | 方法 | 输入 | 行为和返回 |
 | --- | --- | --- |
+| `start_incident_remediation(incident)` | `IncidentSession` | 用户手动交接已完成诊断，从只读开始准备修复；同一轮返回已有任务 |
 | `start(workspace, message, project=None)` | `str | Path`, `str`, `str | None` | 新建任务，保存所选知识项目并执行首个只读轮次，返回 `AgentOutcome` |
 | `send(session_id, message, command_id=None)` | `str`, `str`, `str | None` | 补充澄清、修订指令，或从 completed 开启同一会话的新工作轮次；可用命令 ID 幂等重试 |
 | `approve(session_id, command_id=None)` | `str`, `str | None` | 批准当前请求的精确 scope，并以对应模式继续 |
@@ -1222,21 +1223,17 @@ Runtime 决策后计数归零。`MAX_SEARCH_REPAIR_ROUNDS=1` 因而约束的是�
 `completion_kind=diagnosis` 时，`IncidentOutcome.message` 和完成轮次的最终 Assistant 消息由宿主渲染为：
 
 ```text
-结论
+异常总结
 <一句话结论>
+原因：<简短因果说明，未证实时明确假设>
+待确认：<存在证据缺口时展示>
 
-为什么出现这个异常
-<证据支持的因果说明>
-
-解决方法
+解决方案
 1. <具体修复或验证动作>
-
-结论置信度
-<百分比或模型未量化>
 ```
 
 结构化字段 `diagnosis`、`recommended_actions` 和 `confidence` 仍分别保留，供 API、能力文档与审计
-使用。桌面元数据区域同步使用“为什么出现这个异常”和“解决方法”标签。
+使用。桌面默认隐藏重复元数据和系统查询过程，可通过“查看诊断详情”展开。
 
 `completion_kind=page_location` 时改为“页面定位 / 代码位置 / 定位依据”，不显示异常原因和解决方法，
 也不要求业务数据查询。对应能力 Markdown 标题为“页面定位记录”；同一会话以后升级为诊断时仍追加
@@ -1284,3 +1281,22 @@ ResultKind：unspecified、analysis、page_located、hypothesis、cause_confirme
 verified、partial。completed 仍指本工作轮次结束；不增加 TaskState，不改变原有审批/恢复 API。
 ProgressEvent 新增可空 assessment_summary；active=False 表示当前没有自主执行，不包括等待输入和授权。
 桌面展示阶段与公开理由，备用 Web 共用同一回调。Runtime 心跳不再覆盖最近的实际工具阶段。
+
+
+## 19. 异常处理交接契约（0.9.0）
+
+`IncidentSession.can_remediate` 为只读属性，不写入数据库：只有当前完成完整诊断，且包含原因与
+解决方向时为 true。仅定位页面、等待输入、失败、取消或未提供解决方向时拒绝交接。
+
+`AgentApplication.start_incident_remediation(incident, *, progress_sink=None)` 返回 AgentOutcome。
+调用方传入从 IncidentApplication 获取的当前会话，模型仅得到历史证据数据，首轮为 inspect。
+`AgentSession.source_incident_key` 是可空字符串，格式为 `<incident_id>:<cycle_number>`，旧任务
+默认 null。同轮重复调用返回已有任务结果，不调用 Runtime、不批准修改；新诊断轮次创建新任务。
+
+修改审批继续使用 ChangeProposal：`changes[].path/area/current/proposed`、`expected_result`、
+`impact` 和 `validation`。异常处理额外要求每项 path 非空且 impact/validation 非空。宿主在模型
+返回审批和实际 approve 时均执行检查。普通聊天不会授予写权限；用户可以 reject 或 send 修订
+方案，均回到只读调查。批准修改后再单独申请验证，修改完成不自动等于验证通过。
+
+无新增诊断写权限或 CLI 自动交接命令；桌面入口复用开发应用。修复历史归属开发列表并标识来源，
+异常诊断历史保持可查。现有数据库读取、审计、状态、恢复和审批 API 保持原行为。

@@ -47,6 +47,7 @@ from autocoding_agent.incident.application import (
     IncidentApplication,
     build_incident_application,
 )
+from autocoding_agent.incident.engine import format_incident_summary
 from autocoding_agent.incident.models import (
     IncidentOutcome,
     IncidentSession,
@@ -673,6 +674,7 @@ class DesktopClient:
         else:
             self.incident_application = None
         self.flow = FlowKind.DEVELOPMENT
+        self._show_incident_details = False
         self.session_id: str | None = None
         self._flow_session_ids: dict[FlowKind, str | None] = {
             FlowKind.DEVELOPMENT: None,
@@ -1278,7 +1280,24 @@ class DesktopClient:
             bg=COLORS["input"],
         ).grid(row=0, column=1, sticky="e")
 
+        incident_actions = tk.Frame(composer_header, bg=COLORS["input"])
+        self.incident_actions = incident_actions
+        incident_actions.grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self.remediation_button = self._button(
+            incident_actions, "进入异常处理", self._start_incident_remediation,
+            background=COLORS["accent"], active_background=COLORS["accent_hover"],
+        )
+        self.remediation_button.grid(row=0, column=0, padx=(0, 8))
+        self.remediation_button.grid_remove()
+        self.incident_details_button = self._button(
+            incident_actions, "查看诊断详情", self._toggle_incident_details,
+            background="#E8EEF9", active_background="#D8E4F7",
+        )
+        self.incident_details_button.grid(row=0, column=1)
+        self.incident_details_button.grid_remove()
+
         project_row = tk.Frame(self.composer_frame, bg=COLORS["input"])
+        self.project_row = project_row
         project_row.grid(row=1, column=0, sticky="ew", padx=14, pady=(4, 4))
         project_row.grid_columnconfigure(2, weight=1)
         tk.Label(
@@ -1684,6 +1703,7 @@ class DesktopClient:
     def _update_responsive_layout(self, event: tk.Event[tk.Misc]) -> None:
         if event.widget is not self.root or not hasattr(self, "overview_panel"):
             return
+        self._sync_controls()
         should_show = event.width >= 1180
         if should_show == self._overview_visible:
             return
@@ -1734,6 +1754,7 @@ class DesktopClient:
             )
             return
         self._clear_pending_attachments()
+        self._show_incident_details = False
         self._flow_session_ids[self.flow] = self.session_id
         self.flow = flow
         self.session_id = self._flow_session_ids[flow]
@@ -1832,6 +1853,11 @@ class DesktopClient:
         self._render_incident_session(session)
 
     def _render_welcome(self) -> None:
+        self._show_incident_details = False
+        self.incident_actions.grid_remove()
+        self.remediation_button.grid_remove()
+        self.incident_details_button.grid_remove()
+        self._refresh_flow_presentation()
         self._current_task_state = None
         self.send_button.configure(text="发送任务")
         self.prompt_placeholder.configure(text=self._default_prompt_placeholder_text())
@@ -1863,6 +1889,14 @@ class DesktopClient:
         self._set_status(None)
 
     def _render_session(self, session: AgentSession) -> None:
+        self.incident_actions.grid_remove()
+        self.transcript.tag_configure("assistant_message", spacing1=7, spacing3=9)
+        self.remediation_button.grid_remove()
+        self.incident_details_button.grid_remove()
+        if session.source_incident_key:
+            self.flow_caption_var.set("异常处理 · 方案审阅 → 批准修改 → 验证")
+        else:
+            self.flow_caption_var.set("开发流程 · AI 工程工作台")
         self._current_task_state = session.task_state
         entries: list[tuple[str, str]] = []
         for item in session.messages:
@@ -1871,7 +1905,10 @@ class DesktopClient:
                 MessageRole.ASSISTANT: "assistant",
                 MessageRole.SYSTEM: "system",
             }[item.role]
-            entries.append((role, self._message_display_content(item)))
+            content = self._message_display_content(item)
+            if session.source_incident_key and item is session.messages[0]:
+                content = session.goal.split("\n", 1)[0] + "\n已关联诊断资料，先准备修复方案。"
+            entries.append((role, content))
 
         decision = session.last_decision
         if decision is not None:
@@ -1933,18 +1970,36 @@ class DesktopClient:
         self._present_session_state(session)
 
     def _render_incident_session(self, session: IncidentSession) -> None:
+        self.incident_actions.grid()
+        self.transcript.tag_configure("assistant_message", spacing1=2, spacing3=3)
         self._current_task_state = session.task_state
         entries: list[tuple[str, str]] = []
+        self.incident_details_button.grid()
+        self.incident_details_button.configure(
+            text="收起诊断详情" if self._show_incident_details else "查看诊断详情"
+        )
+        final_assistant = next(
+            (item for item in reversed(session.messages) if item.role == MessageRole.ASSISTANT),
+            None,
+        )
         for item in session.messages:
+            if item.role == MessageRole.SYSTEM and not self._show_incident_details:
+                continue
             role = {
                 MessageRole.USER: "user",
                 MessageRole.ASSISTANT: "assistant",
                 MessageRole.SYSTEM: "system",
             }[item.role]
-            entries.append((role, self._message_display_content(item)))
+            content = self._message_display_content(item)
+            if (item is final_assistant and session.last_decision
+                    and session.status == IncidentStatus.COMPLETED):
+                content = format_incident_summary(session.last_decision)
+            entries.append((role, content))
 
         decision = session.last_decision
-        if decision is not None:
+        if final_assistant is None and decision and session.status == IncidentStatus.COMPLETED:
+            entries.append(("assistant", format_incident_summary(decision)))
+        if decision is not None and self._show_incident_details:
             details: list[str] = []
             if decision.assessment:
                 details.append(assessment_text(decision.assessment))
@@ -1999,8 +2054,13 @@ class DesktopClient:
         self.send_button.configure(text="发送任务")
         self.prompt_placeholder.configure(text=self._default_prompt_placeholder_text())
         if session.status == IncidentStatus.COMPLETED:
+            follow_up = (
+                "或点击“进入异常处理”先审阅修复方案。"
+                if session.can_remediate
+                else "补充证据或要求进一步诊断。"
+            )
             self.status_var.set(
-                f"第 {session.cycle_number} 轮异常诊断已完成。可以继续追问、补充现象，或新建诊断。"
+                f"第 {session.cycle_number} 轮调查已完成。可继续追问，{follow_up}"
             )
             self.send_button.configure(text="继续对话")
             self.prompt_placeholder.configure(text="继续追问，或者补充新的异常线索…")
@@ -2083,6 +2143,7 @@ class DesktopClient:
             self.transcript.insert("end", "\n", "muted")
         self.transcript.configure(state="disabled")
         self.transcript.see("end")
+        self.root.after_idle(lambda: self.transcript.see("end"))
 
     def _load_recent_sessions(self, select_current: bool = False) -> None:
         try:
@@ -2120,6 +2181,7 @@ class DesktopClient:
             messagebox.showerror("无法打开任务", str(exc), parent=self.root)
             return
         self.session_id = session_id
+        self._show_incident_details = False
         self._flow_session_ids[self.flow] = session_id
         self._render_active_session(session)
 
@@ -2506,6 +2568,32 @@ class DesktopClient:
         self.attachment_status_var.set(f"已粘贴 {count} 张异常截图 · {total_bytes / 1024:.1f} KiB")
         self.attachment_frame.grid()
 
+    def _toggle_incident_details(self) -> None:
+        if self._busy or self.flow != FlowKind.INCIDENT or not self.session_id:
+            return
+        self._show_incident_details = not self._show_incident_details
+        self._render_incident_session(self.incident_application.get_session(self.session_id))
+
+    def _start_incident_remediation(self) -> None:
+        """点击只授权生成方案；写权限仍由后续的批准按钮单独授予。"""
+        if self._busy or self.flow != FlowKind.INCIDENT or not self.session_id:
+            return
+        incident = self.incident_application.get_session(self.session_id)
+        if not incident.can_remediate:
+            return
+        self._select_flow(FlowKind.DEVELOPMENT)
+        self.session_id = None
+        self._flow_session_ids[FlowKind.DEVELOPMENT] = None
+        self._render_welcome()
+        self.flow_caption_var.set("异常处理 · 正在核对诊断并准备修复方案")
+        self.task_title_var.set("异常处理：" + incident.problem[:48])
+        self._run_in_background(
+            lambda: self.application.start_incident_remediation(
+                incident, progress_sink=self._queue_progress
+            ),
+            "正在生成异常处理方案",
+        )
+
     def _approve(self) -> None:
         if (
             self.flow != FlowKind.DEVELOPMENT
@@ -2824,6 +2912,20 @@ class DesktopClient:
     def _sync_controls(self) -> None:
         """Keep controls consistent with the durable task state and current worker."""
 
+        can_remediate = False
+        if self.flow == FlowKind.INCIDENT and self.session_id:
+            try:
+                can_remediate = self.incident_application.get_session(
+                    self.session_id
+                ).can_remediate
+            except Exception:
+                pass
+        if can_remediate:
+            self.remediation_button.grid()
+        else:
+            self.remediation_button.grid_remove()
+        self.remediation_button.configure(state="disabled" if self._busy else "normal")
+        self.incident_details_button.configure(state="disabled" if self._busy else "normal")
         can_start_new = not self._busy
         can_choose_project = not self._busy and self.session_id is None
         can_send = not self._busy and self._current_task_state not in {
@@ -2836,6 +2938,18 @@ class DesktopClient:
             and not self._busy
             and self._current_status == AgentStatus.APPROVAL_REQUIRED
         )
+        # 审阅时上下文已固定，把空间留给方案；输入仍可用于拒绝或调整。
+        reviewing = (
+            self.flow == FlowKind.DEVELOPMENT
+            and self._current_status == AgentStatus.APPROVAL_REQUIRED
+        )
+        compact = self.root.winfo_height() < 780
+        self.prompt_input.configure(height=1 if reviewing else (2 if compact else 4))
+        self.approval_text.configure(height=5 if compact else 9)
+        if reviewing:
+            self.project_row.grid_remove()
+        else:
+            self.project_row.grid()
         self.new_task_button.configure(state="normal" if can_start_new else "disabled")
         self.project_combo.configure(state="readonly" if can_choose_project else "disabled")
         recovery_state = False

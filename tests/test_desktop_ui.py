@@ -37,6 +37,9 @@ from autocoding_agent.embedding_setup import (
     EmbeddingSetupState,
 )
 from autocoding_agent.incident.models import (
+    IncidentCompletionKind,
+    IncidentDecision,
+    IncidentFinding,
     IncidentOutcome,
     IncidentSession,
     IncidentStatus,
@@ -1150,3 +1153,93 @@ def test_busy_window_refuses_to_close(root: tk.Toplevel, monkeypatch: pytest.Mon
 
     assert root.winfo_exists()
     assert warnings and "仍在处理" in warnings[0]
+
+
+def test_incident_summary_details_and_manual_repair_entry(root: tk.Toplevel, tmp_path: Path):
+    class RepairApplication(FakeApplication):
+        def start_incident_remediation(self, incident, *, progress_sink=None):
+            self.calls.append(("repair", incident.id))
+            return self.start(incident.workspace, "只读准备修复方案", incident.project)
+
+    incident = IncidentSession(
+        workspace=str(tmp_path), problem="订单停留处理中", status=IncidentStatus.COMPLETED,
+        last_decision=IncidentDecision(
+            status=IncidentStatus.COMPLETED, message="订单未完成履约。",
+            diagnosis="事件消费失败，原因仍待现场证据确认。",
+            recommended_actions=["核对消费失败后修复重试逻辑。"],
+            findings=[IncidentFinding(summary="内部证据详情")], confidence=0.7,
+        ),
+        messages=[
+            ChatMessage(role=MessageRole.USER, content="订单停留处理中"),
+            ChatMessage(role=MessageRole.SYSTEM, content="内部查询过程"),
+            ChatMessage(role=MessageRole.ASSISTANT, content="历史冗长诊断内容"),
+        ],
+    )
+    application = RepairApplication()
+    incidents = FakeIncidentApplication([incident])
+    client = DesktopClient(
+        root, application, incidents,  # type: ignore[arg-type]
+        workspace_service=FakeWorkspaceService(tmp_path),  # type: ignore[arg-type]
+    )
+    client._select_flow(FlowKind.INCIDENT)
+    client.session_id = incident.id
+    client._render_incident_session(incident)
+    transcript = client.transcript.get("1.0", "end")
+    assert "异常总结" in transcript and "解决方案" in transcript
+    assert "内部证据详情" not in transcript and "内部查询过程" not in transcript
+    assert "历史冗长诊断内容" not in transcript
+    assert client.remediation_button.winfo_manager() == "grid"
+    assert not application.calls
+    client._toggle_incident_details()
+    transcript = client.transcript.get("1.0", "end")
+    assert "内部证据详情" in transcript and "内部查询过程" in transcript
+    client._toggle_incident_details()
+    assert "内部证据详情" not in client.transcript.get("1.0", "end")
+    operations = _capture_operation(client)
+    client.remediation_button.invoke()
+    assert client.flow == FlowKind.DEVELOPMENT
+    assert client._flow_session_ids[FlowKind.INCIDENT] == incident.id
+    assert len(operations) == 1 and not application.calls
+    outcome = operations[0]()
+    assert application.calls[0] == ("repair", incident.id)
+    client.session_id = outcome.session_id
+    client._render_session(application.get_session(outcome.session_id))
+    assert client.remediation_button.winfo_manager() == ""
+    assert not any(call[0] == "approve" for call in application.calls)
+    client._select_flow(FlowKind.INCIDENT)
+    assert client.session_id == incident.id
+    assert incidents.calls == []
+
+
+@pytest.mark.parametrize("state", ["input", "page_only", "cancelled", "no_solution"])
+def test_incident_repair_button_only_for_completed_diagnosis(
+    root: tk.Toplevel, tmp_path: Path, state: str,
+):
+    incident = IncidentSession(
+        workspace=str(tmp_path), problem="异常", status=IncidentStatus.COMPLETED,
+        last_decision=IncidentDecision(
+            status=IncidentStatus.COMPLETED, message="总结", diagnosis="原因待核对",
+            recommended_actions=["核对代码后制定方案"],
+        ),
+    )
+    if state == "input":
+        incident.status = IncidentStatus.NEEDS_INPUT
+        incident.task_state = TaskState.WAITING_INPUT
+    elif state == "page_only":
+        incident.last_decision.completion_kind = IncidentCompletionKind.PAGE_LOCATION
+    elif state == "cancelled":
+        incident.task_state = TaskState.CANCELLED
+    else:
+        incident.last_decision.recommended_actions = []
+    application = FakeApplication()
+    client = DesktopClient(
+        root, application, FakeIncidentApplication([incident]),  # type: ignore[arg-type]
+        workspace_service=FakeWorkspaceService(tmp_path),  # type: ignore[arg-type]
+    )
+    client._select_flow(FlowKind.INCIDENT)
+    client.session_id = incident.id
+    client._render_incident_session(incident)
+    assert client.remediation_button.winfo_manager() == ""
+    operations = _capture_operation(client)
+    client._start_incident_remediation()
+    assert not operations and not application.calls

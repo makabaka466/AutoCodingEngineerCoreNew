@@ -244,6 +244,9 @@ class AgentSession(BaseModel):
     workspace: str
     goal: str
     project: str | None = None
+    source_incident_key: str | None = Field(
+        default=None, description="手动进入异常处理时关联的诊断会话 ID 和轮次；历史开发任务为空。"
+    )
     task_state: TaskState = TaskState.CREATED
     version: int = Field(default=0, ge=0)
     revision: int = Field(default=0, ge=0)

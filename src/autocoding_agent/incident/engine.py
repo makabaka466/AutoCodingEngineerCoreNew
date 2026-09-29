@@ -54,7 +54,6 @@ from autocoding_agent.core.workflow import (
     ResultKind,
     WorkflowAssessment,
     assessment_progress_text,
-    assessment_text,
     bind_assessment,
     evidence_catalog,
 )
@@ -949,7 +948,7 @@ class IncidentEngine:
                     content=(
                         "Agent 已形成最小只读查询计划，正在自动核对数据库证据。"
                         if decision.status == IncidentStatus.QUERY_REQUIRED
-                        else _user_facing_decision_message(decision)
+                        else format_incident_summary(decision)
                     ),
                 )
             )
@@ -1794,7 +1793,7 @@ class IncidentEngine:
             completion_kind=decision.completion_kind,
             task_state=session.task_state,
             cycle_number=session.cycle_number,
-            message=_user_facing_decision_message(decision),
+            message=format_incident_summary(decision),
             question=decision.question,
             page=decision.page,
             diagnosis=decision.diagnosis,
@@ -1882,8 +1881,8 @@ invent current code or database facts, or expose hidden reasoning.
 
 Return status `answer` when the user is asking for an explanation, clarification, implications, or
 solution that is already supported by the previous evidence. Give a concise final conclusion in
-`message`, explain why in `diagnosis`, include concrete safe actions when useful, and preserve the
-previous confidence unless the wording should become more cautious.
+`message`, explain why briefly in `diagnosis`, include 1-3 concrete safe actions when useful, and
+preserve previous confidence unless the wording should become more cautious.
 Correcting unsupported wording without new facts can also use `answer`. Do not promote a prior
 hypothesis to fact or label the connected database's environment without evidence. Keep the
 headline as qualified as the detailed diagnosis.
@@ -1905,7 +1904,7 @@ structured result required by the supplied JSON Schema.
 Return assessment with public reason and gaps; never upgrade previous certainty."""
 
 
-def _user_facing_decision_message(decision: IncidentDecision) -> str:
+def format_incident_summary(decision: IncidentDecision) -> str:
     """按用户要求的调查深度生成完成消息，避免页面定位任务被扩成完整诊断。"""
 
     if decision.status != IncidentStatus.COMPLETED:
@@ -1924,14 +1923,12 @@ def _user_facing_decision_message(decision: IncidentDecision) -> str:
         "当前结论未包含可安全执行的修改方案；请补充缺失的运行证据后继续诊断。"
     ]
     actions = "\n".join(f"{index}. {action}" for index, action in enumerate(recommended_actions, 1))
-    confidence = f"{decision.confidence:.0%}" if decision.confidence is not None else "模型未量化"
-    return (
-        f"结论\n{decision.message}\n\n"
-        f"为什么出现这个异常\n{decision.diagnosis}\n\n"
-        f"解决方法\n{actions}\n\n"
-        f"结论置信度\n{confidence}"
-        + ("\n\n" + assessment_text(decision.assessment) if decision.assessment else "")
-    )
+    summary = decision.message
+    if decision.diagnosis and decision.diagnosis.strip() != summary.strip():
+        summary += f"\n原因：{decision.diagnosis}"
+    if decision.assessment and decision.assessment.missing:
+        summary += "\n待确认：" + "；".join(decision.assessment.missing)
+    return f"异常总结\n{summary}\n\n解决方案\n{actions}"
 
 
 def _source_search_enabled(session: IncidentSession) -> bool:
