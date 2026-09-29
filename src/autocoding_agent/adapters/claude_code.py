@@ -11,6 +11,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 from queue import Empty, Queue
 from tempfile import TemporaryDirectory
@@ -58,6 +59,61 @@ PopenFactory = Callable[..., subprocess.Popen[str]]
 StructuredOutputT = TypeVar("StructuredOutputT", bound=BaseModel)
 logger = logging.getLogger("autocoding_agent.runtime.claude_code")
 _WINDOWS_COMMAND_LINE_LIMIT = 32_767
+
+
+@dataclass
+class _TurnTiming:
+    """记录宿主观测时间，不记录提示词/业务值，不把等待时间当成模型计算时间。"""
+
+    started_at: float
+    launch_ms: int | None = None
+    first_event_ms: int | None = None
+    first_feedback_ms: int | None = None
+    result_ms: int | None = None
+    tool_calls: int = 0
+    _active_tools: set[str] = field(default_factory=set)
+    _seen_tool_ids: set[str] = field(default_factory=set)
+    _tool_start: float | None = None
+    _tool_seconds: float = 0.0
+
+    def mark_event(self, now: float) -> None:
+        if self.first_event_ms is None:
+            self.first_event_ms = self.elapsed(now)
+
+    def record(self, activity: RuntimeActivity, now: float) -> None:
+        if activity.kind in {RuntimeEventKind.ASSISTANT_MESSAGE, RuntimeEventKind.TOOL_STARTED}:
+            if self.first_feedback_ms is None:
+                self.first_feedback_ms = self.elapsed(now)
+        tool_id = activity.tool_use_id
+        if activity.kind == RuntimeEventKind.TOOL_STARTED:
+            if tool_id and tool_id in self._seen_tool_ids:
+                return
+            self.tool_calls += 1
+            if tool_id:
+                self._seen_tool_ids.add(tool_id)
+            if tool_id and tool_id not in self._active_tools:
+                if not self._active_tools:
+                    self._tool_start = now
+                self._active_tools.add(tool_id)
+        elif activity.kind == RuntimeEventKind.TOOL_FINISHED and tool_id in self._active_tools:
+            self._active_tools.remove(tool_id)
+            if not self._active_tools and self._tool_start is not None:
+                self._tool_seconds += max(0.0, now - self._tool_start)
+                self._tool_start = None
+
+    def elapsed(self, now: float) -> int:
+        return max(0, int((now - self.started_at) * 1000))
+
+    def summary(self, now: float) -> dict[str, int | None]:
+        # 并行工具只累计时间区间的并集；被中断的未结束工具计到观测终点。
+        pending = max(0.0, now - self._tool_start) if self._tool_start is not None else 0.0
+        return {
+            "total_ms": self.elapsed(now), "launch_ms": self.launch_ms,
+            "first_event_ms": self.first_event_ms, "first_feedback_ms": self.first_feedback_ms,
+            "result_ms": self.result_ms, "tool_calls": self.tool_calls,
+            "tool_span_ms": int((self._tool_seconds + pending) * 1000),
+            "unfinished_tools": len(self._active_tools),
+        }
 
 
 class ClaudeCodeRuntime:
@@ -135,6 +191,8 @@ class ClaudeCodeRuntime:
         """Execute one prepared streaming invocation while its prompt file remains alive."""
 
         started_at = time.monotonic()
+        timing = _TurnTiming(started_at)
+        timing_status = "failed_or_interrupted"
         logger.info(
             "observed_turn_started session_id=%s run_id=%s mode=%s model=%s resumed=%s "
             "command=%s workspace=%s",
@@ -184,6 +242,7 @@ class ClaudeCodeRuntime:
         if process.stdin is None or process.stdout is None or process.stderr is None:
             self._terminate_process(process)
             raise ClaudeCodeError("Claude Code streaming pipes were not created.")
+        timing.launch_ms = timing.elapsed(time.monotonic())
         with self._active_lock:
             self._active[run_id] = process
             self._interrupted.discard(run_id)
@@ -267,8 +326,10 @@ class ClaudeCodeRuntime:
                     continue
                 if not isinstance(envelope, dict):
                     continue
+                timing.mark_event(time.monotonic())
                 if envelope.get("type") == "result":
                     result_envelope = envelope
+                    timing.result_ms = timing.elapsed(time.monotonic())
                 blocked_search = _search_policy_violation(envelope, search_guard)
                 if blocked_search is not None:
                     violation, blocked_input = blocked_search
@@ -301,6 +362,7 @@ class ClaudeCodeRuntime:
                     workspace=turn.workspace,
                     tool_context=tool_context,
                 ):
+                    timing.record(activity, time.monotonic())
                     event_sink(activity)
 
             returncode = process.wait(timeout=5)
@@ -314,6 +376,7 @@ class ClaudeCodeRuntime:
             if result_envelope is None:
                 raise ClaudeCodeError("Claude Code stream ended without a result envelope.")
             result = _structured_result_from_envelope(result_envelope, response_model)
+            timing_status = "completed"
             logger.info(
                 "observed_turn_completed session_id=%s run_id=%s runtime_session_id=%s "
                 "elapsed_ms=%d",
@@ -324,6 +387,11 @@ class ClaudeCodeRuntime:
             )
             return result
         finally:
+            logger.info(
+                "runtime_timing session_id=%s run_id=%s status=%s metrics=%s",
+                turn.session_id, run_id, timing_status,
+                json.dumps(timing.summary(time.monotonic()), separators=(",", ":")),
+            )
             if process.poll() is None:
                 self._terminate_process(process)
             stdin_thread.join(timeout=1)
@@ -525,7 +593,10 @@ class ClaudeCodeRuntime:
         prompt_path = Path(system_prompt_file)
         if not prompt_path.is_file():
             raise ValueError(f"System prompt file does not exist: {prompt_path}")
-        schema = json.dumps(response_model.model_json_schema(), ensure_ascii=False)
+        # 仅去掉 JSON 空白；描述、约束和字段完全保留，不能以响应速度换契约质量。
+        schema = json.dumps(
+            response_model.model_json_schema(), ensure_ascii=False, separators=(",", ":")
+        )
         command = [
             self.settings.claude_command,
             "-p",

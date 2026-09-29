@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import time
 from pathlib import Path, PureWindowsPath
 from uuid import uuid4
 
@@ -82,6 +84,8 @@ from autocoding_agent.ports.runtime import (
 )
 from autocoding_agent.ports.session_store import SessionStore
 from autocoding_agent.skills import SkillRegistry
+
+logger = logging.getLogger(__name__)
 
 
 class PolicyViolation(RuntimeError):
@@ -1016,6 +1020,7 @@ class AgentEngine:
                     + json.dumps(
                         [item.model_dump(mode="json") for item in results],
                         ensure_ascii=False,
+                        separators=(",", ":"),
                     )
                 )
                 self._record_query_results(session, decision, results)
@@ -1086,7 +1091,20 @@ class AgentEngine:
             raise PolicyViolation(
                 f"The task exceeded {self.max_query_rounds} database query rounds."
             )
-        return [self.database.execute(query) for query in decision.queries]
+        results = []
+        for index, query in enumerate(decision.queries):
+            started_at = time.monotonic()
+            status = "failed"
+            try:
+                results.append(self.database.execute(query))
+                status = "completed"
+            finally:
+                logger.info(
+                    "database_query_timing session_id=%s workflow=development query_index=%d "
+                    "status=%s elapsed_ms=%d", session.id, index, status,
+                    max(0, int((time.monotonic() - started_at) * 1000)),
+                )
+        return results
 
     def _try_record_post_implementation(
         self,

@@ -388,7 +388,8 @@ def test_development_flow_can_use_shared_read_only_database(tmp_path: Path) -> N
     assert "Never ask the user to run SQL" in " ".join(
         runtime.turns[0].system_prompt.split()
     )
-    assert '"status": "stuck"' in runtime.turns[1].user_message
+    query_payload = json.loads(runtime.turns[1].user_message.rsplit("\n\n", 1)[1])
+    assert query_payload[0]["rows"] == [{"id": 42, "status": "stuck"}]
     session = app.get_session(outcome.session_id)
     assert session.database_reference == reference
     assert '"status":"stuck"' not in session.model_dump_json()

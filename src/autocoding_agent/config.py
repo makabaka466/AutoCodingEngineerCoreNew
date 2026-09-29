@@ -91,6 +91,10 @@ class Settings(BaseSettings):
     claude_command: str = Field(default_factory=_default_claude_command)
     claude_model: str = "deepseek-v4-pro"
     claude_timeout_seconds: int = Field(default=600, ge=10)
+    compact_phase_prompts: bool = Field(
+        default=True,
+        description="按已授权阶段筛选提示词；关闭可回退到完整规则，权限和证据校验不变。",
+    )
     max_budget_usd: float | None = Field(default=None, gt=0)
     hermes_skills_enabled: bool = True
     hermes_command: str = Field(default_factory=_default_hermes_command)

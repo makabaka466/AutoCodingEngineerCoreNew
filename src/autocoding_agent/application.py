@@ -231,7 +231,7 @@ def build_application(
             configured.data_dir,
             knowledge_root=PROJECT_KNOWLEDGE_ROOT / "development",
         ),
-        skills=SkillRegistry(),
+        skills=SkillRegistry(compact_phase_prompts=configured.compact_phase_prompts),
         policy=ExecutionPolicy(),
         model=configured.claude_model,
         state_machine=state_machine,

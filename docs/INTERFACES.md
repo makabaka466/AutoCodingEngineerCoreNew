@@ -1,6 +1,6 @@
 # AutoCoding Engineer 接口与数据契约
 
-本文记录当前 `0.9.0` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
+本文记录当前 `0.9.1` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
 Runtime、持久化和状态契约。
 设计动机和运行流程见[架构说明](ARCHITECTURE.md)。
 
@@ -1300,3 +1300,32 @@ ProgressEvent 新增可空 assessment_summary；active=False 表示当前没有�
 
 无新增诊断写权限或 CLI 自动交接命令；桌面入口复用开发应用。修复历史归属开发列表并标识来源，
 异常诊断历史保持可查。现有数据库读取、审计、状态、恢复和审批 API 保持原行为。
+
+
+## 20. 阶段精简与耗时日志（0.9.1）
+
+Settings.compact_phase_prompts 默认 true，对应 AUTO_CODING_COMPACT_PHASE_PROMPTS。关闭并重启
+可恢复完整内置方法和异常调查说明；该设置不控制工具权限、审批条件、证据等级或查询预算。
+SkillRegistry 接受同名 keyword-only 参数。IncidentEngine 新增同名可选参数，默认 true；公共
+应用构建器从 Settings 传入。未知自定义工作方法继续发送，外部自定义方法目录整套保留。
+
+run/outcome/session 等公共结果字段未改变。JSON Schema 仅用紧凑 separators 序列化，所有字段、
+类型、描述、约束和默认值均保留；数据库结果的输入 JSON 也仅移除空白。
+
+observed CLI 日志 runtime_timing 的 metrics 包含：
+
+| 字段 | 含义 |
+| --- | --- |
+| total_ms | 从启动调用至生成日志摘要的宿主观测时间，不包含摘要后清理 |
+| launch_ms | Popen 创建返回耗时，不代表 CLI 完成初始化或服务端开始推理 |
+| first_event_ms | 首个可解析的 stream-json 对象到达时间；缺失为 null |
+| first_feedback_ms | 首次观测到助手文本或工具开始事件的时间，不代表 UI 首次绘制 |
+| result_ms | 最终结果 envelope 到达时间，后续仍可能被契约校验拒绝 |
+| tool_calls | 工具开始事件数量，具有相同工具 ID 的重复事件去重 |
+| tool_span_ms | 已观测工具开始/结束区间并集；未结束工具计到摘要时刻 |
+| unfinished_tools | 尚未观测到结束的工具 ID 数量 |
+
+status=completed 只表示本次 Runtime 结果通过解析，不能证明业务已修复；失败与中断标记
+failed_or_interrupted。无活动保持 null，不能把未观测到活动解释为零等待或快速成功。
+数据库日志 database_query_timing 记录 session_id、workflow、query_index、status、elapsed_ms；
+异常额外记录语义 stage。SQL、查询参数、业务行与模型文本不进入这些性能日志。

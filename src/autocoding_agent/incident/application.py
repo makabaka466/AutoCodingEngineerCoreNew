@@ -162,6 +162,7 @@ def build_incident_application(
         max_page_query_rounds=configured.incident_max_page_query_rounds,
         max_business_query_rounds=configured.incident_max_business_query_rounds,
         max_query_repair_rounds=configured.incident_max_query_repair_rounds,
+        compact_phase_prompts=configured.compact_phase_prompts,
         database_reference=selected_reference,
         capabilities=IncidentCapabilityStore(
             configured.data_dir,

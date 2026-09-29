@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import time
 from pathlib import Path, PureWindowsPath
 from uuid import uuid4
 
@@ -88,6 +90,9 @@ _PAGE_IDENTITY_TOOLS = ["Read"]
 _SOURCE_INVESTIGATION_TOOLS = ["Read", "Glob", "Grep"]
 
 
+logger = logging.getLogger(__name__)
+
+
 class IncidentEngine:
     """编排一段只读、以证据为基础的异常处理对话。
 
@@ -120,6 +125,7 @@ class IncidentEngine:
         hermes_skills: HermesSkillService | None = None,
         artifact_recorder: ArtifactRecorder | None = None,
         max_hermes_skill_rounds: int = 1,
+        compact_phase_prompts: bool = True,
     ) -> None:
         if max_page_query_rounds < 1 or max_page_query_rounds > 5:
             raise ValueError("max_page_query_rounds must be between 1 and 5")
@@ -149,6 +155,7 @@ class IncidentEngine:
         self.artifact_recorder = artifact_recorder
         self.hermes = HermesConsultationCoordinator(hermes_skills, artifact_recorder)
         self.max_hermes_skill_rounds = max_hermes_skill_rounds
+        self.compact_phase_prompts = compact_phase_prompts
 
     def start(
         self,
@@ -506,6 +513,7 @@ class IncidentEngine:
         consecutive_search_repair_rounds = 0
         page_correction_used = False
         budget_closure_requested = False
+        first_investigation_turn = True
 
         # 第 3 步：每次循环对应一个可持久化的 Runtime Run。SQL/Hermes 证据可以触发
         # 下一次模型调用，但每个调用边界都可以审计和回放。
@@ -634,7 +642,9 @@ class IncidentEngine:
                         command.id,
                         progress_sink,
                         [item.path for item in attachments],
+                        allow_compact=not first_investigation_turn,
                     )
+                    first_investigation_turn = False
                     decision, page_repaired = self._restore_verified_page(session, decision)
                 if budget_closure_requested and decision.status == IncidentStatus.QUERY_REQUIRED:
                     # 已给过模型一次总结机会；重复请求 SQL 时保留缺口并等待补充，不丢弃调查。
@@ -1095,8 +1105,19 @@ class IncidentEngine:
             )
             results: list[QueryResult] = []
             try:
-                for query in decision.queries:
-                    results.append(self.database.execute(query))
+                for index, query in enumerate(decision.queries):
+                    started_at = time.monotonic()
+                    status = "failed"
+                    try:
+                        results.append(self.database.execute(query))
+                        status = "completed"
+                    finally:
+                        logger.info(
+                            "database_query_timing session_id=%s workflow=incident stage=%s "
+                            "query_index=%d status=%s elapsed_ms=%d", session.id,
+                            query_stage.value, index, status,
+                            max(0, int((time.monotonic() - started_at) * 1000)),
+                        )
             except Exception as exc:
                 detail = " ".join(str(exc).split())[:800]
                 session.query_repair_rounds += 1
@@ -1189,6 +1210,7 @@ class IncidentEngine:
                 + json.dumps(
                     [result.model_dump(mode="json") for result in results],
                     ensure_ascii=False,
+                    separators=(",", ":"),
                 )
             )
             self.state_machine.transition(
@@ -1410,6 +1432,8 @@ class IncidentEngine:
         command_id: str | None = None,
         progress_sink: ProgressSink | None = None,
         attachment_paths: list[str] | None = None,
+        *,
+        allow_compact: bool = False,
     ) -> tuple[IncidentDecision, AgentUsage]:
         database_context = compact_database_context(
             configured=self.database is not None,
@@ -1425,6 +1449,22 @@ class IncidentEngine:
             session.runtime_session_id = session.id
             self.sessions.save(session)
         source_search_enabled = _source_search_enabled(session)
+        # 新命令首轮始终保留完整规则。仅当前轮次页面已绑定、业务查询成功后省略定位细节。
+        prompt_profile = "full"
+        if (
+            self.compact_phase_prompts and allow_compact
+            and session.located_page is not None
+            and session.located_page.source_paths
+            and not session.located_page.unresolved_conflicts
+            and any(
+                observation.stage == IncidentQueryStage.BUSINESS_DATA.value
+                and observation.status == QueryObservationStatus.SUCCEEDED
+                for observation in session.query_observations[
+                    session.cycle_query_observation_start :
+                ]
+            )
+        ):
+            prompt_profile = "diagnosis"
         tools = _SOURCE_INVESTIGATION_TOOLS if source_search_enabled else _PAGE_IDENTITY_TOOLS
         turn = RuntimeTurn(
             session_id=session.id,
@@ -1441,6 +1481,7 @@ class IncidentEngine:
                 knowledge_context,
                 self.hermes.catalog_prompt(),
                 source_search_enabled,
+                prompt_profile=prompt_profile,
             ),
             tools=list(tools),
             allowed_tools=list(tools),
@@ -1819,6 +1860,8 @@ def _system_prompt(
     knowledge_context: str = "",
     hermes_catalog: str = "Hermes engineering skills are unavailable for this run.",
     source_search_enabled: bool = False,
+    *,
+    prompt_profile: str = "full",
 ) -> str:
     selected_project = (
         f"The user selected the knowledge project {project!r}. Use only its Markdown linked from "
@@ -1839,7 +1882,7 @@ def _system_prompt(
         if knowledge_context
         else ""
     )
-    workflow_rules = load_incident_workflow_rules()
+    workflow_rules = load_incident_workflow_rules(prompt_profile)
     source_search_note = (
         "A page-mapping candidate or verified page unlocks Read/Glob/Grep; verify source identity."
         if source_search_enabled

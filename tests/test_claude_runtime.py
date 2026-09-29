@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -17,6 +18,7 @@ from autocoding_agent.adapters.claude_code import (
     ClaudeCodeRuntime,
     _command_line_chars,
     _stream_activities,
+    _TurnTiming,
     _validate_command_line_length,
 )
 from autocoding_agent.config import Settings
@@ -436,7 +438,13 @@ def test_runtime_error_redacts_provider_credentials(tmp_path: Path) -> None:
     assert "[REDACTED]" in str(error.value)
 
 
-def test_observed_runtime_parses_sanitized_tool_lifecycle(tmp_path: Path) -> None:
+def test_observed_runtime_parses_sanitized_tool_lifecycle(
+    tmp_path: Path, caplog, monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "autocoding_agent.adapters.claude_code.logger", logging.getLogger("tests.runtime_timing")
+    )
+    caplog.set_level(logging.INFO, logger="tests.runtime_timing")
     secret = "sk-1234567890abcdefghijkl"
     stream = [
         {"type": "system", "subtype": "init", "model": "deepseek-test"},
@@ -511,6 +519,12 @@ def test_observed_runtime_parses_sanitized_tool_lifecycle(tmp_path: Path) -> Non
     prompt_path = captured["prompt_path"]
     assert isinstance(prompt_path, Path)
     assert not prompt_path.exists()
+    record = next(item for item in caplog.records if item.message.startswith("runtime_timing "))
+    metrics = json.loads(record.message.split("metrics=", 1)[1])
+    assert metrics["tool_calls"] == 1 and metrics["unfinished_tools"] == 0
+    assert 0 <= metrics["launch_ms"] <= metrics["total_ms"]
+    assert 0 <= metrics["first_feedback_ms"] <= metrics["result_ms"] <= metrics["total_ms"]
+    assert secret not in record.message and "SYSTEM PROMPT" not in record.message
 
 
 def test_observed_runtime_supports_incident_structured_contract(tmp_path: Path) -> None:
@@ -623,3 +637,70 @@ def test_observed_runtime_can_be_interrupted(tmp_path: Path) -> None:
 
     assert not worker.is_alive()
     assert errors and "interrupted" in str(errors[0]).casefold()
+
+
+
+def test_runtime_timing_counts_overlapping_tools_once_and_preserves_missing_feedback():
+    from autocoding_agent.core.runtime.models import RuntimeActivity
+
+    timing = _TurnTiming(0.0)
+    timing.mark_event(0.5)
+    timing.record(RuntimeActivity(
+        run_id="run", kind=RuntimeEventKind.TOOL_STARTED, summary="Read", tool_use_id="a",
+    ), 1.0)
+    timing.record(RuntimeActivity(
+        run_id="run", kind=RuntimeEventKind.TOOL_STARTED, summary="Read", tool_use_id="b",
+    ), 2.0)
+    timing.record(RuntimeActivity(
+        run_id="run", kind=RuntimeEventKind.TOOL_FINISHED, summary="Read", tool_use_id="a",
+    ), 4.0)
+    timing.record(RuntimeActivity(
+        run_id="run", kind=RuntimeEventKind.TOOL_FINISHED, summary="Read", tool_use_id="b",
+    ), 6.0)
+    timing.record(RuntimeActivity(
+        run_id="run", kind=RuntimeEventKind.TOOL_STARTED, summary="duplicate", tool_use_id="a",
+    ), 7.0)
+    metrics = timing.summary(8.0)
+    assert metrics["tool_span_ms"] == 5000
+    assert metrics["total_ms"] == 8000
+    assert metrics["tool_calls"] == 2
+    assert metrics["first_feedback_ms"] == 1000
+    assert metrics["unfinished_tools"] == 0
+    empty = _TurnTiming(0.0).summary(5.0)
+    assert empty["first_feedback_ms"] is None and empty["first_event_ms"] is None
+
+
+def test_runtime_timing_records_unfinished_tool_span_on_failure():
+    from autocoding_agent.core.runtime.models import RuntimeActivity
+
+    timing = _TurnTiming(0.0)
+    timing.record(RuntimeActivity(
+        run_id="run", kind=RuntimeEventKind.TOOL_STARTED, summary="Read", tool_use_id="a",
+    ), 1.0)
+    metrics = timing.summary(3.0)
+    assert metrics["tool_span_ms"] == 2000 and metrics["unfinished_tools"] == 1
+    assert metrics["result_ms"] is None
+
+
+def test_failed_observed_turn_still_logs_timing_without_a_fake_first_response(
+    tmp_path: Path, caplog, monkeypatch,
+):
+    monkeypatch.setattr(
+        "autocoding_agent.adapters.claude_code.logger", logging.getLogger("tests.failed_timing")
+    )
+    caplog.set_level(logging.INFO, logger="tests.failed_timing")
+    envelope = {"type": "result", "session_id": "failed-runtime", "structured_output": {}}
+    script = f"print({json.dumps(json.dumps(envelope))}, flush=True)"
+
+    def popen_factory(command, **kwargs):
+        return subprocess.Popen([sys.executable, "-c", script], **kwargs)
+
+    runtime = ClaudeCodeRuntime(_settings(tmp_path), popen_factory=popen_factory)
+    with pytest.raises(ClaudeCodeError):
+        runtime.run_observed(_turn(tmp_path), "failed-run", lambda event: None)
+    record = next(item for item in caplog.records if item.message.startswith("runtime_timing "))
+    metrics = json.loads(record.message.split("metrics=", 1)[1])
+    assert "status=failed_or_interrupted" in record.message
+    assert metrics["first_feedback_ms"] is None
+    assert metrics["result_ms"] is not None
+    assert metrics["tool_calls"] == 0

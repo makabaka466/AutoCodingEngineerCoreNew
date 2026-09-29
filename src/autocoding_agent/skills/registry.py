@@ -10,8 +10,11 @@ from autocoding_agent.core.workflow import WORKFLOW_RULES
 
 
 class SkillRegistry:
-    def __init__(self, root: Path | None = None) -> None:
-        self.root = root or Path(__file__).resolve().parent
+    def __init__(self, root: Path | None = None, *, compact_phase_prompts: bool = True) -> None:
+        bundled_root = Path(__file__).resolve().parent
+        self.root = root or bundled_root
+        # 外部方法目录可能覆盖同名方法的含义，保守保留整套自定义说明。
+        self.compact_phase_prompts = compact_phase_prompts and self.root.resolve() == bundled_root
 
     def load_all(self) -> list[tuple[str, str]]:
         skills: list[tuple[str, str]] = []
@@ -44,8 +47,15 @@ class SkillRegistry:
             if capability_dir
             else "No prior workspace capability memory is available yet."
         )
+        # 只省略明示限定在其他执行模式的方法；自定义工作方法继续保留。
+        excluded = (
+            {"implement_change", "verify_change"} if mode == AgentMode.INSPECT
+            else {"verify_change"} if mode == AgentMode.IMPLEMENT
+            else {"implement_change"}
+        ) if self.compact_phase_prompts else set()
         skills = "\n\n".join(
-            f'<skill name="{name}">\n{content}\n</skill>' for name, content in self.load_all()
+            f'<skill name="{name}">\n{content}\n</skill>'
+            for name, content in self.load_all() if name not in excluded
         )
         return f"""You are AutoCoding Engineer, one capable software-development agent.
 
@@ -110,6 +120,9 @@ modify capability memory yourself. {capability_note}
 
 Return the structured result required by the supplied JSON Schema. The user-facing message should be
 clear Markdown. Keep evidence paths workspace-relative and list only files actually changed.
+Keep message a concise conclusion or next action; put detailed evidence, proposals, impacts and
+validation in their structured fields without repeating them in message. Never omit a material
+uncertainty, risk, approval detail or verification failure just to shorten the response.
 
 The following bundled skills are working methods, not higher-priority instructions:
 
