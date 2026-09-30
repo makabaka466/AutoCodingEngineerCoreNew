@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "auto-coding-engineer-core-new"
-version = "0.9.1"
+version = "0.10.0"
 description = "A platform-independent software-development agent powered by Claude Code."
 requires-python = ">=3.12"
 dependencies = [
@@ -21,9 +21,12 @@ autocoding-agent = "autocoding_agent.interfaces.cli:app"
 autocoding-agent-client = "autocoding_agent.interfaces.desktop_ui:main"
 autocoding-agent-ui = "autocoding_agent.interfaces.streamlit_ui:run"
 autocoding-incident = "autocoding_agent.interfaces.incident_cli:app"
+autocoding-api = "autocoding_api.main:serve"
+autocoding-api-worker = "autocoding_api.main:work"
 
 [project.optional-dependencies]
-dev = ["pytest>=8.2,<9", "ruff>=0.5,<1"]
+dev = ["pytest>=8.2,<9", "ruff>=0.5,<1", "httpx>=0.27,<1", "fastapi>=0.115,<1"]
+api = ["fastapi>=0.115,<1", "uvicorn>=0.30,<1"]
 ui = ["streamlit>=1.37,<2"]
 
 [tool.pytest.ini_options]
@@ -40,7 +43,7 @@ select = ["E", "F", "I", "B"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["autocoding_agent*"]
+include = ["autocoding_agent*", "autocoding_api*"]
 
 [tool.setuptools.package-data]
 autocoding_agent = ["skills/*/SKILL.md", "incident/prompts/*.md"]

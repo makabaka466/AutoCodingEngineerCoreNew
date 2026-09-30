@@ -1,8 +1,17 @@
 # AutoCoding Engineer 接口与数据契约
 
-本文记录当前 `0.9.1` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
+本文记录当前 `0.10.0` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
 Runtime、持久化和状态契约。
 设计动机和运行流程见[架构说明](ARCHITECTURE.md)。
+新增独立 HTTP 路由、队列状态和 PowerShell 示例见[HTTP API](API.md)。
+
+HTTP 入口 `autocoding-api` 与执行入口 `autocoding-api-worker` 属于独立的
+`autocoding_api` 包。前者支持 `POST /v1/tasks`、`POST /v1/tasks/{id}/messages`、
+`POST /v1/tasks/{id}/resume`、`GET /v1/tasks/{id}`、`GET /v1/jobs/{id}`、
+`GET /v1/projects`、`GET /healthz` 和 `GET /readyz`。业务请求由 Bearer Token 认证；
+POST 必带 Idempotency-Key。任务结果的 `version` 用于消息的并发校验；操作的状态与领域
+`TaskState` 不混用。请求体禁止传服务器路径，开发/异常原有应用门面只有新增的可选
+`session_id` 参数用于队列预分配会话 ID。
 
 ## 1. 公共 Python API
 

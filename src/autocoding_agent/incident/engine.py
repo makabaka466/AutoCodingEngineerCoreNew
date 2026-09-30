@@ -163,6 +163,7 @@ class IncidentEngine:
         problem: str,
         page_hint: str | None = None,
         *,
+        session_id: str | None = None,
         project: str | None = None,
         source: str = "manual",
         external_reference: str | None = None,
@@ -175,6 +176,7 @@ class IncidentEngine:
         if not problem.strip():
             raise ValueError("Problem description cannot be empty.")
         session = IncidentSession(
+            id=session_id or str(uuid4()),
             workspace=str(canonical),
             problem=problem.strip(),
             project=project.strip() if project and project.strip() else None,

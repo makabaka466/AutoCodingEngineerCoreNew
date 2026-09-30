@@ -172,6 +172,7 @@ class AgentEngine:
         project: str | None = None,
         *,
         source_incident_key: str | None = None,
+        session_id: str | None = None,
         progress_sink: ProgressSink | None = None,
     ) -> AgentOutcome:
         canonical = Path(workspace).expanduser().resolve(strict=True)
@@ -180,6 +181,7 @@ class AgentEngine:
         if not message.strip():
             raise ValueError("Task message cannot be empty.")
         session = AgentSession(
+            id=session_id or str(uuid4()),
             workspace=str(canonical),
             goal=message.strip(),
             project=project.strip() if project and project.strip() else None,

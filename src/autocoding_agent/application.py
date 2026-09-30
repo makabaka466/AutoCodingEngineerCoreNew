@@ -104,12 +104,14 @@ class AgentApplication:
         message: str,
         project: str | None = None,
         *,
+        session_id: str | None = None,
         progress_sink: ProgressSink | None = None,
     ) -> AgentOutcome:
         return self._engine.start(
             workspace,
             message,
             project,
+            session_id=session_id,
             progress_sink=progress_sink,
         )
 

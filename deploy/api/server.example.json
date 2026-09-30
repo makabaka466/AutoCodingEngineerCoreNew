@@ -1,0 +1,15 @@
+{
+  "data_dir": "D:\\AgentData",
+  "projects": {
+    "demo": {
+      "workspace": "D:\\AgentProjects\\demo",
+      "knowledge_project": null
+    }
+  },
+  "users": {
+    "operator": {
+      "token": "REPLACE_WITH_A_RANDOM_TOKEN_OF_AT_LEAST_32_CHARACTERS",
+      "projects": ["demo"]
+    }
+  }
+}
