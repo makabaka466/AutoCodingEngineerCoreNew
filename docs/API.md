@@ -1,10 +1,10 @@
-# HTTP API：独立接口与可靠执行（0.10.0）
+# HTTP API：独立接口与远程交互（0.11.0）
 
 `src/autocoding_api/` 是独立交付层，HTTP 和执行进程分别运行；二者只调用现有
 `AgentApplication` / `IncidentApplication`。任务首先持久化到
 `<data_dir>/api/queue.sqlite3`，领域会话仍保存到既有 runtime SQLite。API 进程只读领域会话，不构建
-Runtime 或执行恢复扫描。当前版本支持创建开发与异常诊断任务、追加普通消息、查询任务/操作，
-以及显式只读恢复；不开放代码修改/验证审批接口。需要审批的开发任务会停在原有等待审批状态。
+Runtime 或执行恢复扫描。当前版本支持创建开发与异常诊断任务、追加普通消息、查询任务/操作、
+显式只读恢复、按游标查询进度、手动进入异常处理，以及对已审阅方案批准或拒绝。
 
 ## 本机启动
 
@@ -72,6 +72,69 @@ $nextJob = Invoke-RestMethod -Method Post -Uri "$apiBase/v1/tasks/$($job.task_id
 `GET /v1/projects` 查看当前 Token 可访问的项目 ID。服务自动生成 OpenAPI 文档：
 `http://127.0.0.1:8000/docs`，可在浏览器中先使用 `Authorize` 输入 Token 再试调接口。
 
+## 诊断后手动进入异常处理
+
+只有诊断任务的 `can_remediate=true` 时才显示入口。诊断结果、原因和解决方向可从 `summary`
+及 `result` 读取。用户决定进入后，把当前 `version`、`cycle_number` 原样提交：
+
+```powershell
+$task = Invoke-RestMethod -Uri "$apiBase/v1/tasks/$($job.task_id)" -Headers $headers
+$handoffHeaders = @{ Authorization = "Bearer $apiToken"; 'Idempotency-Key' = [guid]::NewGuid().ToString() }
+$handoffBody = @{ expected_version = $task.version; cycle_number = $task.cycle_number } | ConvertTo-Json
+$repairJob = Invoke-RestMethod -Method Post -Uri "$apiBase/v1/tasks/$($job.task_id)/remediation" -Headers $handoffHeaders -ContentType 'application/json' -Body $handoffBody
+```
+
+返回的是新的**开发任务** `task_id`；原诊断任务仍独立保留。同一诊断轮次重复进入会复用该修复
+任务。Worker 先只读核对证据并生成方案，不会因为调用此接口就修改文件。
+
+## 审阅、批准或拒绝方案
+
+修复操作结束后查询新任务。`state=waiting_modify_approval` 时，先把
+`pending_approval.proposal` 完整展示给用户，包括逐项路径、涉及功能、当前行为、修改后行为、
+目标效果、影响与风险、验证计划。只有用户明确确认后才能提交批准请求：
+
+```powershell
+$repair = Invoke-RestMethod -Uri "$apiBase/v1/tasks/$($repairJob.task_id)" -Headers $headers
+$repair.pending_approval.proposal | ConvertTo-Json -Depth 12
+$approveHeaders = @{ Authorization = "Bearer $apiToken"; 'Idempotency-Key' = [guid]::NewGuid().ToString() }
+$approvalBody = @{
+    expected_version = $repair.version
+    approval_id = $repair.pending_approval.approval_id
+    scope = $repair.pending_approval.scope
+} | ConvertTo-Json
+$approvedJob = Invoke-RestMethod -Method Post -Uri "$apiBase/v1/tasks/$($repairJob.task_id)/approve" -Headers $approveHeaders -ContentType 'application/json' -Body $approvalBody
+```
+
+`scope=modify` 只授权当前方案中的修改。完成后如果状态变为
+`waiting_verify_approval`，要**重新查询任务、审阅验证动作，再用新的** `version`、
+`approval_id`、`scope=verify` 调同一批准接口。不能沿用旧方案标识。
+
+若用户拒绝方案，使用相同版本、方案标识与范围调用 `/reject`，可补充原因；任务会回到只读
+调查和说明，不会执行被拒绝的写操作：
+
+```powershell
+$rejectBody = @{
+    expected_version = $repair.version
+    approval_id = $repair.pending_approval.approval_id
+    scope = $repair.pending_approval.scope
+    reason = '先不要修改代码，请补充风险说明'
+} | ConvertTo-Json
+$rejectedJob = Invoke-RestMethod -Method Post -Uri "$apiBase/v1/tasks/$($repairJob.task_id)/reject" -Headers $approveHeaders -ContentType 'application/json' -Body $rejectBody
+```
+
+普通 `/messages` 请求即使内容写了“同意”，也只作为用户消息进入只读分析，不能批准修改。
+批准/拒绝在入队和执行前都检查版本、范围和方案标识；不符返回 409。重复提交相同请求时沿用
+原 `Idempotency-Key`，查看原操作结果，不会执行第二次。
+
+## 轮询进度
+
+`GET /v1/tasks/{task_id}/events?after=0&limit=100` 返回该任务自己的持久化事件及
+`next_cursor`。后续请求把游标放入 `after`；客户端重连后沿用最后一个游标即可继续读取。
+事件种类包括 `job_queued`、`job_started`、`progress`、`job_finished`；`progress.data`
+包含安全阶段标签、活动标志等，不提供模型推理过程、原始工具输出或原始业务数据。
+客户端在操作为 `queued` 或 `running` 时显示加载动画；等待输入或审批时依任务状态显示具体
+操作按钮。当前使用轮询，钉钉对接可由服务端适配层按此接口读取。
+
 ## 状态和可靠性边界
 
 | 操作状态 | 含义 | 客户端动作 |
@@ -82,7 +145,8 @@ $nextJob = Invoke-RestMethod -Method Post -Uri "$apiBase/v1/tasks/$($job.task_id
 | `failed` | 操作未成功接受，未自动重试 | 查看任务后换新幂等键重试适用操作 |
 | `recovery_required` | 领取后中断或执行异常；禁止自动重放 | 查询任务，再调用 `/resume` 显式只读恢复 |
 
-查询任务返回 `state`、`version`、`summary`、`result`、最近 100 条非系统消息及最新操作。
+查询任务返回 `state`、`version`、`cycle_number`、`summary`、`result`、
+`pending_approval`、`can_remediate`、最近 100 条非系统消息及最新操作。
 追加消息必须提交刚读到的 `expected_version`。版本变化返回 409，重新查询并判断是否仍应发送。
 任务和操作只允许原 Token 对应的用户读取，且用户需仍有项目访问权。配置撤销后未执行的
 操作也会在 Worker 阶段再次检查。普通消息永远不会替代修改审批。
@@ -97,5 +161,6 @@ $recoveryJob = Invoke-RestMethod -Method Post -Uri "$apiBase/v1/tasks/$($job.tas
 ```
 
 排队中断之前尚未被领取的操作仍会在 Worker 重启后执行。修改过程如果中断，既有引擎的
-恢复规则继续适用；服务不会自动重放写操作。本版还没有正式的系统服务安装脚本、钉钉对接、
-事件流或远程审批接口；当前接口适合先完成可控的提交、对话和查询联调。
+恢复规则继续适用；服务不会自动重放写操作。若审批的领域命令回执已落盘而队列尚未确认，
+Worker 重启会识别回执并补齐队列结果，不会重新执行该审批。本版没有正式的系统服务安装脚本、
+开机自启、外部 HTTPS 入口或钉钉适配层；这些属于下一阶段的常驻部署。

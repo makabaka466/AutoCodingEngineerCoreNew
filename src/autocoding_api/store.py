@@ -45,9 +45,24 @@ class QueueStore:
                     UNIQUE(owner, key)
                 );
                 CREATE INDEX IF NOT EXISTS jobs_task ON jobs(task_id);
+                CREATE TABLE IF NOT EXISTS job_key_aliases (
+                    owner TEXT NOT NULL, key TEXT NOT NULL, fingerprint TEXT NOT NULL,
+                    job_id TEXT NOT NULL REFERENCES jobs(id), PRIMARY KEY(owner, key)
+                );
                 CREATE TABLE IF NOT EXISTS service_state (
                     name TEXT PRIMARY KEY, updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS task_bindings (
+                    task_id TEXT PRIMARY KEY REFERENCES api_tasks(id),
+                    session_id TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS api_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT NOT NULL REFERENCES api_tasks(id),
+                    job_id TEXT NOT NULL REFERENCES jobs(id),
+                    kind TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS api_events_task ON api_events(task_id, id);
             """)
 
     def connect(self) -> sqlite3.Connection:
@@ -74,20 +89,43 @@ class QueueStore:
         intent = json.dumps([operation, task_id, payload], sort_keys=True, ensure_ascii=False)
         fingerprint = hashlib.sha256(intent.encode()).hexdigest()
         with self.transaction() as db:
-            old = db.execute(
-                "SELECT * FROM jobs WHERE owner=? AND key=?", (owner, key)
-            ).fetchone()
+            old, saved_fingerprint = self._by_key(db, owner, key)
             if old:
-                if old["fingerprint"] != fingerprint:
+                if saved_fingerprint != fingerprint:
                     raise ApiError(409, "此幂等键已用于另一操作，请使用新键")
                 return self.public_job(dict(old))
             if task is not None:
-                task_id = str(uuid4())
-                db.execute(
-                    "INSERT INTO api_tasks VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (task_id, owner, task["workflow"], task["project_id"],
-                     task["workspace"], task.get("knowledge_project"), now()),
-                )
+                task_id = task_id or str(uuid4())
+                existing = db.execute(
+                    "SELECT * FROM api_tasks WHERE id=?", (task_id,)
+                ).fetchone()
+                if existing:
+                    if operation != "remediate" or any(
+                        existing[field] != value for field, value in {
+                            "owner": owner, "workflow": task["workflow"],
+                            "project_id": task["project_id"], "workspace": task["workspace"],
+                            "knowledge_project": task.get("knowledge_project"),
+                        }.items()
+                    ):
+                        raise ApiError(409, "异常处理任务身份或项目配置不一致")
+                    prior = db.execute(
+                        "SELECT * FROM jobs WHERE task_id=? AND operation='remediate' "
+                        "ORDER BY rowid DESC LIMIT 1", (task_id,)
+                    ).fetchone()
+                    if prior and prior["status"] != "failed":
+                        if json.loads(prior["payload"]) != payload:
+                            raise ApiError(409, "同一诊断轮次已有基于另一版本的异常处理任务")
+                        db.execute(
+                            "INSERT INTO job_key_aliases(owner, key, fingerprint, job_id) "
+                            "VALUES (?, ?, ?, ?)", (owner, key, fingerprint, prior["id"]),
+                        )
+                        return self.public_job(dict(prior))
+                else:
+                    db.execute(
+                        "INSERT INTO api_tasks VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (task_id, owner, task["workflow"], task["project_id"],
+                         task["workspace"], task.get("knowledge_project"), now()),
+                    )
             else:
                 self._task(db, task_id, owner)
                 latest = db.execute(
@@ -105,6 +143,7 @@ class QueueStore:
                 (job_id, task_id, owner, key, fingerprint, operation,
                  json.dumps(payload, ensure_ascii=False), stamp, stamp),
             )
+            self._event(db, task_id, job_id, "job_queued", {"status": "queued"})
             return self.public_job(dict(db.execute(
                 "SELECT * FROM jobs WHERE id=?", (job_id,)
             ).fetchone()))
@@ -112,15 +151,29 @@ class QueueStore:
     def replay(self, owner: str, key: str, operation: str, task_id: str, payload: dict):
         """在读取已变化的领域版本之前处理重试，避免把合法重试误判为过期输入。"""
         with closing(self.connect()) as db:
-            old = db.execute(
-                "SELECT * FROM jobs WHERE owner=? AND key=?", (owner, key)
-            ).fetchone()
+            old, saved_fingerprint = self._by_key(db, owner, key)
         if old is None:
             return None
         intent = json.dumps([operation, task_id, payload], sort_keys=True, ensure_ascii=False)
-        if old["fingerprint"] != hashlib.sha256(intent.encode()).hexdigest():
+        if saved_fingerprint != hashlib.sha256(intent.encode()).hexdigest():
             raise ApiError(409, "此幂等键已用于另一操作，请使用新键")
         return self.public_job(dict(old))
+
+    @staticmethod
+    def _by_key(db, owner: str, key: str):
+        row = db.execute(
+            "SELECT * FROM jobs WHERE owner=? AND key=?", (owner, key)
+        ).fetchone()
+        if row:
+            return row, row["fingerprint"]
+        alias = db.execute(
+            "SELECT job_id, fingerprint FROM job_key_aliases WHERE owner=? AND key=?",
+            (owner, key),
+        ).fetchone()
+        if alias:
+            row = db.execute("SELECT * FROM jobs WHERE id=?", (alias["job_id"],)).fetchone()
+            return row, alias["fingerprint"]
+        return None, None
 
     @staticmethod
     def _task(db, task_id: str | None, owner: str) -> dict:
@@ -134,6 +187,27 @@ class QueueStore:
     def task(self, task_id: str, owner: str) -> dict:
         with closing(self.connect()) as db:
             return self._task(db, task_id, owner)
+
+    def domain_id(self, task_id: str) -> str:
+        with closing(self.connect()) as db:
+            row = db.execute(
+                "SELECT session_id FROM task_bindings WHERE task_id=?", (task_id,)
+            ).fetchone()
+        return row[0] if row else task_id
+
+    def bind_domain(self, task_id: str, session_id: str) -> None:
+        if task_id == session_id:
+            return
+        with self.transaction() as db:
+            current = db.execute(
+                "SELECT session_id FROM task_bindings WHERE task_id=?", (task_id,)
+            ).fetchone()
+            if current and current[0] != session_id:
+                raise ApiError(409, "异常处理关联的会话已变化")
+            db.execute(
+                "INSERT OR IGNORE INTO task_bindings(task_id, session_id) VALUES (?, ?)",
+                (task_id, session_id),
+            )
 
     def job(self, job_id: str, owner: str) -> dict:
         with closing(self.connect()) as db:
@@ -151,12 +225,15 @@ class QueueStore:
             ).fetchone()
         return self.public_job(dict(row))
 
-    def original_payload(self, task_id: str) -> dict:
+    def original_operation(self, task_id: str) -> tuple[str, dict]:
         with closing(self.connect()) as db:
             row = db.execute(
-                "SELECT payload FROM jobs WHERE task_id=? AND operation='start'", (task_id,)
+                "SELECT operation, payload FROM jobs WHERE task_id=? "
+                "AND operation IN ('start', 'remediate') ORDER BY rowid LIMIT 1", (task_id,)
             ).fetchone()
-        return json.loads(row[0])
+        if row is None:
+            raise ApiError(409, "没有可恢复的初始操作")
+        return row["operation"], json.loads(row["payload"])
 
     def claim(self) -> dict | None:
         with self.transaction() as db:
@@ -168,33 +245,82 @@ class QueueStore:
             db.execute(
                 "UPDATE jobs SET status='running', updated_at=? WHERE id=?", (now(), row["id"])
             )
+            self._event(db, row["task_id"], row["id"], "job_started", {"status": "running"})
             job = dict(row)
             job["payload"] = json.loads(job["payload"])
             job["task"] = self._task(db, job["task_id"], job["owner"])
             return job
 
+    def running(self) -> list[dict]:
+        with closing(self.connect()) as db:
+            rows = db.execute(
+                "SELECT id, task_id, owner, operation FROM jobs WHERE status='running'"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def finish(self, job_id: str, status: str, error: str | None = None) -> None:
         with self.transaction() as db:
+            row = db.execute(
+                "SELECT task_id FROM jobs WHERE id=? AND status='running'", (job_id,)
+            ).fetchone()
+            if not row:
+                return
             db.execute(
                 "UPDATE jobs SET status=?, error=?, updated_at=? WHERE id=? AND status='running'",
                 (status, error, now(), job_id),
             )
+            self._event(db, row["task_id"], job_id, "job_finished", {"status": status})
 
     def progress(self, job_id: str, progress: dict) -> None:
         with self.transaction() as db:
+            row = db.execute(
+                "SELECT task_id, progress FROM jobs WHERE id=? AND status='running'", (job_id,)
+            ).fetchone()
+            if not row:
+                return
+            encoded = json.dumps(progress, ensure_ascii=False)
+            if row["progress"] == encoded:
+                return
             db.execute(
                 "UPDATE jobs SET progress=?, updated_at=? WHERE id=? AND status='running'",
-                (json.dumps(progress, ensure_ascii=False), now(), job_id),
+                (encoded, now(), job_id),
             )
+            self._event(db, row["task_id"], job_id, "progress", progress)
 
     def recover_interrupted(self) -> None:
         """只在获得独占 Worker 锁后调用；排队中的操作保持原样。"""
         with self.transaction() as db:
+            interrupted = db.execute(
+                "SELECT id, task_id FROM jobs WHERE status='running'"
+            ).fetchall()
             db.execute(
                 "UPDATE jobs SET status='recovery_required', error=?, updated_at=? "
                 "WHERE status='running'",
                 ("执行进程中断；请查询已有结果并显式选择只读恢复", now()),
             )
+            for row in interrupted:
+                self._event(db, row["task_id"], row["id"], "job_finished", {
+                    "status": "recovery_required"
+                })
+
+    @staticmethod
+    def _event(db, task_id: str, job_id: str, kind: str, payload: dict) -> None:
+        db.execute(
+            "INSERT INTO api_events(task_id, job_id, kind, payload, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (task_id, job_id, kind, json.dumps(payload, ensure_ascii=False), now()),
+        )
+
+    def events(self, task_id: str, after: int, limit: int) -> dict:
+        with closing(self.connect()) as db:
+            rows = db.execute(
+                "SELECT id, job_id, kind, payload, created_at FROM api_events "
+                "WHERE task_id=? AND id>? ORDER BY id LIMIT ?", (task_id, after, limit),
+            ).fetchall()
+        events = [{"id": row["id"], "job_id": row["job_id"], "kind": row["kind"],
+                   "data": json.loads(row["payload"]), "created_at": row["created_at"]}
+                  for row in rows]
+        return {"events": events, "next_cursor": events[-1]["id"] if events else after}
 
     def worker_heartbeat(self) -> None:
         with self.transaction() as db:

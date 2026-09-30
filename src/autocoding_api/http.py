@@ -5,7 +5,7 @@ import secrets
 from typing import Annotated, Literal
 from uuid import UUID
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
@@ -46,9 +46,29 @@ class ResumeTask(BaseModel):
     expected_version: int | None = Field(description="当前版本；尚未建立领域会话时为 null。", ge=0)
 
 
+class RemediateTask(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_version: int = Field(ge=0, description="已审阅的诊断任务版本。")
+    cycle_number: int = Field(ge=1, description="已审阅的诊断轮次。")
+
+
+class ApprovalAction(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_version: int = Field(ge=0, description="已审阅方案对应的任务版本。")
+    approval_id: str = Field(
+        min_length=64, max_length=64, pattern="^[0-9a-f]{64}$",
+        description="从任务查询结果中读取的当前方案标识。",
+    )
+    scope: Literal["modify", "verify"] = Field(description="批准或拒绝的权限范围。")
+
+
+class RejectAction(ApprovalAction):
+    reason: str = Field(default="", max_length=2000, description="拒绝原因。")
+
+
 def create_app(config: ServerConfig) -> FastAPI:
     service = ApiService(config)
-    app = FastAPI(title="AutoCoding Agent API", version="0.10.0")
+    app = FastAPI(title="AutoCoding Agent API", version="0.11.0")
     app.state.service = service
     bearer = HTTPBearer(auto_error=False)
 
@@ -92,6 +112,14 @@ def create_app(config: ServerConfig) -> FastAPI:
     def task(task_id: UUID, owner: User):
         return service.get_task(owner, str(task_id))
 
+    @app.get("/v1/tasks/{task_id}/events")
+    def events(
+        task_id: UUID, owner: User,
+        after: Annotated[int, Query(ge=0)] = 0,
+        limit: Annotated[int, Query(ge=1, le=100)] = 100,
+    ):
+        return service.events(owner, str(task_id), after, limit)
+
     @app.get("/v1/jobs/{job_id}")
     def job(job_id: UUID, owner: User):
         return service.get_job(owner, str(job_id))
@@ -103,5 +131,17 @@ def create_app(config: ServerConfig) -> FastAPI:
     @app.post("/v1/tasks/{task_id}/resume", status_code=202)
     def resume(task_id: UUID, body: ResumeTask, owner: User, key: Key):
         return service.submit(owner, str(task_id), key, "resume", body.model_dump(mode="json"))
+
+    @app.post("/v1/tasks/{task_id}/remediation", status_code=202)
+    def remediation(task_id: UUID, body: RemediateTask, owner: User, key: Key):
+        return service.remediate(owner, str(task_id), key, body.model_dump(mode="json"))
+
+    @app.post("/v1/tasks/{task_id}/approve", status_code=202)
+    def approve(task_id: UUID, body: ApprovalAction, owner: User, key: Key):
+        return service.submit(owner, str(task_id), key, "approve", body.model_dump(mode="json"))
+
+    @app.post("/v1/tasks/{task_id}/reject", status_code=202)
+    def reject(task_id: UUID, body: RejectAction, owner: User, key: Key):
+        return service.submit(owner, str(task_id), key, "reject", body.model_dump(mode="json"))
 
     return app

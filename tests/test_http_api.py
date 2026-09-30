@@ -40,8 +40,7 @@ TOKEN = "a" * 40
 OTHER_TOKEN = "b" * 40
 
 
-@pytest.fixture
-def configured(tmp_path):
+def server_config(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     return ServerConfig.model_validate({
@@ -51,6 +50,11 @@ def configured(tmp_path):
         "users": {"alice": {"token": TOKEN, "projects": ["demo"]},
                   "bob": {"token": OTHER_TOKEN, "projects": ["demo", "private"]}},
     })
+
+
+@pytest.fixture
+def configured(tmp_path):
+    return server_config(tmp_path)
 
 
 def headers(key="request-1", token=TOKEN):
@@ -201,7 +205,8 @@ def test_plain_messages_never_approve_changes(configured):
     assert response.status_code == 202
     worker.run_once()
     assert all(turn.mode == AgentMode.INSPECT for turn in runtime.turns)
-    assert client.post(f"/v1/tasks/{job['task_id']}/approve", headers=headers()).status_code == 404
+    # 只有明确提交完整方案标识与范围的专用请求才可能批准。
+    assert client.post(f"/v1/tasks/{job['task_id']}/approve", headers=headers()).status_code == 422
 
 
 @pytest.mark.parametrize("with_session", [False, True])

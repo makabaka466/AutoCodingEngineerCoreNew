@@ -97,6 +97,37 @@ class Worker:
             queue.finish(job["id"], "succeeded")
         return True
 
+    def reconcile_finished_commands(self) -> None:
+        """领域命令回执已提交时，仅补齐队列确认，不重新执行代码或模型。"""
+        for job in self.service.queue.running():
+            if job["operation"] not in {"message", "approve", "reject", "remediate"}:
+                continue
+            try:
+                task = self.service.queue.task(job["task_id"], job["owner"])
+                session = self.service.session(task)
+                if job["operation"] == "remediate":
+                    if session is None:
+                        _, intent = self.service.queue.original_operation(task["id"])
+                        source_key = (
+                            f"{intent['source_incident_id']}:{intent['source_cycle']}"
+                        )
+                        session = next(
+                            (item for item in self.service.sessions["development"].list()
+                             if item.source_incident_key == source_key), None,
+                        )
+                    if session is not None:
+                        self.service.queue.bind_domain(task["id"], session.id)
+                        if session.last_decision is not None:
+                            self.service.queue.finish(job["id"], "succeeded")
+                    continue
+            except Exception:
+                logger.warning("job_receipt_scan_failed job_id=%s", job["id"], exc_info=True)
+                continue
+            if session and any(
+                receipt.command_id == job["id"] for receipt in session.command_receipts
+            ):
+                self.service.queue.finish(job["id"], "succeeded")
+
     def _execute(self, job: dict) -> None:
         task, payload = job["task"], job["payload"]
         config = self.service.config
@@ -109,36 +140,57 @@ class Worker:
         ):
             raise ApiError(409, "排队任务的项目配置已变化，请新建任务")
         application = self.applications[task["workflow"]]
+
         def sink(event):
-            self.service.queue.progress(job["id"], event.model_dump(mode="json"))
+            payload = event.model_dump(mode="json")
+            payload["task_id"] = task["id"]
+            self.service.queue.progress(job["id"], payload)
+
         session = self.service.session(task)
         if job["operation"] == "start":
             if session is not None:
                 raise ValueError("此任务已建立，必须显式恢复")
             self._start(application, task, payload, sink)
             return
+        if job["operation"] == "remediate":
+            self._remediate(application, task, payload, sink)
+            return
         if payload["expected_version"] != (session.version if session else None):
             raise ApiError(409, "执行前版本校验失败，请重新查询后提交")
+        domain_id = self.service.queue.domain_id(task["id"])
+        if job["operation"] in {"approve", "reject"}:
+            self.service.verify_approval(task, session, payload)
+            if job["operation"] == "approve":
+                application.approve(domain_id, command_id=job["id"], progress_sink=sink)
+            else:
+                application.reject(
+                    domain_id, payload["reason"], command_id=job["id"], progress_sink=sink,
+                )
+            return
         if job["operation"] == "resume":
             if session is None:
                 # 崩溃发生在领域会话建立前；用户显式恢复才允许开始原任务。
-                self._start(
-                    application, task, self.service.queue.original_payload(task["id"]), sink
-                )
+                initial_operation, original = self.service.queue.original_operation(task["id"])
+                if initial_operation == "remediate":
+                    self._remediate(application, task, original, sink)
+                else:
+                    self._start(application, task, original, sink)
             elif session.task_state in {TaskState.PAUSED, TaskState.RECOVERY_REQUIRED}:
-                application.resume(task["id"], progress_sink=sink)
+                application.resume(domain_id, progress_sink=sink)
             else:
                 # 会话落盘与队列完成之间也可能崩溃；重新只读核验，不重放旧输入。
                 application.send(
-                    task["id"],
+                    domain_id,
                     "用户选择只读恢复：核对当前代码和已有证据，说明中断影响与安全下一步。"
                     "不假定旧操作已完成，不修改文件；需要修改时重新提出方案等待批准。",
                     command_id=job["id"], progress_sink=sink,
                 )
-        else:
+        elif job["operation"] == "message":
             application.send(
-                task["id"], payload["message"], command_id=job["id"], progress_sink=sink
+                domain_id, payload["message"], command_id=job["id"], progress_sink=sink
             )
+        else:
+            raise ApiError(400, "不支持的操作")
 
     @staticmethod
     def _start(application, task, payload, sink):
@@ -149,12 +201,33 @@ class Worker:
                           external_reference=payload.get("external_reference"))
         application.start(task["workspace"], payload["message"], **kwargs)
 
+    def _remediate(self, application, task, payload, sink) -> None:
+        source = self.service.queue.task(payload["source_incident_id"], task["owner"])
+        if (
+            source["workflow"] != "incident" or source["project_id"] != task["project_id"]
+            or source["workspace"] != task["workspace"]
+        ):
+            raise ApiError(409, "异常诊断任务与目标项目不匹配")
+        incident = self.service.session(source)
+        if (
+            incident is None or incident.workspace != task["workspace"]
+            or incident.version != payload["expected_version"]
+            or incident.cycle_number != payload["source_cycle"]
+            or not incident.can_remediate
+        ):
+            raise ApiError(409, "诊断轮次、版本或工作区已变化，请重新查询")
+        outcome = application.start_incident_remediation(
+            incident, session_id=task["id"], progress_sink=sink,
+        )
+        self.service.queue.bind_domain(task["id"], outcome.session_id)
+
 
 def run_worker(config: ServerConfig, stop: Event | None = None) -> None:
     stopped = stop or Event()
     with worker_lock(config.data_dir):
         applications = build_services(config)
         worker = Worker(config, applications)
+        worker.reconcile_finished_commands()
         worker.service.queue.recover_interrupted()
         heartbeats_done = Event()
 

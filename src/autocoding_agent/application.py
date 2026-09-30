@@ -54,6 +54,7 @@ class AgentApplication:
         self,
         incident: IncidentSession,
         *,
+        session_id: str | None = None,
         progress_sink: ProgressSink | None = None,
     ) -> AgentOutcome:
         """用户手动交接已完成诊断；复用只读调查和显式修改审批，不继承写权限。"""
@@ -95,6 +96,7 @@ class AgentApplication:
                 message,
                 incident.project,
                 source_incident_key=key,
+                session_id=session_id,
                 progress_sink=progress_sink,
             )
 

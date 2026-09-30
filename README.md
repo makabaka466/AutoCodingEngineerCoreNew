@@ -2,7 +2,8 @@
 
 默认双击 `start.cmd` 会启动桌面客户端。
 
-独立 HTTP 服务和持久化 Worker 的安装、配置与调用示例见[HTTP API](docs/API.md)。
+独立 HTTP 服务和持久化 Worker 的安装、配置、诊断转修复、方案审批与调用示例见
+[HTTP API](docs/API.md)。
 
 一个以 **Agent 专业能力** 为核心、与具体平台解耦的任务内核。目前包含两条彼此独立、
 共享 Claude Code Runtime 的流程：软件开发，以及页面与业务数据联合诊断的异常处理。两条流程
