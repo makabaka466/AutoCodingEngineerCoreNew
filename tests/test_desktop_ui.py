@@ -44,6 +44,7 @@ from autocoding_agent.incident.models import (
     IncidentSession,
     IncidentStatus,
 )
+from autocoding_agent.interfaces.chat_transcript import ChatTranscript
 from autocoding_agent.interfaces.desktop_ui import (
     COLORS,
     DesktopClient,
@@ -354,6 +355,49 @@ def test_session_list_label_is_compact_and_includes_status() -> None:
     assert "…" in label
     assert "已完成" in label
     assert "08-20" in label
+
+
+def test_chat_long_response_folds_losslessly_and_copies_original(root: tk.Toplevel) -> None:
+    widget = tk.Text(root)
+    renderer = ChatTranscript(widget)
+    content = "## 结论\n\n已确认原因。\n\n" + "详细证据。" * 400 + "\n最终约束不可遗漏。"
+    renderer.render([("assistant", content), ("metadata", "内部查询记录\n只读查询已完成")])
+    visible = widget.get("1.0", "end")
+    assert "结论" in visible and "展开全文" in visible
+    assert "最终约束不可遗漏" not in visible and "内部查询记录" not in visible
+    renderer.toggle(renderer.key(0, "assistant", content))
+    assert "最终约束不可遗漏" in widget.get("1.0", "end")
+    renderer._copy(content)
+    assert widget.clipboard_get() == content
+    renderer.collapse_all()
+    assert "最终约束不可遗漏" not in widget.get("1.0", "end")
+
+
+def test_chat_markdown_styles_do_not_parse_code_or_user_input(root: tk.Toplevel) -> None:
+    widget = tk.Text(root)
+    renderer = ChatTranscript(widget)
+    renderer.render([
+        ("user", "**这是原始输入**"),
+        ("assistant", "## 修改结果\n- **已修复** `app.py`\n```python\n# literal\n```"),
+    ])
+    visible = widget.get("1.0", "end")
+    assert "**这是原始输入**" in visible
+    assert "## 修改结果" not in visible and "修改结果" in visible
+    assert "# literal" in visible and "```" not in visible
+    assert widget.tag_ranges("chat_heading")
+    assert widget.tag_ranges("chat_bold") and widget.tag_ranges("chat_inline_code")
+    assert widget.tag_ranges("chat_code")
+
+
+def test_chat_expansion_survives_refresh_without_changing_message_data(root: tk.Toplevel) -> None:
+    widget = tk.Text(root)
+    renderer = ChatTranscript(widget)
+    entries = [("assistant", "结论\n" + "证据" * 900)]
+    renderer.render(entries)
+    renderer.expand_all()
+    renderer.render(entries)
+    assert entries[0][1] in widget.get("1.0", "end")
+    assert entries[0][1].endswith("证据" * 900)
 
 
 def test_query_observation_display_distinguishes_stage_and_failure() -> None:
@@ -852,6 +896,8 @@ def test_history_restores_result_and_missing_evidence_without_loading(root: tk.T
     client._render_session(session)
     assert client.activity_var.get() == "修改完成，尚未验证"
     assert "需要运行相关测试" in client.workflow_detail_var.get()
+    assert "调查与验证详情" in client.transcript.get("1.0", "end")
+    client._chat_renderer.expand_all()
     assert "推进依据" in client.transcript.get("1.0", "end")
     assert not client._progress_event.active
     assert client.activity_dot.itemcget(client.activity_spinner, "state") == "hidden"
@@ -880,6 +926,8 @@ def test_long_evidence_summary_keeps_compact_window_composer_visible(root: tk.To
         root.winfo_rooty() + root.winfo_height()
     )
     assert "…" in client.workflow_detail_var.get()
+    assert session.last_decision.assessment.reason not in client.transcript.get("1.0", "end")
+    client._chat_renderer.expand_all()
     assert session.last_decision.assessment.reason in client.transcript.get("1.0", "end")
 
 

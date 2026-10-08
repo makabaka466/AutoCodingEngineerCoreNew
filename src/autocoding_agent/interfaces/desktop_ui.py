@@ -57,6 +57,7 @@ from autocoding_agent.incident_attachments import (
     IncidentAttachmentError,
     IncidentAttachmentStore,
 )
+from autocoding_agent.interfaces.chat_transcript import ChatTranscript, insert_markdown
 from autocoding_agent.interfaces.knowledge_management_ui import KnowledgeManagementDialog
 from autocoding_agent.interfaces.system_settings_ui import SystemSettingsDialog
 from autocoding_agent.knowledge_rag.service import (
@@ -963,6 +964,22 @@ class DesktopClient:
         transcript_frame = self.transcript_panel.content
         transcript_frame.grid_rowconfigure(1, weight=1)
         transcript_frame.grid_columnconfigure(0, weight=1)
+        chat_toolbar = tk.Frame(transcript_frame, bg=COLORS["surface"])
+        chat_toolbar.grid(row=0, column=0, columnspan=2, sticky="ew", padx=12, pady=(4, 8))
+        tk.Label(
+            chat_toolbar, text="对话记录", bg=COLORS["surface"], fg=COLORS["muted"],
+            font=("Microsoft YaHei UI", 9, "bold"),
+        ).pack(side="left")
+        for label, action in (
+            ("收起长文", lambda: self._chat_renderer.collapse_all()),
+            ("展开全部", lambda: self._chat_renderer.expand_all()),
+            ("最新回应", lambda: self.transcript.yview("latest_reply")),
+        ):
+            tk.Button(
+                chat_toolbar, text=label, command=action, relief="flat", borderwidth=0,
+                bg=COLORS["surface"], fg=COLORS["accent"], cursor="hand2",
+                font=("Microsoft YaHei UI", 9), padx=8, pady=3,
+            ).pack(side="right")
 
         self.activity_frame = tk.Frame(
             transcript_frame,
@@ -2141,19 +2158,11 @@ class DesktopClient:
         return f"{content}\n[异常截图：{names}]"
 
     def _replace_transcript(self, entries: list[tuple[str, str]]) -> None:
-        self.transcript.configure(state="normal")
-        self.transcript.delete("1.0", "end")
-        names = {"user": "你 · 任务", "assistant": "Agent · 回应", "system": "系统 · 提示"}
-        for role, content in entries:
-            if role == "metadata":
-                self.transcript.insert("end", f"\n{content.strip()}\n", "metadata")
-                continue
-            self.transcript.insert("end", f"{names[role]}\n", f"{role}_name")
-            self.transcript.insert("end", f"{content.strip()}\n", f"{role}_message")
-            self.transcript.insert("end", "\n", "muted")
-        self.transcript.configure(state="disabled")
-        self.transcript.see("end")
-        self.root.after_idle(lambda: self.transcript.see("end"))
+        if not hasattr(self, "_chat_renderer"):
+            self._chat_renderer = ChatTranscript(self.transcript)
+        self._chat_renderer.render(
+            entries, details_open=self.flow == FlowKind.INCIDENT and self._show_incident_details,
+        )
 
     def _load_recent_sessions(self, select_current: bool = False) -> None:
         try:
@@ -3027,9 +3036,10 @@ class DesktopClient:
             and self._current_status == AgentStatus.APPROVAL_REQUIRED
         )
         compact = self.root.winfo_height() < 780
-        self.prompt_input.configure(height=1 if reviewing else (2 if compact else 4))
+        input_height = 1 if reviewing else (2 if compact or self.session_id else 4)
+        self.prompt_input.configure(height=input_height)
         self.approval_text.configure(height=5 if compact else 9)
-        if reviewing:
+        if reviewing or self.session_id:
             self.project_row.grid_remove()
         else:
             self.project_row.grid()
@@ -3143,7 +3153,9 @@ class DesktopClient:
         )
         self.approval_text.configure(state="normal")
         self.approval_text.delete("1.0", "end")
-        self.approval_text.insert("1.0", format_approval_details(approval))
+        if not hasattr(self, "_approval_renderer"):
+            self._approval_renderer = ChatTranscript(self.approval_text)
+        insert_markdown(self.approval_text, format_approval_details(approval), "approval_body")
         self.approval_text.yview_moveto(0.0)
         self.approval_text.configure(state="disabled")
         self.approval_frame.grid(

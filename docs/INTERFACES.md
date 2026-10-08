@@ -1,9 +1,14 @@
 # AutoCoding Engineer 接口与数据契约
 
-本文记录当前 `0.12.0` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
+本文记录当前 `0.13.0` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
 Runtime、持久化和状态契约。
 设计动机和运行流程见[架构说明](ARCHITECTURE.md)。
 新增独立 HTTP 路由、队列状态和 PowerShell 示例见[HTTP API](API.md)。
+
+桌面对话页的“展开全文”“收起详情”“复制全文”作用于单条消息；顶部“展开全部”、
+“收起长文”和“最新回应”作用于当前对话展示。复制全文保留原始 Markdown 与完整内容。
+开发依据与查询详情默认折叠；异常页既有“查看诊断详情”会展开关联详情。
+审批区使用清楚的标题样式并保持完整内容，所有审批和执行入口仍走原应用门面。
 
 HTTP 入口 `autocoding-api` 与执行入口 `autocoding-api-worker` 属于独立的
 `autocoding_api` 包。前者支持 `POST /v1/tasks`、`POST /v1/tasks/{id}/messages`、
