@@ -440,6 +440,8 @@ class SystemSettingsDialog:
         tab = self.workspace_tab
         tab.grid_columnconfigure(0, weight=1)
         self.workspace_path_var = tk.StringVar()
+        self.git_remote_var = tk.StringVar()
+        self.git_branch_var = tk.StringVar()
         self.workspace_status_var = tk.StringVar()
         self.workspace_status_label = self._status(tab, self.workspace_status_var, 0)
         self._field_label(tab, "项目代码根目录", 1)
@@ -462,6 +464,14 @@ class SystemSettingsDialog:
             bg=CARD,
             anchor="w",
         ).grid(row=3, column=0, sticky="ew", padx=26, pady=(8, 12))
+        self._field_label(tab, "Git 远端地址或名称（例如 origin）", 4)
+        self._entry(tab, self.git_remote_var).grid(
+            row=5, column=0, sticky="ew", padx=26, ipady=5,
+        )
+        self._field_label(tab, "目标分支", 6)
+        self._entry(tab, self.git_branch_var).grid(
+            row=7, column=0, sticky="ew", padx=26, ipady=5,
+        )
 
     def _build_knowledge_tab(self) -> None:
         tab = self.knowledge_tab
@@ -637,6 +647,8 @@ class SystemSettingsDialog:
         self.workspace_state = state
         if state.config is not None:
             self.workspace_path_var.set(state.config.path)
+            self.git_remote_var.set(state.config.git_remote or "")
+            self.git_branch_var.set(state.config.git_branch or "")
         if state.configured:
             self._set_workspace_status("项目路径已配置并可访问。", SUCCESS)
         elif state.config is not None:
@@ -829,7 +841,10 @@ class SystemSettingsDialog:
 
     def _save_workspace(self) -> None:
         try:
-            state = self.workspace_service.save(self.workspace_path_var.get())
+            state = self.workspace_service.save(
+                self.workspace_path_var.get(), self.git_remote_var.get().strip(),
+                self.git_branch_var.get().strip(),
+            )
         except Exception as exc:
             messagebox.showerror("项目路径未保存", str(exc), parent=self.window)
             return

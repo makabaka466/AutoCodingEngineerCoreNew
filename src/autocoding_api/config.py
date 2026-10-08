@@ -12,6 +12,16 @@ class ProjectConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
     workspace: Path = Field(description="服务器上的授权工作区绝对路径。")
     knowledge_project: str | None = Field(default=None, description="现有领域知识的项目名称。")
+    git_remote: str | None = Field(
+        default=None, description="拉取与推送使用的 Git 远端地址或名称。"
+    )
+    git_branch: str | None = Field(default=None, description="目标分支；本地当前分支须一致。")
+
+    @model_validator(mode="after")
+    def complete_git_target(self):
+        if bool(self.git_remote) != bool(self.git_branch):
+            raise ValueError("项目的 git_remote 与 git_branch 必须同时配置")
+        return self
 
 
 class UserConfig(BaseModel):
@@ -42,10 +52,15 @@ class ServerConfig(BaseModel):
             tokens.add(token)
             if not set(user.projects) <= self.projects.keys():
                 raise ValueError("用户引用了未配置的项目")
+        workspace_targets: dict[Path, tuple[str | None, str | None]] = {}
         for project in self.projects.values():
             if not project.workspace.is_absolute() or not project.workspace.is_dir():
                 raise ValueError("workspace 必须是存在的绝对目录")
             project.workspace = project.workspace.resolve()
+            git_target = (project.git_remote, project.git_branch)
+            previous = workspace_targets.setdefault(project.workspace, git_target)
+            if previous != git_target:
+                raise ValueError("同一工作区不能配置不同的 Git 目标")
         return self
 
 

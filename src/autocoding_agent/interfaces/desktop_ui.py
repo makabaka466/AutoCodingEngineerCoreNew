@@ -1406,6 +1406,16 @@ class DesktopClient:
             active_background=COLORS["accent_hover"],
         )
         self.send_button.grid(row=0, column=1, sticky="e")
+        self.git_sync_button = self._button(
+            action_row, "更新代码", self._sync_git,
+            background="#E8EEF9", active_background="#D8E4F7",
+        )
+        self.git_sync_button.grid(row=0, column=2, padx=(8, 0))
+        self.git_publish_button = self._button(
+            action_row, "提交并推送", self._publish_git,
+            background="#E8EEF9", active_background="#D8E4F7",
+        )
+        self.git_publish_button.grid(row=0, column=3, padx=(8, 0))
 
         self._build_overview_panel(main)
 
@@ -2491,6 +2501,72 @@ class DesktopClient:
         self._append_optimistic_user_message(message, attachments)
         self._run_in_background(operation, "Claude Code 正在分析")
 
+    def _sync_git(self) -> None:
+        if self._busy:
+            return
+        if self.session_id:
+            session = self._active_application().get_session(self.session_id)
+            if getattr(session, "pending_approval", None) is not None:
+                self.status_var.set("请先拒绝当前审批方案，再更新代码并重新调查。")
+                return
+            workspace = session.workspace
+        else:
+            state = self.workspace_service.inspect()
+            if not state.configured or state.config is None:
+                self.status_var.set("请先配置项目路径和 Git 目标。")
+                return
+            workspace = state.config.path
+        self._set_busy(True, "正在更新代码")
+
+        def run() -> None:
+            try:
+                app = self._active_application()
+                result = app.sync_git(workspace)
+                self._result_queue.put(("git_result", f"代码已更新到 {result[:12]}"))
+            except Exception as exc:
+                self._result_queue.put(("git_error", exc))
+
+        threading.Thread(target=run, name="git-sync", daemon=True).start()
+
+    def _publish_git(self) -> None:
+        if self._busy or self.flow != FlowKind.DEVELOPMENT or not self.session_id:
+            return
+        try:
+            preview = self.application.git_preview(self.session_id)
+        except Exception as exc:
+            messagebox.showerror("无法推送", str(exc), parent=self.root)
+            return
+        files = "\n".join(preview["files"][:30])
+        if len(preview["files"]) > 30:
+            files += f"\n…另外 {len(preview['files']) - 30} 个文件"
+        if not messagebox.askokcancel(
+            "审阅提交文件",
+            f"目标：{preview['remote']} / {preview['branch']}\n"
+            f"{'重试推送已有本地提交' if preview['pending_push'] else '创建提交并推送'}\n"
+            f"涉及以下 {len(preview['files'])} 个文件：\n{files}",
+            parent=self.root,
+        ):
+            return
+        summary = simpledialog.askstring(
+            "修改摘要", "请填写简短的单行修改内容：",
+            initialvalue=preview.get("summary", ""), parent=self.root,
+        )
+        if not summary:
+            return
+        session_id = self.session_id
+        self._set_busy(True, "正在提交并推送")
+
+        def run() -> None:
+            try:
+                result = self.application.git_publish(
+                    session_id, summary, preview["fingerprint"],
+                )
+                self._result_queue.put(("git_result", f"已推送提交 {result['commit'][:12]}"))
+            except Exception as exc:
+                self._result_queue.put(("git_error", exc))
+
+        threading.Thread(target=run, name="git-publish", daemon=True).start()
+
     def _append_optimistic_user_message(
         self,
         message: str,
@@ -2712,6 +2788,13 @@ class DesktopClient:
                 if kind == "progress":
                     if isinstance(payload, ProgressEvent):
                         self._present_progress(payload)
+                    continue
+                if kind in {"git_result", "git_error"}:
+                    self._set_busy(False)
+                    message = str(payload) if kind == "git_result" else f"Git 操作失败：{payload}"
+                    self.status_var.set(message)
+                    if kind == "git_error":
+                        messagebox.showerror("Git 操作失败", str(payload), parent=self.root)
                     continue
                 self._set_busy(False)
                 if kind == "success":
@@ -2965,6 +3048,12 @@ class DesktopClient:
                 recovery_state = False
         self.prompt_input.configure(state="normal" if can_send else "disabled")
         self.send_button.configure(state="normal" if can_send else "disabled")
+        self.git_sync_button.configure(state="disabled" if self._busy else "normal")
+        can_publish = (
+            not self._busy and self.flow == FlowKind.DEVELOPMENT and bool(self.session_id)
+            and self.application.get_session(self.session_id).task_state == TaskState.COMPLETED
+        )
+        self.git_publish_button.configure(state="normal" if can_publish else "disabled")
         self.approve_button.configure(
             state="normal" if can_decide and self._approval_can_execute else "disabled"
         )

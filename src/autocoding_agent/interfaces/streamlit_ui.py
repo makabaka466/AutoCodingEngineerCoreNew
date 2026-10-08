@@ -34,7 +34,23 @@ def main() -> None:
         st.session_state.workspace = workspace
         if st.button("新建任务", use_container_width=True):
             st.session_state.session_id = None
+            st.session_state.git_preview = None
             st.rerun()
+        if st.button("更新 Git 代码", use_container_width=True):
+            try:
+                current = (
+                    application.get_session(st.session_state.session_id)
+                    if st.session_state.session_id else None
+                )
+                if current and current.pending_approval:
+                    st.error("请先拒绝当前审批方案，再更新代码并重新调查。")
+                else:
+                    with st.spinner("正在更新代码…"):
+                        head = application.sync_git(current.workspace if current else workspace)
+                    st.session_state.git_preview = None
+                    st.success(f"已更新到 {head[:12]}")
+            except Exception as exc:
+                st.error(str(exc))
         if st.session_state.session_id:
             st.caption(f"Session\n{st.session_state.session_id}")
 
@@ -143,6 +159,31 @@ def main() -> None:
             if session.capability_document:
                 st.caption(f"能力文档：{session.capability_document}")
             st.info("可以在下方继续追问或补充要求；也可以点击左侧“新建任务”。")
+            if st.button("预览待推送修改"):
+                try:
+                    st.session_state.git_preview = application.git_preview(session.id)
+                except Exception as exc:
+                    st.error(str(exc))
+            preview = st.session_state.get("git_preview")
+            if preview:
+                st.write(f"目标：{preview['remote']} / {preview['branch']}")
+                st.write("涉及文件：", preview["files"])
+                if preview["pending_push"]:
+                    st.info("本地已有一个提交，确认后仅重试推送。")
+                summary = st.text_input(
+                    "简短修改内容", value=preview.get("summary", ""), key="git_summary",
+                )
+                reviewed = st.checkbox("我已检查目标分支和以上文件")
+                if st.button("提交并推送", disabled=not reviewed or not summary.strip()):
+                    try:
+                        with st.spinner("正在提交并推送…"):
+                            result = application.git_publish(
+                                session.id, summary, preview["fingerprint"],
+                            )
+                        st.session_state.git_preview = None
+                        st.success(f"已推送提交 {result['commit'][:12]}")
+                    except Exception as exc:
+                        st.error(str(exc))
 
     prompt = st.chat_input(
         "继续追问，或者补充新的修改要求…"
@@ -162,6 +203,7 @@ def main() -> None:
                 else:
                     outcome = application.start(workspace, prompt, progress_sink=show_progress)
                     st.session_state.session_id = outcome.session_id
+                    st.session_state.git_preview = None
             except Exception as exc:
                 st.error(str(exc))
                 return

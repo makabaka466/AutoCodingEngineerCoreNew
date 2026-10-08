@@ -3,7 +3,9 @@
   "projects": {
     "demo": {
       "workspace": "D:\\AgentProjects\\demo",
-      "knowledge_project": null
+      "knowledge_project": null,
+      "git_remote": "origin",
+      "git_branch": "main"
     }
   },
   "users": {

@@ -10,6 +10,7 @@ from threading import Event, Thread
 from autocoding_agent.application import build_application
 from autocoding_agent.config import Settings
 from autocoding_agent.core.state_machine.models import TaskState
+from autocoding_agent.git_version import GitTarget, GitVersionError
 from autocoding_agent.incident.application import build_incident_application
 from autocoding_agent.sqlserver_service import SQLServerConnectionService
 from autocoding_api.config import ServerConfig
@@ -55,17 +56,26 @@ def worker_lock(data_dir):
 
 def build_services(config: ServerConfig):
     settings = Settings(data_dir=config.data_dir)
+    git_targets = {
+        str(project.workspace): GitTarget(
+            project.workspace, project.git_remote, project.git_branch or ""
+        )
+        for project in config.projects.values() if project.git_remote
+    }
     sql = SQLServerConnectionService(settings)
     state = sql.inspect()
     if state.config is not None and not state.configured:
         raise RuntimeError("数据库已配置但凭据不可用，请检查服务账户")
     reader = sql.reader()
     reference = reader.reference if reader is not None else None
-    development = build_application(settings, database=reader, database_reference=reference)
+    development = build_application(
+        settings, database=reader, database_reference=reference, git_targets=git_targets,
+    )
     # SQLite 的显式异常配置优先，与现有异常应用构建规则一致。
     incident = build_incident_application(
         settings, database=reader if settings.incident_sqlite_path is None else None,
         database_reference=reference if settings.incident_sqlite_path is None else None,
+        git_targets=git_targets,
     )
     return {"development": development, "incident": incident}
 
@@ -84,6 +94,8 @@ class Worker:
             self._execute(job)
         except ApiError as exc:
             queue.finish(job["id"], "failed", exc.detail)
+        except GitVersionError as exc:
+            queue.finish(job["id"], "failed", str(exc))
         except (ValueError, KeyError) as exc:
             # 不把第三方错误文本、主机路径或连接字符串写入外部响应。
             logger.warning("job_rejected job_id=%s type=%s", job["id"], type(exc).__name__)
@@ -157,6 +169,24 @@ class Worker:
             return
         if payload["expected_version"] != (session.version if session else None):
             raise ApiError(409, "执行前版本校验失败，请重新查询后提交")
+        if job["operation"] == "git_sync":
+            target = self.applications["development"].git(task["workspace"])
+            if target is None:
+                raise ApiError(409, "当前项目未配置 Git 远端")
+            head = target.sync()
+            self.service.queue.progress(job["id"], {"label": "代码已更新", "commit": head})
+            return
+        if job["operation"] == "git_publish":
+            if task["workflow"] != "development":
+                raise ApiError(409, "只有开发任务可以推送")
+            published = application.git_publish(
+                self.service.queue.domain_id(task["id"]),
+                payload["summary"], payload["fingerprint"],
+            )
+            self.service.queue.progress(
+                job["id"], {"label": "提交已推送", "commit": published["commit"]},
+            )
+            return
         domain_id = self.service.queue.domain_id(task["id"])
         if job["operation"] in {"approve", "reject"}:
             self.service.verify_approval(task, session, payload)

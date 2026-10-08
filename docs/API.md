@@ -1,4 +1,4 @@
-# HTTP API：独立接口与远程交互（0.11.0）
+# HTTP API：独立接口与远程交互（0.12.0）
 
 `src/autocoding_api/` 是独立交付层，HTTP 和执行进程分别运行；二者只调用现有
 `AgentApplication` / `IncidentApplication`。任务首先持久化到
@@ -19,6 +19,9 @@ D:\python\python.exe -c "import secrets; print(secrets.token_urlsafe(32))"
 编辑 `deploy\api\server.local.json`：使用实际存在的绝对项目目录，将命令生成的随机 Token
 填入 `token`，并设置独立、持久的 `data_dir`。`server.local.json` 已被 Git 忽略；限制此文件和
 `data_dir` 仅供服务账户读取。`project_id` 是服务器白名单键，调用者不能提交工作区路径。
+项目可配置 `git_remote`（远端名称如 `origin`，或仓库地址）和 `git_branch`（目标分支）。
+两项必须同时设置；Worker 的服务账户需要已有的 Git 读取和推送凭据。使用远端地址时不要把
+密码写进 URL。新任务开始前，Worker 只在本地分支匹配且工作区干净时快进同步；失败则不启动模型。
 如果需要查询 SQL Server，应在**运行 Worker 的同一服务账户**下配置现有数据库连接和凭据；
 数据目录也必须与该配置一致。
 
@@ -125,6 +128,27 @@ $rejectedJob = Invoke-RestMethod -Method Post -Uri "$apiBase/v1/tasks/$($repairJ
 普通 `/messages` 请求即使内容写了“同意”，也只作为用户消息进入只读分析，不能批准修改。
 批准/拒绝在入队和执行前都检查版本、范围和方案标识；不符返回 409。重复提交相同请求时沿用
 原 `Idempotency-Key`，查看原操作结果，不会执行第二次。
+
+## Git 更新与发布
+
+已有任务可调用 `POST /v1/tasks/{task_id}/git-sync`，正文为当前任务的
+`{"expected_version": 3}`，并使用新的 `Idempotency-Key`。Worker 领取后检查版本，在
+干净工作区中 fetch 并只做快进更新；待审批方案应先拒绝并重新调查，避免旧方案基于过期代码。
+
+开发任务完成后，先调用 `GET /v1/tasks/{task_id}/git-preview`。响应包含目标远端、分支、
+待提交文件清单和 `fingerprint`；将清单展示给用户审核。用户填写单行修改摘要后，调用
+`POST /v1/tasks/{task_id}/git-publish`，正文示例：
+
+```json
+{"expected_version": 3, "fingerprint": "<预览返回的64位哈希>", "summary": "修复订单查询错误"}
+```
+
+接口会再次检查文件内容和远端版本，随后提交并正常推送，不使用强制推送。远端变更、文件变更、
+本地冲突和凭据错误会停止操作。若进程在提交或推送之间中断，队列不会自动重放；请核对本地
+HEAD 与远端分支后再人工处理。若本地恰好只有一个待推送提交且工作区干净，重新调用
+`git-preview` 会返回 `pending_push=true`、原摘要与文件清单；用户再次确认后可用相同摘要
+和新指纹调用 `git-publish`，仅重试推送。Git 同步和推送不执行模型，也不会代替业务验收。
+成功后从操作的 `progress.commit` 读取本地已同步或已推送的提交 ID。
 
 ## 轮询进度
 

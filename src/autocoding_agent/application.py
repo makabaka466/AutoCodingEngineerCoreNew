@@ -25,6 +25,7 @@ from autocoding_agent.core.recovery.manager import RecoveryManager
 from autocoding_agent.core.recovery.models import RecoveryAction, RecoveryScanResult
 from autocoding_agent.core.runtime.models import RuntimeRunRecord
 from autocoding_agent.core.state_machine.machine import AgentStateMachine
+from autocoding_agent.git_version import GitTarget, GitVersionService
 from autocoding_agent.incident.models import IncidentSession
 from autocoding_agent.knowledge_rag.ports import KnowledgeRetriever
 from autocoding_agent.knowledge_rag.service import build_configured_rag_service
@@ -33,6 +34,7 @@ from autocoding_agent.ports.database import DatabaseReader
 from autocoding_agent.ports.hermes_skills import HermesSkillService
 from autocoding_agent.ports.runtime import AgentRuntime
 from autocoding_agent.skills import SkillRegistry
+from autocoding_agent.workspace_config import WorkspaceConfigStore
 from autocoding_agent.workspace_knowledge import PROJECT_KNOWLEDGE_ROOT
 
 
@@ -44,11 +46,47 @@ class AgentApplication:
         engine: AgentEngine,
         log_path: Path | None = None,
         recovery_scan: RecoveryScanResult | None = None,
+        data_dir: Path | None = None,
+        git_targets: dict[str, GitTarget] | None = None,
     ) -> None:
         self._engine = engine
         self.log_path = log_path
         self.recovery_scan = recovery_scan or RecoveryScanResult()
         self._remediation_lock = Lock()
+        self._data_dir = data_dir
+        self._git_targets = git_targets or {}
+
+    def git(self, workspace: str | Path) -> GitVersionService | None:
+        root = str(Path(workspace).resolve())
+        target = self._git_targets.get(root)
+        if target is None and self._data_dir is not None:
+            state = WorkspaceConfigStore(self._data_dir).load()
+            config = state.config
+            if config and str(Path(config.path).resolve()) == root and config.git_remote:
+                target = GitTarget(Path(root), config.git_remote, config.git_branch or "")
+        return GitVersionService(target) if target else None
+
+    def sync_git(self, workspace: str | Path) -> str:
+        service = self.git(workspace)
+        if service is None:
+            raise ValueError("请先在项目配置中填写 Git 远端地址和目标分支。")
+        return service.sync()
+
+    def git_preview(self, session_id: str) -> dict:
+        session = self.get_session(session_id)
+        service = self.git(session.workspace)
+        if service is None:
+            raise ValueError("当前项目未配置 Git 远端。")
+        return service.preview()
+
+    def git_publish(self, session_id: str, summary: str, fingerprint: str) -> dict:
+        session = self.get_session(session_id)
+        if session.task_state.value != "completed":
+            raise ValueError("开发任务完成后才能提交和推送。")
+        service = self.git(session.workspace)
+        if service is None:
+            raise ValueError("当前项目未配置 Git 远端。")
+        return service.publish(summary, fingerprint)
 
     def start_incident_remediation(
         self,
@@ -62,6 +100,9 @@ class AgentApplication:
         if not incident.can_remediate:
             raise ValueError("请先完成异常诊断并给出解决方案，再进入异常处理。")
         assert decision is not None
+        git = self.git(incident.workspace)
+        if git is not None:
+            git.sync()
         key = f"{incident.id}:{incident.cycle_number}"
         # 同一诊断轮次重复点击/重启后都回到已有任务，不重复创建或自动批准。
         with self._remediation_lock:
@@ -109,6 +150,9 @@ class AgentApplication:
         session_id: str | None = None,
         progress_sink: ProgressSink | None = None,
     ) -> AgentOutcome:
+        git = self.git(workspace)
+        if git is not None:
+            git.sync()
         return self._engine.start(
             workspace,
             message,
@@ -209,6 +253,7 @@ def build_application(
     database_reference: str | None = None,
     knowledge_retriever: KnowledgeRetriever | None = None,
     hermes_skills: HermesSkillService | None = None,
+    git_targets: dict[str, GitTarget] | None = None,
 ) -> AgentApplication:
     configured = settings or get_settings()
     configured.data_dir.mkdir(parents=True, exist_ok=True)
@@ -257,4 +302,4 @@ def build_application(
         ),
         max_hermes_skill_rounds=configured.hermes_skill_max_rounds,
     )
-    return AgentApplication(engine, log_path, recovery_scan)
+    return AgentApplication(engine, log_path, recovery_scan, configured.data_dir, git_targets)

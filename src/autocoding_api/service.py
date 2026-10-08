@@ -10,6 +10,7 @@ from autocoding_agent.adapters.sqlite_incident_store import SQLiteIncidentStore
 from autocoding_agent.adapters.sqlite_task_store import SQLiteTaskStore
 from autocoding_agent.core.models import MessageRole
 from autocoding_agent.core.state_machine.models import TaskState
+from autocoding_agent.git_version import GitTarget, GitVersionError, GitVersionService
 from autocoding_agent.incident.engine import format_incident_summary
 from autocoding_api.config import ServerConfig
 from autocoding_api.store import ApiError, QueueStore
@@ -43,6 +44,31 @@ class ApiService:
             return self.sessions[task["workflow"]].load(self.queue.domain_id(task["id"]))
         except KeyError:
             return None
+
+    def git(self, owner: str, task: dict) -> GitVersionService:
+        project = self.project(owner, task["project_id"])
+        if not project.git_remote:
+            raise ApiError(409, "当前项目未配置 Git 远端和目标分支")
+        try:
+            return GitVersionService(GitTarget(
+                project.workspace, project.git_remote, project.git_branch or "",
+            ))
+        except GitVersionError as exc:
+            raise ApiError(409, str(exc)) from exc
+
+    def git_preview(self, owner: str, task_id: str) -> dict:
+        task = self.task(owner, task_id)
+        session = self.session(task)
+        if task["workflow"] != "development" or session is None or (
+            session.task_state != TaskState.COMPLETED
+        ):
+            raise ApiError(409, "只有已完成的开发任务可以预览推送")
+        if self.queue.latest_job(task_id)["status"] in {"queued", "running"}:
+            raise ApiError(409, "请等待当前操作完成")
+        try:
+            return self.git(owner, task).preview()
+        except GitVersionError as exc:
+            raise ApiError(409, str(exc)) from exc
 
     @staticmethod
     def approval_id(session) -> str | None:
@@ -133,6 +159,20 @@ class ApiService:
             }
             if latest["status"] != "recovery_required" and not recovery_state:
                 raise ApiError(409, "此任务不需要恢复")
+        elif operation == "git_sync":
+            self.git(owner, task)
+            if session is None:
+                raise ApiError(409, "请等待任务建立后再手动更新代码")
+            if getattr(session, "pending_approval", None) is not None:
+                raise ApiError(409, "当前有待审批方案，请先拒绝并重新调查后更新代码")
+        elif operation == "git_publish":
+            if task["workflow"] != "development" or session is None or (
+                session.task_state != TaskState.COMPLETED
+            ):
+                raise ApiError(409, "开发任务完成后才能推送")
+            self.git(owner, task)
+            if payload["fingerprint"] != self.git_preview(owner, task_id)["fingerprint"]:
+                raise ApiError(409, "修改清单已变化，请重新审阅")
         else:
             raise ApiError(400, "不支持的操作")
         return self.queue.enqueue(

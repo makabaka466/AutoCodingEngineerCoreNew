@@ -7,9 +7,10 @@ import os
 from pathlib import Path
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 
 from autocoding_agent.config import Settings, get_settings
+from autocoding_agent.git_version import GitTarget, GitVersionError, GitVersionService
 
 
 class WorkspaceConfigError(ValueError):
@@ -22,6 +23,14 @@ class WorkspaceConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     path: str
+    git_remote: str | None = None
+    git_branch: str | None = None
+
+    @model_validator(mode="after")
+    def complete_git_target(self):
+        if bool(self.git_remote) != bool(self.git_branch):
+            raise ValueError("Git 远端地址和目标分支必须同时填写")
+        return self
 
 
 class WorkspaceConfigState(BaseModel):
@@ -51,7 +60,10 @@ class WorkspaceConfigStore:
         candidate = Path(config.path).expanduser()
         return WorkspaceConfigState(config=config, available=candidate.is_dir())
 
-    def save(self, workspace: str | Path) -> WorkspaceConfigState:
+    def save(
+        self, workspace: str | Path, git_remote: str | None = None,
+        git_branch: str | None = None,
+    ) -> WorkspaceConfigState:
         if not str(workspace).strip():
             raise WorkspaceConfigError("请先选择项目代码根目录。")
         try:
@@ -60,7 +72,17 @@ class WorkspaceConfigStore:
             raise WorkspaceConfigError(f"项目路径不存在或无法访问：{exc}") from exc
         if not canonical.is_dir():
             raise WorkspaceConfigError("项目路径必须是一个可访问的目录。")
-        config = WorkspaceConfig(path=str(canonical))
+        config = WorkspaceConfig(
+            path=str(canonical), git_remote=git_remote or None,
+            git_branch=git_branch or None,
+        )
+        if config.git_remote:
+            try:
+                GitVersionService(GitTarget(
+                    canonical, config.git_remote, config.git_branch or "",
+                ))
+            except GitVersionError as exc:
+                raise WorkspaceConfigError(str(exc)) from exc
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_name(f".{self.path.name}.{uuid4().hex}.tmp")
         try:
@@ -90,5 +112,8 @@ class WorkspaceConfigService:
     def inspect(self) -> WorkspaceConfigState:
         return self.store.load()
 
-    def save(self, workspace: str | Path) -> WorkspaceConfigState:
-        return self.store.save(workspace)
+    def save(
+        self, workspace: str | Path, git_remote: str | None = None,
+        git_branch: str | None = None,
+    ) -> WorkspaceConfigState:
+        return self.store.save(workspace, git_remote, git_branch)

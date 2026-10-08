@@ -66,9 +66,16 @@ class RejectAction(ApprovalAction):
     reason: str = Field(default="", max_length=2000, description="拒绝原因。")
 
 
+class GitPublish(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_version: int = Field(ge=0)
+    fingerprint: str = Field(min_length=64, max_length=64, pattern="^[0-9a-f]{64}$")
+    summary: str = Field(min_length=1, max_length=120)
+
+
 def create_app(config: ServerConfig) -> FastAPI:
     service = ApiService(config)
-    app = FastAPI(title="AutoCoding Agent API", version="0.11.0")
+    app = FastAPI(title="AutoCoding Agent API", version="0.12.0")
     app.state.service = service
     bearer = HTTPBearer(auto_error=False)
 
@@ -143,5 +150,17 @@ def create_app(config: ServerConfig) -> FastAPI:
     @app.post("/v1/tasks/{task_id}/reject", status_code=202)
     def reject(task_id: UUID, body: RejectAction, owner: User, key: Key):
         return service.submit(owner, str(task_id), key, "reject", body.model_dump(mode="json"))
+
+    @app.post("/v1/tasks/{task_id}/git-sync", status_code=202)
+    def git_sync(task_id: UUID, body: ResumeTask, owner: User, key: Key):
+        return service.submit(owner, str(task_id), key, "git_sync", body.model_dump(mode="json"))
+
+    @app.get("/v1/tasks/{task_id}/git-preview")
+    def git_preview(task_id: UUID, owner: User):
+        return service.git_preview(owner, str(task_id))
+
+    @app.post("/v1/tasks/{task_id}/git-publish", status_code=202)
+    def git_publish(task_id: UUID, body: GitPublish, owner: User, key: Key):
+        return service.submit(owner, str(task_id), key, "git_publish", body.model_dump(mode="json"))
 
     return app

@@ -14,6 +14,7 @@ import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from test_agent_flows import ScriptedRuntime
+from test_git_version import git
 from test_incident_flow import ScriptedStructuredRuntime
 
 from autocoding_agent.application import build_application
@@ -28,6 +29,7 @@ from autocoding_agent.core.models import (
     ChangeProposal,
     ProposedChange,
 )
+from autocoding_agent.git_version import GitTarget
 from autocoding_agent.incident.application import build_incident_application
 from autocoding_agent.incident.models import IncidentDecision, IncidentSession, IncidentStatus
 from autocoding_api.config import ServerConfig
@@ -161,6 +163,60 @@ def test_http_development_start_and_send_preserve_core_contract(configured):
     assert all(turn.mode == AgentMode.INSPECT for turn in runtime.turns)
     final = client.get(f"/v1/tasks/{job['task_id']}", headers=headers()).json()
     assert final["state"] == "completed"
+
+
+def test_http_git_preview_publish_and_manual_sync(configured, tmp_path):
+    workspace = configured.projects["demo"].workspace
+    remote = tmp_path / "remote.git"
+    remote.mkdir()
+    git(remote, "init", "--bare")
+    git(workspace, "init", "-b", "main")
+    git(workspace, "config", "user.name", "Test User")
+    git(workspace, "config", "user.email", "test@example.invalid")
+    (workspace / "file.txt").write_text("initial", encoding="utf-8")
+    git(workspace, "add", "--all")
+    git(workspace, "commit", "-m", "initial")
+    git(workspace, "push", str(remote), "HEAD:refs/heads/main")
+    configured.projects["demo"].git_remote = str(remote)
+    configured.projects["demo"].git_branch = "main"
+    target = {str(workspace): GitTarget(workspace, str(remote), "main")}
+    settings = Settings(data_dir=configured.data_dir, hermes_skills_enabled=False)
+    apps = {
+        "development": build_application(
+            settings, runtime=ScriptedRuntime(
+                AgentDecision(status=AgentStatus.COMPLETED, message="检查完成")
+            ), git_targets=target,
+        ),
+        "incident": build_incident_application(
+            settings, runtime=ScriptedStructuredRuntime([]), git_targets=target,
+        ),
+    }
+    client = TestClient(create_app(configured))
+    job = create(client)
+    worker = Worker(configured, apps)
+    assert worker.run_once()
+    view = client.get(f"/v1/tasks/{job['task_id']}", headers=headers()).json()
+    assert view["state"] == "completed"
+    (workspace / "file.txt").write_text("changed", encoding="utf-8")
+    preview_path = f"/v1/tasks/{job['task_id']}/git-preview"
+    preview = client.get(preview_path, headers=headers()).json()
+    assert preview["files"] == ["file.txt"]
+    publish_path = f"/v1/tasks/{job['task_id']}/git-publish"
+    body = {"expected_version": view["version"], "fingerprint": preview["fingerprint"],
+            "summary": "update file"}
+    publish = client.post(publish_path, headers=headers("git-push"), json=body)
+    assert publish.status_code == 202
+    assert worker.run_once()
+    pushed = git(remote, "rev-parse", "refs/heads/main")
+    assert pushed == git(workspace, "rev-parse", "HEAD")
+    assert client.get(
+        f"/v1/jobs/{publish.json()['job_id']}", headers=headers(),
+    ).json()["progress"]["commit"] == pushed
+    sync_path = f"/v1/tasks/{job['task_id']}/git-sync"
+    assert client.post(sync_path, headers=headers("git-sync"), json={
+        "expected_version": view["version"]
+    }).status_code == 202
+    assert worker.run_once()
 
 
 def test_http_incident_uses_real_facade_and_returns_concise_result(configured):

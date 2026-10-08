@@ -41,6 +41,36 @@ def send(
     _invoke(lambda: build_application().send(session_id, message, command_id))
 
 
+@app.command("git-sync")
+def git_sync(
+    workspace: Annotated[
+        Path, typer.Option("--workspace", "-w", help="Configured repository root.")
+    ],
+) -> None:
+    """Fetch and fast-forward a configured clean workspace."""
+    try:
+        typer.echo(json.dumps({"head": build_application().sync_git(workspace)}))
+    except Exception as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1) from exc
+
+
+@app.command("git-preview")
+def git_preview(session_id: Annotated[str, typer.Option("--session-id", "-s")]) -> None:
+    """Review paths and obtain the fingerprint required for publishing."""
+    _query_json(lambda: build_application().git_preview(session_id))
+
+
+@app.command("git-publish")
+def git_publish(
+    session_id: Annotated[str, typer.Option("--session-id", "-s")],
+    summary: Annotated[str, typer.Option("--summary")],
+    fingerprint: Annotated[str, typer.Option("--fingerprint")],
+) -> None:
+    """Commit and push the exact reviewed working-tree snapshot."""
+    _query_json(lambda: build_application().git_publish(session_id, summary, fingerprint))
+
+
 @app.command()
 def approve(
     session_id: Annotated[str, typer.Option("--session-id", "-s")],

@@ -19,6 +19,7 @@ from autocoding_agent.core.progress import ProgressSink
 from autocoding_agent.core.recovery.models import RecoveryAction, RecoveryScanResult
 from autocoding_agent.core.runtime.models import RuntimeRunRecord
 from autocoding_agent.core.state_machine.machine import AgentStateMachine
+from autocoding_agent.git_version import GitTarget, GitVersionService
 from autocoding_agent.incident.capability_store import IncidentCapabilityStore
 from autocoding_agent.incident.engine import IncidentEngine
 from autocoding_agent.incident.models import IncidentOutcome, IncidentSession
@@ -29,6 +30,7 @@ from autocoding_agent.observability import configure_file_logging
 from autocoding_agent.ports.database import DatabaseReader
 from autocoding_agent.ports.hermes_skills import HermesSkillService
 from autocoding_agent.ports.structured_runtime import StructuredRuntime
+from autocoding_agent.workspace_config import WorkspaceConfigStore
 from autocoding_agent.workspace_knowledge import PROJECT_KNOWLEDGE_ROOT
 
 
@@ -40,10 +42,26 @@ class IncidentApplication:
         engine: IncidentEngine,
         log_path: Path | None = None,
         recovery_scan: RecoveryScanResult | None = None,
+        data_dir: Path | None = None,
+        git_targets: dict[str, GitTarget] | None = None,
     ) -> None:
         self._engine = engine
         self.log_path = log_path
         self.recovery_scan = recovery_scan or RecoveryScanResult()
+        self._data_dir = data_dir
+        self._git_targets = git_targets or {}
+
+    def sync_git(self, workspace: str | Path) -> str:
+        root = str(Path(workspace).resolve())
+        target = self._git_targets.get(root)
+        if target is None and self._data_dir is not None:
+            state = WorkspaceConfigStore(self._data_dir).load()
+            config = state.config
+            if config and str(Path(config.path).resolve()) == root and config.git_remote:
+                target = GitTarget(Path(root), config.git_remote, config.git_branch or "")
+        if target is None:
+            raise ValueError("请先在项目配置中填写 Git 远端地址和目标分支。")
+        return GitVersionService(target).sync()
 
     def start(
         self,
@@ -58,6 +76,14 @@ class IncidentApplication:
         attachments: list[MessageAttachment] | None = None,
         progress_sink: ProgressSink | None = None,
     ) -> IncidentOutcome:
+        root = str(Path(workspace).resolve())
+        configured = root in self._git_targets
+        if not configured and self._data_dir is not None:
+            state = WorkspaceConfigStore(self._data_dir).load()
+            configured = bool(state.config and state.config.git_remote
+                              and str(Path(state.config.path).resolve()) == root)
+        if configured:
+            self.sync_git(workspace)
         return self._engine.start(
             workspace,
             problem,
@@ -131,6 +157,7 @@ def build_incident_application(
     database_reference: str | None = None,
     knowledge_retriever: KnowledgeRetriever | None = None,
     hermes_skills: HermesSkillService | None = None,
+    git_targets: dict[str, GitTarget] | None = None,
 ) -> IncidentApplication:
     configured = settings or get_settings()
     configured.data_dir.mkdir(parents=True, exist_ok=True)
@@ -186,4 +213,4 @@ def build_incident_application(
         artifact_recorder=artifact_recorder,
         max_hermes_skill_rounds=configured.hermes_skill_max_rounds,
     )
-    return IncidentApplication(engine, log_path, recovery_scan)
+    return IncidentApplication(engine, log_path, recovery_scan, configured.data_dir, git_targets)
