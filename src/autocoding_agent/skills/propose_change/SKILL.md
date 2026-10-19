@@ -8,7 +8,8 @@ requesting permission to edit files.
    become. Set `path` whenever a concrete workspace file is known; use a null path only for a
    genuinely non-file area. Separate confirmed facts from design choices.
 3. State the expected user-visible or technical result, important impact, and how the result should
-   be validated.
+   be validated. Preserve existing API/method names, signatures, and observable contracts unless the
+   user explicitly requests a change; explain the compatibility impact of any requested change.
 4. Provide a useful preview whenever the task supports one without making edits:
    - UI: a compact text wireframe, interaction sequence, or before/after layout;
    - API or data: example request, response, schema, or transformation;
