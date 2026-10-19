@@ -75,7 +75,7 @@ class GitPublish(BaseModel):
 
 def create_app(config: ServerConfig) -> FastAPI:
     service = ApiService(config)
-    app = FastAPI(title="AutoCoding Agent API", version="0.14.0")
+    app = FastAPI(title="AutoCoding Agent API", version="0.14.1")
     app.state.service = service
     bearer = HTTPBearer(auto_error=False)
 

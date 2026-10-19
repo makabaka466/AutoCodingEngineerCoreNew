@@ -1,6 +1,6 @@
 # AutoCoding Engineer 接口与数据契约
 
-本文记录当前 `0.14.0` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
+本文记录当前 `0.14.1` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
 Runtime、持久化和状态契约。
 设计动机和运行流程见[架构说明](ARCHITECTURE.md)。
 新增独立 HTTP 路由、队列状态和 PowerShell 示例见[HTTP API](API.md)。
@@ -1365,3 +1365,8 @@ status=completed 只表示本次 Runtime 结果通过解析，不能证明业务
 failed_or_interrupted。无活动保持 null，不能把未观测到活动解释为零等待或快速成功。
 数据库日志 database_query_timing 记录 session_id、workflow、query_index、status、elapsed_ms；
 异常额外记录语义 stage。SQL、查询参数、业务行与模型文本不进入这些性能日志。
+
+
+0.14.1：ACE Logo 改为透明 PNG，侧栏标识沿用所在面板背景。Windows 在创建窗口前设置
+固定 AppUserModelID `AutoCodingEngineer.ACE.Desktop`，并设置 16/32/256 像素的透明窗口图标。
+重启客户端生效；已有固定的旧 Python 快捷方式可能需要取消固定后重新固定 ACE 窗口。

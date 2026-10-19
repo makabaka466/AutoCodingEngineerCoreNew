@@ -750,9 +750,19 @@ class DesktopClient:
             images = getattr(owner, "_ace_images", None)
             if images is None:
                 source = tk.PhotoImage(master=owner, file=str(logo_path))
-                images = (source.subsample(5), source.subsample(18))
+                icons = []
+                for size in (16, 32, 256):
+                    factor = max(1, (max(source.width(), source.height()) + size - 1) // size)
+                    scaled = source.subsample(factor)
+                    icon = tk.PhotoImage(master=owner, width=size, height=size)
+                    icon.tk.call(
+                        icon, "copy", scaled, "-to",
+                        (size - scaled.width()) // 2, (size - scaled.height()) // 2,
+                    )
+                    icons.append(icon)
+                images = (icons, source.subsample(max(1, (source.width() + 69) // 70)))
                 owner._ace_images = images
-            self.root.iconphoto(False, images[0])
+            self.root.iconphoto(True, *images[0])
             self._brand_logo = images[1]
         except (tk.TclError, OSError):
             logger.warning("ACE logo unavailable; using text brand")
@@ -796,7 +806,7 @@ class DesktopClient:
         brand.grid(row=0, column=0, sticky="ew", padx=12, pady=(14, 18))
         tk.Label(
             brand, image=self._brand_logo, text="ACE" if self._brand_logo is None else "",
-            font=("Segoe UI", 16, "bold"), bg="#FFFFFF", borderwidth=0,
+            font=("Segoe UI", 16, "bold"), bg=COLORS["sidebar"], borderwidth=0,
         ).pack(side="left", anchor="n")
         brand_copy = tk.Frame(brand, bg=COLORS["sidebar"])
         brand_copy.pack(side="left", padx=(10, 0), fill="x", expand=True)
@@ -3302,6 +3312,16 @@ def _release_single_instance() -> None:
 def main() -> None:
     """Start the native desktop client."""
 
+    if hasattr(ctypes, "windll"):
+        # 在创建任何窗口前声明 ACE 身份，使任务栏使用应用窗口图标而非 Python 分组。
+        try:
+            set_app_id = ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID
+            set_app_id.argtypes = [ctypes.c_wchar_p]
+            set_app_id.restype = ctypes.c_long
+            if set_app_id("AutoCodingEngineer.ACE.Desktop") != 0:
+                logger.warning("Unable to set ACE taskbar application identity")
+        except (AttributeError, OSError):
+            logger.warning("ACE taskbar application identity unavailable")
     _enable_windows_dpi_awareness()
     if not _acquire_single_instance():
         duplicate_root = tk.Tk()

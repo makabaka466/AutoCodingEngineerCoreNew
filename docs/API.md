@@ -1,4 +1,4 @@
-# HTTP API：独立接口与远程交互（0.14.0）
+# HTTP API：独立接口与远程交互（0.14.1）
 
 `src/autocoding_api/` 是独立交付层，HTTP 和执行进程分别运行；二者只调用现有
 `AgentApplication` / `IncidentApplication`。任务首先持久化到

@@ -1,6 +1,6 @@
 # AutoCoding Engineer 架构说明
 
-本文描述当前 `0.14.0` 代码已经实现的架构。数据字段、公共方法和命令行参数见
+本文描述当前 `0.14.1` 代码已经实现的架构。数据字段、公共方法和命令行参数见
 [接口与数据契约](INTERFACES.md)。
 
 开发质量约束合并进已有 investigate/propose/implement 方法：调查现有风格与复用点，方案
@@ -876,3 +876,8 @@ WorkspaceConfigService 负责确保每个项目两份知识文档存在。文件
 运行记录或模型恢复上下文。新任务使用固定项目知识。UI 切换不新增模型调用。
 Git 门面按工作目录查找项目配置，HTTP 注入的目标优先级不变。
 Logo 是随包分发的 PNG，通过 Tk 原生图片用于窗口图标和侧栏，不增加运行依赖。
+
+
+0.14.1：ACE Logo 改为透明 PNG，侧栏标识沿用所在面板背景。Windows 在创建窗口前设置
+固定 AppUserModelID `AutoCodingEngineer.ACE.Desktop`，并设置 16/32/256 像素的透明窗口图标。
+重启客户端生效；已有固定的旧 Python 快捷方式可能需要取消固定后重新固定 ACE 窗口。
