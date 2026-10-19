@@ -1,11 +1,20 @@
 # AutoCoding Engineer 接口与数据契约
 
-本文记录当前 `0.13.1` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
+本文记录当前 `0.14.0` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
 Runtime、持久化和状态契约。
 设计动机和运行流程见[架构说明](ARCHITECTURE.md)。
 新增独立 HTTP 路由、队列状态和 PowerShell 示例见[HTTP API](API.md)。
 
-0.13.1 仅合并开发方法的质量约束与更新版本元数据；沿用现有接口、结构化结果和审批协议。
+0.14.0 新增项目维护接口；既有应用 start/send/approve 等调用契约不变。
+
+- `WorkspaceConfigService.list_projects()`：返回项目列表，确保两类知识文件存在。
+- `WorkspaceConfigService.save_project(name, workspace, git_remote=None, git_branch=None, *, project_id=None)`：新增或更新项目；更新保留 ID。
+- `WorkspaceProject`：继承路径/Git 配置，增加 id、name、previous_paths、migrated。
+- `MarkdownKnowledgeService.ensure_project(project_id, *, legacy_name=None)`：幂等创建两份知识文档；只在迁移匹配明确时复制旧内容。
+- `save_branch` 现在允许空内容；UI 取消手动新增分支，项目选项来自统一目录。
+
+桌面新会话的 `project` 传稳定 ID，历史任务字段不批量改写。Git 按当前工作目录匹配项目。
+项目改名/改目录保留历史归属，已有任务仍在原目录执行。HTTP 项目白名单仍由独立配置管理。
 
 桌面对话页的“展开全文”“收起详情”“复制全文”作用于单条消息；顶部“展开全部”、
 “收起长文”和“最新回应”作用于当前对话展示。复制全文保留原始 Markdown 与完整内容。
@@ -93,7 +102,7 @@ def build_application(
 主要前置条件：
 
 - `start` 的工作区必须真实存在且为目录，任务消息不能为空；
-- `project` 对应当前流程 `knowledge/` 下的二级路径；桌面端要求新任务必须选择；
+- `project` 对应当前流程 `knowledge/` 下的项目 ID 目录（旧会话保留旧分支名）；桌面端要求新任务必须选择；
 - `send` 的消息不能为空；`completed` 会开启下一工作轮次，`cancelled` 不能重新打开；
 - `approve`、`reject` 只适用于存在 `pending_approval` 的会话；
 - session ID 必须是已保存的 UUID。
@@ -793,7 +802,7 @@ autocoding-agent-client
 
 - 启动前自动检测 Claude Code 和模型配置；未就绪时先显示配置页；
 - 顶部胶囊式“开发 / 异常处理”选择器，蓝底表示当前流程；
-- 对话输入区的“项目”选择框，只列出当前流程的二级路径并显示所用 MD 相对路径；
+- 对话输入区的“项目”选择框，列出已维护项目并自动加载对应模式的固定 MD；
 - 两套流程各自的当前 session、最近会话、欢迎提示、状态和结果渲染；
 - 白银浅色玻璃主题，左侧最近会话、中部对话/上下文，以及宽屏右侧真实任务概览；
 - 概览按当前流程 Session 计算今日任务、完成、进行中、完成率和七日趋势，并显示本机模型、
@@ -837,15 +846,13 @@ SQL Server 页包含服务器、端口、数据库、已安装 ODBC 驱动、Win
 日志、模型提示词或会话。两套流程共享连接；连接可随时更换，已有开发或异常会话保持原连接，
 新配置从对应流程的下一项任务开始。
 
-“项目路径”页保存开发与异常处理新任务共用的代码根目录。`WorkspaceConfigService.save()` 只接受
-当前存在且可访问的目录，规范路径以 JSON 原子写入 `<data_dir>/workspace/project.json`。配置
-切换不会改写已有 Session 中的 workspace；配置缺失或路径已不可访问时，桌面端阻止新任务并
-引导用户返回该页重新选择。
+“项目维护”页新增/编辑项目名称、代码目录及 Git 目标，原子保存到
+`<data_dir>/workspace/projects.json`；旧单项目配置会迁移且保留原文件。
+当前和旧目录不得重复绑定其他项目；修改目录不改变已有会话执行路径。
 
-“MD 能力配置”页不显示项目路径，直接按“开发/异常处理 → 二级路径”导航。点击添加时在项目
-`knowledge/` 下创建 `<二级路径>/<二级路径名>.md`，选择路径即可直接编辑并保存；只读路径框
-显示项目相对路径。未保存内容在切换流程、路径或关闭窗口前会得到确认。路径名不能包含路径分隔符、
-`..`、Windows 保留字符或设备名。
+“MD 能力配置”按“开发/异常处理 → 项目”导航，项目列表与维护页同步。
+每个项目自动创建两份固定文档，允许保存为空，不再手动新增分支。未保存内容在切换选择或
+关闭窗口前会提示。只读路径框显示真实文档位置，项目改名不会移动文件。
 
 ## 9. Streamlit Web UI
 

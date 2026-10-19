@@ -41,6 +41,28 @@ class MarkdownKnowledgeService:
             key=str.casefold,
         )
 
+    def ensure_project(self, project_id: str, *, legacy_name: str | None = None) -> None:
+        """每个项目固定两份用户知识；只创建缺失文件，绝不覆盖用户编辑。"""
+        for domain in KnowledgeDomain:
+            path = self.branch_path(domain, project_id)
+            if path.exists():
+                continue
+            content = ""
+            if legacy_name:
+                branches = [b for b in self.list_branches(domain) if not b.startswith("ace-")]
+                # 多份旧知识无法推断归属时全部保留原文件，不猜测合并。
+                source = legacy_name if legacy_name in branches else (
+                    branches[0] if len(branches) == 1 else None
+                )
+                if source:
+                    content = self.load_branch(domain, source)[1]
+            path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                with path.open("x", encoding="utf-8") as document:
+                    document.write(content)
+            except FileExistsError:
+                pass
+
     def create_branch(self, domain: KnowledgeDomain, name: str) -> Path:
         path = self.branch_path(domain, name)
         if path.parent.exists():
@@ -81,9 +103,7 @@ class MarkdownKnowledgeService:
         path = self.branch_path(domain, branch)
         if not path.is_file():
             raise WorkspaceKnowledgeError("请先选择或添加一个二级路径。")
-        if not content.strip():
-            raise WorkspaceKnowledgeError("Markdown 内容不能为空。")
-        self._atomic_text(path, content.rstrip() + "\n")
+        self._atomic_text(path, content.rstrip() + "\n" if content.strip() else "")
         return path
 
     def _domain_root(self, domain: KnowledgeDomain) -> Path:

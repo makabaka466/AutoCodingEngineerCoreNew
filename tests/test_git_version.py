@@ -10,6 +10,35 @@ import pytest
 from autocoding_agent.git_version import GitTarget, GitVersionError, GitVersionService
 
 
+def test_application_git_uses_each_project_target(repositories, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from autocoding_agent.application import AgentApplication
+    from autocoding_agent.incident.application import IncidentApplication
+    from autocoding_agent.workspace_config import WorkspaceConfigStore
+
+    first, second, remote = repositories
+    state = tmp_path / "state"
+    store = WorkspaceConfigStore(state)
+    store.save_project("first", first, str(remote), "main")
+    store.save_project("second", second, "origin", "main")
+    calls = []
+    monkeypatch.setattr(GitVersionService, "sync", lambda self: calls.append(self) or "head")
+    engine = SimpleNamespace(start=lambda *args, **kwargs: args)
+    development = AgentApplication(engine, data_dir=state)
+    incident = IncidentApplication(engine, data_dir=state)
+    development.start(second, "inspect")
+    incident.start(first, "diagnose")
+    assert len(calls) == 2
+    assert calls[0].target.workspace == second
+    assert calls[0].target.remote == "origin"
+    assert calls[1].target.workspace == first
+    assert calls[1].target.remote == str(remote)
+    # 两个项目均能找到配置，不能退回第一个项目的远端配置。
+    assert development.git(second) is not None
+    assert development.git(first) is not None
+
+
 def git(where: Path, *args: str) -> str:
     result = subprocess.run(
         ["git", *args], cwd=where, capture_output=True, text=True,

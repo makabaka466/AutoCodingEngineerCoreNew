@@ -650,7 +650,11 @@ class DesktopClient:
         self.setup_service = setup_service or ClaudeModelSetupService()
         self.sqlserver_service = sqlserver_service or SQLServerConnectionService()
         self.knowledge_service = knowledge_service or MarkdownKnowledgeService()
-        self.workspace_service = workspace_service or WorkspaceConfigService()
+        self.workspace_service = workspace_service or WorkspaceConfigService(
+            knowledge=self.knowledge_service,
+        )
+        self.workspace_service.knowledge = self.knowledge_service
+        self.projects = self.workspace_service.list_projects()
         self.attachment_store = attachment_store or IncidentAttachmentStore()
         self.embedding_service = embedding_service or EmbeddingSetupService()
         self.rag_service = rag_service
@@ -737,7 +741,21 @@ class DesktopClient:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _configure_window(self) -> None:
-        self.root.title("AutoCoding Engineer")
+        self.root.title("ACE · AutoCoding Engineer")
+        logo_path = Path(__file__).resolve().parents[1] / "assets" / "ace-logo.png"
+        self._brand_logo = None
+        try:
+            # 同一 Tk 解释器只解码一次，并仅保留缩小后的图标。
+            owner = self.root._root()
+            images = getattr(owner, "_ace_images", None)
+            if images is None:
+                source = tk.PhotoImage(master=owner, file=str(logo_path))
+                images = (source.subsample(5), source.subsample(18))
+                owner._ace_images = images
+            self.root.iconphoto(False, images[0])
+            self._brand_logo = images[1]
+        except (tk.TclError, OSError):
+            logger.warning("ACE logo unavailable; using text brand")
         self.root.configure(bg=COLORS["window"])
         screen_width = self.root.winfo_screenwidth()
         screen_height = self.root.winfo_screenheight()
@@ -777,13 +795,8 @@ class DesktopClient:
         brand = tk.Frame(sidebar, bg=COLORS["sidebar"])
         brand.grid(row=0, column=0, sticky="ew", padx=12, pady=(14, 18))
         tk.Label(
-            brand,
-            text="AC",
-            font=("Segoe UI Variable Display", 12, "bold"),
-            fg=COLORS["accent"],
-            bg=COLORS["accent_soft"],
-            width=3,
-            height=2,
+            brand, image=self._brand_logo, text="ACE" if self._brand_logo is None else "",
+            font=("Segoe UI", 16, "bold"), bg="#FFFFFF", borderwidth=0,
         ).pack(side="left", anchor="n")
         brand_copy = tk.Frame(brand, bg=COLORS["sidebar"])
         brand_copy.pack(side="left", padx=(10, 0), fill="x", expand=True)
@@ -1319,7 +1332,7 @@ class DesktopClient:
         project_row.grid_columnconfigure(2, weight=1)
         tk.Label(
             project_row,
-            text="知识项目",
+            text="项目",
             font=("Microsoft YaHei UI", 8, "bold"),
             fg=COLORS["muted"],
             bg=COLORS["input"],
@@ -1336,6 +1349,7 @@ class DesktopClient:
         tk.Label(
             project_row,
             textvariable=self.project_path_var,
+            width=1,
             font=("Microsoft YaHei UI", 8),
             fg=COLORS["muted"],
             bg=COLORS["input"],
@@ -1654,7 +1668,7 @@ class DesktopClient:
         self._draw_task_trend()
 
         try:
-            knowledge_count = len(self.knowledge_service.list_branches(self._knowledge_domain()))
+            knowledge_count = len(self.projects)
         except Exception:
             knowledge_count = 0
         self.knowledge_health_var.set(
@@ -1839,28 +1853,55 @@ class DesktopClient:
         )
 
     def _refresh_project_options(self) -> None:
-        projects = self.knowledge_service.list_branches(self._knowledge_domain())
-        self.project_combo.configure(values=projects)
-        selected = self._flow_projects[self.flow]
-        if selected not in projects:
-            selected = projects[0] if projects else ""
-        self.project_var.set(selected)
-        self._flow_projects[self.flow] = selected
+        self.projects = self.workspace_service.list_projects()
+        names = [p.name for p in self.projects]
+        self.project_combo.configure(values=names)
+        selected_id = self._flow_projects[self.flow]
+        project = next((p for p in self.projects if p.id == selected_id), None)
+        if project is None and self.projects:
+            project = self.projects[0]
+        self.project_var.set(project.name if project else "")
+        self._flow_projects[self.flow] = project.id if project else ""
         self._refresh_project_path()
         if hasattr(self, "knowledge_health_label"):
             self._refresh_overview()
 
     def _on_project_selected(self, _event: tk.Event[tk.Misc]) -> None:
-        self._flow_projects[self.flow] = self.project_var.get()
+        if self._busy:
+            return
+        project = next((p for p in self.projects if p.name == self.project_var.get()), None)
+        if project is None or project.id == self._flow_projects[self.flow]:
+            return
+        self._flow_projects[self.flow] = project.id
+        self.session_id = None
+        self._flow_session_ids[self.flow] = None
+        self._hide_approval()
+        self._clear_pending_attachments()
+        self.prompt_input.delete("1.0", "end")
+        self._reset_progress_display()
         self._refresh_project_path()
+        self._load_recent_sessions()
+        self._render_welcome()
+        self._sync_controls()
 
     def _refresh_project_path(self) -> None:
-        project = self.project_var.get()
-        if not project:
-            self.project_path_var.set("请先在系统配置中添加项目")
+        project = next((p for p in self.projects if p.name == self.project_var.get()), None)
+        if project is None:
+            self.project_path_var.set("请先在项目维护中新增项目")
             return
-        path = self.knowledge_service.branch_path(self._knowledge_domain(), project)
+        path = self.knowledge_service.branch_path(self._knowledge_domain(), project.id)
         self.project_path_var.set(self.knowledge_service.relative_path(path))
+        if self.session_id is None:
+            self.workspace_var.set(project.path)
+
+    def _restore_session_project(self, session: AgentSession | IncidentSession) -> None:
+        project = next(
+            (p for p in self.projects if p.owns(session.project, session.workspace)), None,
+        )
+        self.project_var.set(project.name if project else "")
+        self._flow_projects[self.flow] = project.id if project else ""
+        self._refresh_project_path()
+        self.workspace_var.set(session.workspace)
 
     def _active_application(self) -> AgentApplication | IncidentApplication:
         if self.flow == FlowKind.DEVELOPMENT:
@@ -1963,10 +2004,7 @@ class DesktopClient:
                 entries.append(("metadata", "\n".join(details)))
 
         self._replace_transcript(entries)
-        self.workspace_var.set(session.workspace)
-        self.project_var.set(session.project or "")
-        self._flow_projects[FlowKind.DEVELOPMENT] = session.project or ""
-        self._refresh_project_path()
+        self._restore_session_project(session)
         title = " ".join(session.goal.split()) or "未命名任务"
         self.task_title_var.set(title[:64] + ("…" if len(title) > 64 else ""))
         self._set_status(session.status)
@@ -2067,10 +2105,7 @@ class DesktopClient:
                 entries.append(("metadata", "\n".join(details)))
 
         self._replace_transcript(entries)
-        self.workspace_var.set(session.workspace)
-        self.project_var.set(session.project or "")
-        self._flow_projects[FlowKind.INCIDENT] = session.project or ""
-        self._refresh_project_path()
+        self._restore_session_project(session)
         title = " ".join(session.problem.split()) or "未命名异常"
         self.task_title_var.set(title[:64] + ("…" if len(title) > 64 else ""))
         if session.task_state in {TaskState.PAUSED, TaskState.RECOVERY_REQUIRED}:
@@ -2170,6 +2205,8 @@ class DesktopClient:
         except Exception as exc:
             self.status_var.set(f"读取历史任务失败：{exc}")
             return
+        project = next((p for p in self.projects if p.id == self._flow_projects[self.flow]), None)
+        sessions = [s for s in sessions if project and project.owns(s.project, s.workspace)]
         self.sessions_list.delete(0, "end")
         self._session_ids = [item.id for item in sessions]
         self._refresh_overview(sessions)
@@ -2218,7 +2255,7 @@ class DesktopClient:
         self._hide_approval()
         self._clear_pending_attachments()
         self._reload_configured_workspace()
-        self._refresh_project_options()
+        self._load_recent_sessions()
         self._render_welcome()
         self._reset_progress_display()
         self._sync_controls()
@@ -2245,6 +2282,7 @@ class DesktopClient:
             initial_section=section,
             embedding_service=self.embedding_service,
             workspace_service=self.workspace_service,
+            knowledge_service=self.knowledge_service,
             on_model_saved=self._apply_model_configuration,
             on_embedding_saved=self._apply_embedding_configuration,
             on_database_saved=self._apply_sqlserver_configuration,
@@ -2253,22 +2291,13 @@ class DesktopClient:
         )
 
     def _apply_workspace_configuration(self, state: WorkspaceConfigState) -> None:
-        if state.configured and state.config is not None:
-            if self.session_id is None:
-                self.workspace_var.set(state.config.path)
-            self.status_var.set("项目路径已保存；新任务将使用该路径。")
-        else:
-            self.status_var.set("项目路径尚未配置或当前不可访问。")
+        self._refresh_project_options()
+        self._load_recent_sessions(select_current=bool(self.session_id))
+        self.status_var.set("项目配置已保存；新任务使用最新目录，已有任务保留原目录。")
         self._sync_controls()
 
     def _reload_configured_workspace(self) -> None:
-        try:
-            state = self.workspace_service.inspect()
-        except Exception as exc:
-            self.workspace_var.set("")
-            self.status_var.set(f"读取项目路径配置失败：{exc}")
-            return
-        self.workspace_var.set(state.config.path if state.configured and state.config else "")
+        self._refresh_project_options()
 
     def _apply_sqlserver_configuration(self, state: SQLServerConfigState) -> None:
         if not state.configured or state.config is None:
@@ -2431,19 +2460,19 @@ class DesktopClient:
             return
 
         if self.session_id is None:
-            project = self.project_var.get().strip()
-            if not project:
-                self.status_var.set("请先选择项目；可在系统配置中添加项目。")
-                return
             try:
-                workspace_state = self.workspace_service.inspect()
+                project_config = next(
+                    (p for p in self.workspace_service.list_projects()
+                     if p.id == self._flow_projects[self.flow]), None,
+                )
             except Exception as exc:
-                self.status_var.set(f"读取项目路径配置失败：{exc}")
+                self.status_var.set(f"读取项目配置失败：{exc}")
                 return
-            if not workspace_state.configured or workspace_state.config is None:
-                self.status_var.set("请先在系统配置的“项目路径”中选择项目代码目录。")
+            if project_config is None:
+                self.status_var.set("请先选择项目，或在项目维护中新增项目。")
                 return
-            workspace = workspace_state.config.path
+            project = project_config.id
+            workspace = project_config.path
             self.workspace_var.set(workspace)
             path = Path(workspace).expanduser()
             if not path.is_dir():
@@ -2520,11 +2549,13 @@ class DesktopClient:
                 return
             workspace = session.workspace
         else:
-            state = self.workspace_service.inspect()
-            if not state.configured or state.config is None:
-                self.status_var.set("请先配置项目路径和 Git 目标。")
+            project = next(
+                (p for p in self.projects if p.id == self._flow_projects[self.flow]), None,
+            )
+            if project is None:
+                self.status_var.set("请先选择项目并配置 Git 目标。")
                 return
-            workspace = state.config.path
+            workspace = project.path
         self._set_busy(True, "正在更新代码")
 
         def run() -> None:
@@ -2669,6 +2700,8 @@ class DesktopClient:
         self._select_flow(FlowKind.DEVELOPMENT)
         self.session_id = None
         self._flow_session_ids[FlowKind.DEVELOPMENT] = None
+        self._restore_session_project(incident)
+        self._load_recent_sessions()
         self._render_welcome()
         self.flow_caption_var.set("异常处理 · 正在核对诊断并准备修复方案")
         self.task_title_var.set("异常处理：" + incident.problem[:48])
@@ -3019,7 +3052,7 @@ class DesktopClient:
         self.remediation_button.configure(state="disabled" if self._busy else "normal")
         self.incident_details_button.configure(state="disabled" if self._busy else "normal")
         can_start_new = not self._busy
-        can_choose_project = not self._busy and self.session_id is None
+        can_choose_project = not self._busy
         can_send = not self._busy and self._current_task_state not in {
             TaskState.CANCELLED,
             TaskState.PAUSED,
@@ -3039,10 +3072,7 @@ class DesktopClient:
         input_height = 1 if reviewing else (2 if compact or self.session_id else 4)
         self.prompt_input.configure(height=input_height)
         self.approval_text.configure(height=5 if compact else 9)
-        if reviewing or self.session_id:
-            self.project_row.grid_remove()
-        else:
-            self.project_row.grid()
+        self.project_row.grid()
         self.new_task_button.configure(state="normal" if can_start_new else "disabled")
         self.project_combo.configure(state="readonly" if can_choose_project else "disabled")
         recovery_state = False

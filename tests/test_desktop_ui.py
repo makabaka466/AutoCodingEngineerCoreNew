@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import tkinter as tk
 from collections.abc import Callable, Iterator
 from datetime import datetime, timedelta, timezone
@@ -64,8 +65,10 @@ from autocoding_agent.sqlserver_config import (
     SQLServerConnectionConfig,
 )
 from autocoding_agent.workspace_config import (
-    WorkspaceConfig,
+    WorkspaceConfigService,
     WorkspaceConfigState,
+    WorkspaceConfigStore,
+    WorkspaceProject,
 )
 from autocoding_agent.workspace_knowledge import KnowledgeDomain, MarkdownKnowledgeService
 
@@ -280,22 +283,31 @@ class FakeIncidentApplication:
 
 
 class FakeWorkspaceService:
-    def __init__(self, path: Path) -> None:
-        self.state = WorkspaceConfigState(
-            config=WorkspaceConfig(path=str(path)),
-            available=path.is_dir(),
-        )
+    def __init__(self, path: Path, **_kwargs) -> None:
+        self.project = WorkspaceProject(id="ace-test", name="生物", path=str(path))
+        self.state = WorkspaceConfigState(config=self.project, available=path.is_dir())
 
     def inspect(self) -> WorkspaceConfigState:
         return self.state
 
-    def save(self, workspace: str | Path) -> WorkspaceConfigState:
-        path = Path(workspace).resolve()
-        self.state = WorkspaceConfigState(
-            config=WorkspaceConfig(path=str(path)),
-            available=path.is_dir(),
+    def list_projects(self) -> list[WorkspaceProject]:
+        self.knowledge.ensure_project(self.project.id, legacy_name=self.project.name)
+        return [self.project]
+
+
+@pytest.fixture(autouse=True)
+def isolated_project_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # UI tests must never migrate or modify the developer's actual project catalog/knowledge.
+    for module in ("desktop_ui", "system_settings_ui"):
+        monkeypatch.setattr(
+            f"autocoding_agent.interfaces.{module}.WorkspaceConfigService",
+            lambda **kwargs: FakeWorkspaceService(Path.cwd()),
         )
-        return self.state
+        monkeypatch.setattr(
+            f"autocoding_agent.interfaces.{module}.MarkdownKnowledgeService",
+            lambda: MarkdownKnowledgeService(tmp_path / "knowledge-state"),
+        )
+
 
 @pytest.fixture(scope="session")
 def tk_root() -> Iterator[tk.Tk]:
@@ -316,6 +328,8 @@ def root(tk_root: tk.Tk) -> Iterator[tk.Toplevel]:
     yield window
     if window.winfo_exists():
         window.destroy()
+    # Tk 对象必须在主线程回收，避免后续 HTTP worker 的 GC 触发 Tcl 调用。
+    gc.collect()
 
 
 def _session(status: AgentStatus = AgentStatus.NEEDS_INPUT) -> AgentSession:
@@ -561,7 +575,7 @@ def test_new_task_routes_first_message_to_application_start(
     client._send_message()
     outcome = operations[0]()
 
-    assert application.calls == [("start", str(tmp_path), "调查 src/app.py 的报错", "生物")]
+    assert application.calls == [("start", str(tmp_path), "调查 src/app.py 的报错", "ace-test")]
     assert outcome.status == AgentStatus.NEEDS_INPUT
 
 
@@ -772,7 +786,7 @@ def test_system_settings_combines_model_and_shared_database_without_revealing_se
         "模型与 Claude Code",
         "Embedding",
         "SQL Server",
-        "项目路径",
+        "项目维护",
         "MD 能力配置",
     ]
     root.update_idletasks()
@@ -819,19 +833,18 @@ def test_system_settings_combines_model_and_shared_database_without_revealing_se
     assert dialog.knowledge_save_button.winfo_manager() == "pack"
     assert not hasattr(dialog, "knowledge_workspace_entry")
     assert dialog.knowledge_branch_var.get() == "生物"
-    assert dialog.knowledge_path_var.get() == "knowledge/development/生物/生物.md"
+    assert dialog.knowledge_path_var.get() == "knowledge/development/ace-test/ace-test.md"
     dialog.knowledge_editor.delete("1.0", "end")
     dialog.knowledge_editor.insert("1.0", "# Updated guide\n")
     assert dialog._save_knowledge() is True
     assert "Updated guide" in knowledge_service.branch_path(
-        KnowledgeDomain.DEVELOPMENT, "生物"
+        KnowledgeDomain.DEVELOPMENT, "ace-test"
     ).read_text(encoding="utf-8")
     dialog.knowledge_domain_var.set("异常处理")
     dialog._refresh_knowledge()
-    dialog.knowledge_new_branch_var.set("生物")
-    dialog._add_knowledge_branch()
+    assert not hasattr(dialog, "knowledge_add_branch_button")
     assert dialog.knowledge_branch_var.get() == "生物"
-    assert dialog.knowledge_path_var.get() == "knowledge/incident/生物/生物.md"
+    assert dialog.knowledge_path_var.get() == "knowledge/incident/ace-test/ace-test.md"
     dialog._close()
 
 
@@ -920,7 +933,7 @@ def test_long_evidence_summary_keeps_compact_window_composer_visible(root: tk.To
     client._render_session(session)
     root.geometry("980x720")
     root.deiconify()
-    root.update_idletasks()
+    root.update()  # 完成窗口 Configure 事件后再测量响应式布局。
     assert client.activity_frame.winfo_height() < 160
     assert client.prompt_input.winfo_rooty() + client.prompt_input.winfo_height() <= (
         root.winfo_rooty() + root.winfo_height()
@@ -1008,7 +1021,7 @@ def test_flow_selector_shows_active_flow_and_reveals_incident_fields(
     assert client.incident_flow_button.selected is False
     assert not hasattr(client, "incident_context_frame")
     assert client.project_var.get() == "生物"
-    assert client.project_path_var.get() == "knowledge/development/生物/生物.md"
+    assert client.project_path_var.get() == "knowledge/development/ace-test/ace-test.md"
 
     client._select_flow(FlowKind.INCIDENT)
 
@@ -1022,7 +1035,90 @@ def test_flow_selector_shows_active_flow_and_reveals_incident_fields(
     assert not hasattr(client, "page_hint_entry")
     assert not hasattr(client, "database_browse_button")
     assert client.project_var.get() == "生物"
-    assert client.project_path_var.get() == "knowledge/incident/生物/生物.md"
+    assert client.project_path_var.get() == "knowledge/incident/ace-test/ace-test.md"
+
+
+def test_project_switch_isolates_history_and_routes_new_tasks(
+    root: tk.Toplevel, tmp_path: Path,
+) -> None:
+    knowledge = MarkdownKnowledgeService(tmp_path / "ace")
+    service = WorkspaceConfigService(
+        store=WorkspaceConfigStore(tmp_path / "state"), knowledge=knowledge,
+    )
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    a = service.save_project("项目 A", first)
+    b = service.save_project("项目 B", second)
+    sa, sb = _session(), _session()
+    sa.workspace, sa.project = str(first), a.id
+    sb.workspace, sb.project = str(second), b.id
+    app = FakeApplication([sa, sb])
+    incident = IncidentSession(
+        id=str(uuid4()), workspace=str(first), project=a.id, problem="A 异常",
+        status=IncidentStatus.NEEDS_INPUT,
+    )
+    client = DesktopClient(
+        root, app, FakeIncidentApplication([incident]),
+        knowledge_service=knowledge, workspace_service=service,
+    )
+    assert client._session_ids == [sa.id]
+    client.session_id = sa.id
+    client._render_session(sa)
+    client.project_var.set(b.name)
+    client._on_project_selected(None)
+    assert client.session_id is None
+    assert client._session_ids == [sb.id]
+    assert client.workspace_var.get() == str(second)
+    operations = _capture_operation(client)
+    client.prompt_input.insert("1.0", "处理 B")
+    client._send_message()
+    operations[0]()
+    assert app.calls[-1] == ("start", str(second), "处理 B", b.id)
+    client._select_flow(FlowKind.INCIDENT)
+    assert client._session_ids == [incident.id]
+    assert client.project_path_var.get().endswith(f"incident/{a.id}/{a.id}.md")
+    client.project_var.set(b.name)
+    client._on_project_selected(None)
+    assert client._session_ids == []
+    assert app.get_session(sa.id).workspace == str(first)
+
+
+def test_project_settings_creates_both_documents_and_keeps_them_on_rename(
+    root: tk.Toplevel, tmp_path: Path,
+) -> None:
+    knowledge = MarkdownKnowledgeService(tmp_path / "ace")
+    service = WorkspaceConfigService(
+        store=WorkspaceConfigStore(tmp_path / "state"), knowledge=knowledge,
+    )
+    from types import SimpleNamespace
+
+    dialog = SystemSettingsDialog(
+        root, SimpleNamespace(inspect=lambda: ModelSetupState(
+            installation=ClaudeInstallation(found=False), endpoint="", model="",
+            has_api_key=False, ready=False,
+        )),
+        SimpleNamespace(inspect=lambda: SQLServerConfigState(), drivers=lambda: []),
+        workspace_service=service, knowledge_service=knowledge,
+    )
+    dialog._new_workspace_project()
+    dialog.workspace_name_var.set("新增项目")
+    dialog.workspace_path_var.set(str(tmp_path))
+    dialog._save_workspace()
+    project = service.list_projects()[0]
+    assert dialog.knowledge_branch_combo.cget("values") == ("新增项目",)
+    assert dialog.knowledge_editor.get("1.0", "end-1c") == ""
+    dialog.knowledge_editor.insert("1.0", "业务规则")
+    assert dialog._save_knowledge()
+    dialog.workspace_name_var.set("改名项目")
+    dialog._save_workspace()
+    assert service.list_projects()[0].id == project.id
+    assert dialog.knowledge_branch_var.get() == "改名项目"
+    assert dialog.knowledge_editor.get("1.0", "end-1c").strip() == "业务规则"
+    dialog.knowledge_domain_var.set("异常处理")
+    dialog._refresh_knowledge()
+    assert dialog.knowledge_editor.get("1.0", "end-1c") == ""
+    dialog._close()
 
 
 def test_incident_flow_routes_problem_from_configured_workspace(
@@ -1050,7 +1146,7 @@ def test_incident_flow_routes_problem_from_configured_workspace(
             str(tmp_path),
             "订单页面 /orders/42 一直停留在处理中",
             "",
-            "生物",
+            "ace-test",
         )
     ]
 
@@ -1100,7 +1196,7 @@ def test_incident_screenshot_paste_attaches_image_and_allows_image_only_send(
             str(tmp_path),
             "请根据粘贴的异常界面截图定位并诊断问题。",
             "",
-            "生物",
+            "ace-test",
         )
     ]
     assert incident_application.attachments == [[attachment]]

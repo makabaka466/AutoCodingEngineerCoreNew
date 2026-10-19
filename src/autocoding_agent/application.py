@@ -60,8 +60,8 @@ class AgentApplication:
         root = str(Path(workspace).resolve())
         target = self._git_targets.get(root)
         if target is None and self._data_dir is not None:
-            state = WorkspaceConfigStore(self._data_dir).load()
-            config = state.config
+            config = next((item for item in WorkspaceConfigStore(self._data_dir).list_projects()
+                           if str(Path(item.path).resolve()) == root), None)
             if config and str(Path(config.path).resolve()) == root and config.git_remote:
                 target = GitTarget(Path(root), config.git_remote, config.git_branch or "")
         return GitVersionService(target) if target else None

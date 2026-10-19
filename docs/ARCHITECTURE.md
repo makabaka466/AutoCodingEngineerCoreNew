@@ -1,6 +1,6 @@
 # AutoCoding Engineer 架构说明
 
-本文描述当前 `0.13.1` 代码已经实现的架构。数据字段、公共方法和命令行参数见
+本文描述当前 `0.14.0` 代码已经实现的架构。数据字段、公共方法和命令行参数见
 [接口与数据契约](INTERFACES.md)。
 
 开发质量约束合并进已有 investigate/propose/implement 方法：调查现有风格与复用点，方案
@@ -513,11 +513,11 @@ Windows 上的生成模型 API Key 只持久化到当前用户的 `HKCU\Environm
 
 能力记忆位于 `Settings.data_dir/workspaces/<workspace_id>/`，不会写入目标仓库。其下按领域
 分成 `development/` 与 `incident/`；两边各有自己的索引、task JSON 和 Markdown，不会互读。
-项目根目录的 `knowledge/<development|incident>/<二级路径>/<二级路径名>.md` 保存用户维护的
-基础知识，一个二级路径只对应一份同名 Markdown。任务开始时，只有用户在对话页“项目”
-选择框选中的 MD 会同步到当前工作区能力目录的 `pinned/` 只读视图并进入索引；所选项目名
-持久化在 session 中，后续对话继续使用同一份知识。自动完成任务产生的文档仍进入
-`capabilities/`。开发与异常处理拥有各自的二级路径，同名路径也不会共享文件。
+项目根目录的 `knowledge/<development|incident>/<项目ID>/<项目ID>.md` 保存用户维护的
+基础知识，每个项目在两套流程各有一份固定 Markdown，新建为空。任务开始时，只有用户在对话页“项目”
+选择框选中的 MD 会同步到当前工作区能力目录的 `pinned/` 只读视图并进入索引；所选项目 ID
+持久化在新 session 中，后续对话继续使用同一份知识。自动完成任务产生的文档仍进入
+`capabilities/`。开发与异常处理各有自己的文件，项目名称修改不改变文件位置。
 `MarkdownKnowledgeService` 校验 Windows 文件名、限定项目知识目录并执行原子保存。
 `workspace_id` 是规范化工作区绝对路径（不区分大小写）计算出的 SHA-256 前 16 位，因此
 不同路径的项目默认隔离。
@@ -553,12 +553,12 @@ flowchart LR
 └─ workspaces/<workspace-id>/
    ├─ development/
    │  ├─ CAPABILITIES.md
-   │  ├─ pinned/<二级路径>/<二级路径名>.md
+   │  ├─ pinned/<项目ID>/<项目ID>.md
    │  ├─ tasks/<session-id>.json
    │  └─ capabilities/<session-id>.md
    └─ incident/
       ├─ CAPABILITIES.md
-      ├─ pinned/<二级路径>/<二级路径名>.md
+      ├─ pinned/<项目ID>/<项目ID>.md
       ├─ tasks/<session-id>.json
       └─ capabilities/<session-id>.md
 ```
@@ -567,8 +567,8 @@ flowchart LR
 
 ```text
 knowledge/
-├─ development/<二级路径>/<二级路径名>.md
-└─ incident/<二级路径>/<二级路径名>.md
+├─ development/<项目ID>/<项目ID>.md
+└─ incident/<项目ID>/<项目ID>.md
 ```
 
 开发能力 Markdown 包含适用场景、方法、验证、风险、任务证据和来源任务；异常能力 Markdown
@@ -863,3 +863,16 @@ ClaudeCodeRuntime 使用 monotonic 时钟记录宿主可观测耗时；重叠工
 保持 null，不推算首字时间或模型计算时间。失败/中断后的 finally 同样生成时间摘要。两套 Engine
 在数据库执行处记录成功/失败耗时，无新增日志正文或业务值。运行记录、审批事务与每条活动的
 持久化机制不变，避免以性能优化牺牲恢复或审计。
+
+## 0.14.0 多项目与知识归属
+
+WorkspaceConfigStore 增加 projects.json 项目目录，WorkspaceProject 以稳定 ID 关联名称、
+当前路径、旧路径及 Git 目标。旧单项目配置保持读取/保存兼容；原文件不删除。
+WorkspaceConfigService 负责确保每个项目两份知识文档存在。文件只在缺失时创建，保存为空合法。
+桌面选择器显示名称，传入应用的 project 为稳定 ID；历史按项目身份或旧路径过滤，再按开发/
+异常应用分开读取。修改路径不重写已有任务快照。项目路径及其旧路径不可重复归属其他项目。
+
+知识编辑和自动会话经验保持分离。已有历史任务继续使用原 project/知识分支；不隐式修改审批、
+运行记录或模型恢复上下文。新任务使用固定项目知识。UI 切换不新增模型调用。
+Git 门面按工作目录查找项目配置，HTTP 注入的目标优先级不变。
+Logo 是随包分发的 PNG，通过 Tk 原生图片用于窗口图标和侧栏，不增加运行依赖。

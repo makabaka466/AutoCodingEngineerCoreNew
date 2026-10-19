@@ -33,6 +33,7 @@ from autocoding_agent.sqlserver_service import (
 from autocoding_agent.workspace_config import (
     WorkspaceConfigService,
     WorkspaceConfigState,
+    WorkspaceProject,
 )
 from autocoding_agent.workspace_knowledge import (
     KnowledgeDomain,
@@ -76,7 +77,12 @@ class SystemSettingsDialog:
         self.database_service = database_service
         self.embedding_service = embedding_service or EmbeddingSetupService()
         self.knowledge_service = knowledge_service or MarkdownKnowledgeService()
-        self.workspace_service = workspace_service or WorkspaceConfigService()
+        self.workspace_service = workspace_service or WorkspaceConfigService(
+            knowledge=self.knowledge_service,
+        )
+        self.workspace_service.knowledge = self.knowledge_service
+        self.projects = self.workspace_service.list_projects()
+        self._editing_project_id: str | None = self.projects[0].id if self.projects else None
         self.on_model_saved = on_model_saved
         self.on_embedding_saved = on_embedding_saved
         self.on_database_saved = on_database_saved
@@ -172,7 +178,7 @@ class SystemSettingsDialog:
         self.notebook.add(self.model_tab, text="模型与 Claude Code")
         self.notebook.add(self.embedding_tab, text="Embedding")
         self.notebook.add(self.database_tab, text="SQL Server")
-        self.notebook.add(self.workspace_tab, text="项目路径")
+        self.notebook.add(self.workspace_tab, text="项目维护")
         self.notebook.add(self.knowledge_tab, text="MD 能力配置")
         self._build_model_tab()
         self._build_embedding_tab()
@@ -199,7 +205,7 @@ class SystemSettingsDialog:
             footer, "保存数据库配置", self._save_database, ACCENT, "#FFFFFF"
         )
         self.workspace_save_button = self._button(
-            footer, "保存项目路径", self._save_workspace, ACCENT, "#FFFFFF"
+            footer, "保存项目", self._save_workspace, ACCENT, "#FFFFFF"
         )
         self.knowledge_save_button = self._button(
             footer, "保存 Markdown", self._save_knowledge, ACCENT, "#FFFFFF"
@@ -440,13 +446,30 @@ class SystemSettingsDialog:
         tab = self.workspace_tab
         tab.grid_columnconfigure(0, weight=1)
         self.workspace_path_var = tk.StringVar()
+        self.workspace_name_var = tk.StringVar()
+        self.workspace_choice_var = tk.StringVar()
         self.git_remote_var = tk.StringVar()
         self.git_branch_var = tk.StringVar()
         self.workspace_status_var = tk.StringVar()
         self.workspace_status_label = self._status(tab, self.workspace_status_var, 0)
-        self._field_label(tab, "项目代码根目录", 1)
+        project_row = tk.Frame(tab, bg=CARD)
+        project_row.grid(row=1, column=0, sticky="ew", padx=26, pady=8)
+        self.workspace_combo = ttk.Combobox(
+            project_row, textvariable=self.workspace_choice_var, state="readonly",
+            values=[p.name for p in self.projects], width=26,
+        )
+        self.workspace_combo.pack(side="left")
+        self.workspace_combo.bind("<<ComboboxSelected>>", self._select_workspace_project)
+        self._button(project_row, "新增项目", self._new_workspace_project, PANEL, TEXT).pack(
+            side="left", padx=10,
+        )
+        self._field_label(tab, "项目名称", 2)
+        self._entry(tab, self.workspace_name_var).grid(
+            row=3, column=0, sticky="ew", padx=26, ipady=5,
+        )
+        self._field_label(tab, "项目代码根目录", 4)
         path_row = tk.Frame(tab, bg=CARD)
-        path_row.grid(row=2, column=0, sticky="ew", padx=26)
+        path_row.grid(row=5, column=0, sticky="ew", padx=26)
         path_row.grid_columnconfigure(0, weight=1)
         self.workspace_path_entry = self._entry(path_row, self.workspace_path_var)
         self.workspace_path_entry.grid(row=0, column=0, sticky="ew", ipady=5)
@@ -457,20 +480,20 @@ class SystemSettingsDialog:
         tk.Label(
             tab,
             text=(
-                "开发与异常处理的新任务共用此路径；已创建的会话继续使用其保存的原路径。"
+                "每个项目绑定独立目录和两份知识文件；旧会话仍使用创建时的目录。"
             ),
             font=("Microsoft YaHei UI", 8),
             fg=MUTED,
             bg=CARD,
             anchor="w",
-        ).grid(row=3, column=0, sticky="ew", padx=26, pady=(8, 12))
-        self._field_label(tab, "Git 远端地址或名称（例如 origin）", 4)
+        ).grid(row=6, column=0, sticky="ew", padx=26, pady=(8, 12))
+        self._field_label(tab, "Git 远端地址或名称（例如 origin）", 7)
         self._entry(tab, self.git_remote_var).grid(
-            row=5, column=0, sticky="ew", padx=26, ipady=5,
+            row=8, column=0, sticky="ew", padx=26, ipady=5,
         )
-        self._field_label(tab, "目标分支", 6)
+        self._field_label(tab, "目标分支", 9)
         self._entry(tab, self.git_branch_var).grid(
-            row=7, column=0, sticky="ew", padx=26, ipady=5,
+            row=10, column=0, sticky="ew", padx=26, ipady=5,
         )
 
     def _build_knowledge_tab(self) -> None:
@@ -479,7 +502,6 @@ class SystemSettingsDialog:
         tab.grid_rowconfigure(3, weight=1)
         self.knowledge_domain_var = tk.StringVar(value="开发")
         self.knowledge_branch_var = tk.StringVar()
-        self.knowledge_new_branch_var = tk.StringVar()
         self.knowledge_path_var = tk.StringVar()
         self.knowledge_status_var = tk.StringVar()
         self._loaded_knowledge: tuple[str, str] | None = None
@@ -502,7 +524,7 @@ class SystemSettingsDialog:
         self.knowledge_domain_combo.bind(
             "<<ComboboxSelected>>", self._on_knowledge_domain_changed
         )
-        self._inline_row_label(branch_row, "二级路径", 2)
+        self._inline_row_label(branch_row, "项目", 2)
         self.knowledge_branch_combo = ttk.Combobox(
             branch_row,
             textvariable=self.knowledge_branch_var,
@@ -514,18 +536,6 @@ class SystemSettingsDialog:
         self.knowledge_branch_combo.bind(
             "<<ComboboxSelected>>", self._on_knowledge_branch_changed
         )
-        self._inline_row_label(branch_row, "新增路径名", 4)
-        self.knowledge_new_branch_entry = self._entry(
-            branch_row, self.knowledge_new_branch_var
-        )
-        self.knowledge_new_branch_entry.grid(
-            row=0, column=5, sticky="ew", padx=(8, 0), ipady=5
-        )
-        self.knowledge_add_branch_button = self._button(
-            branch_row, "添加", self._add_knowledge_branch, PANEL, TEXT
-        )
-        self.knowledge_add_branch_button.grid(row=0, column=6, padx=(8, 0))
-
         path_row = tk.Frame(tab, bg=CARD)
         path_row.grid(row=2, column=0, sticky="ew", padx=26, pady=(0, 6))
         path_row.grid_columnconfigure(1, weight=1)
@@ -645,6 +655,14 @@ class SystemSettingsDialog:
 
     def _load_workspace_state(self, state: WorkspaceConfigState) -> None:
         self.workspace_state = state
+        if isinstance(state.config, WorkspaceProject):
+            self._editing_project_id = state.config.id
+            self.workspace_name_var.set(state.config.name)
+            self.workspace_choice_var.set(state.config.name)
+        elif self.projects:
+            self._editing_project_id = self.projects[0].id
+            self.workspace_name_var.set(self.projects[0].name)
+            self.workspace_choice_var.set(self.projects[0].name)
         if state.config is not None:
             self.workspace_path_var.set(state.config.path)
             self.git_remote_var.set(state.config.git_remote or "")
@@ -839,17 +857,38 @@ class SystemSettingsDialog:
         if selected:
             self.workspace_path_var.set(str(Path(selected).resolve()))
 
+    def _new_workspace_project(self) -> None:
+        self._editing_project_id = None
+        self.workspace_choice_var.set("")
+        for variable in (self.workspace_name_var, self.workspace_path_var,
+                         self.git_remote_var, self.git_branch_var):
+            variable.set("")
+        self._set_workspace_status("保存项目后自动创建开发和异常两份空知识文件。", MUTED)
+
+    def _select_workspace_project(self, _event: tk.Event[tk.Misc]) -> None:
+        project = next(p for p in self.projects if p.name == self.workspace_choice_var.get())
+        self._load_workspace_state(WorkspaceConfigState(
+            config=project, available=Path(project.path).is_dir(),
+        ))
+
     def _save_workspace(self) -> None:
-        try:
-            state = self.workspace_service.save(
-                self.workspace_path_var.get(), self.git_remote_var.get().strip(),
-                self.git_branch_var.get().strip(),
-            )
-        except Exception as exc:
-            messagebox.showerror("项目路径未保存", str(exc), parent=self.window)
+        if not self._confirm_discard_knowledge():
             return
+        try:
+            project = self.workspace_service.save_project(
+                self.workspace_name_var.get(), self.workspace_path_var.get(),
+                self.git_remote_var.get().strip(), self.git_branch_var.get().strip(),
+                project_id=self._editing_project_id,
+            )
+            self.projects = self.workspace_service.list_projects()
+            self.workspace_combo.configure(values=[p.name for p in self.projects])
+        except Exception as exc:
+            messagebox.showerror("项目未保存", str(exc), parent=self.window)
+            return
+        state = WorkspaceConfigState(config=project, available=True)
         self._load_workspace_state(state)
-        self._set_workspace_status("项目路径已保存，将用于两套流程的新任务。", SUCCESS)
+        self._refresh_knowledge(preferred_branch=project.name)
+        self._set_workspace_status("项目已保存，开发和异常知识文件均已准备。", SUCCESS)
         if self.on_workspace_saved:
             self.on_workspace_saved(state)
 
@@ -870,8 +909,8 @@ class SystemSettingsDialog:
             self._restore_loaded_knowledge_selection()
             return
         try:
-            domain = self._knowledge_domain()
-            branches = self.knowledge_service.list_branches(domain)
+            self.projects = self.workspace_service.list_projects()
+            branches = [p.name for p in self.projects]
             self.knowledge_branch_combo.configure(values=branches)
             selected_branch = preferred_branch or self.knowledge_branch_var.get()
             if selected_branch not in branches:
@@ -882,7 +921,7 @@ class SystemSettingsDialog:
             else:
                 self._clear_knowledge_editor()
                 self.knowledge_path_var.set("")
-                self._set_knowledge_status("请先添加一个二级分支。", MUTED)
+                self._set_knowledge_status("请先在项目维护中新增项目。", MUTED)
         except Exception as exc:
             self.knowledge_branch_combo.configure(values=[])
             self.knowledge_branch_var.set("")
@@ -894,7 +933,8 @@ class SystemSettingsDialog:
         try:
             domain = self._knowledge_domain()
             branch = self.knowledge_branch_var.get()
-            path, content = self.knowledge_service.load_branch(domain, branch)
+            project = next(p for p in self.projects if p.name == branch)
+            path, content = self.knowledge_service.load_branch(domain, project.id)
         except Exception as exc:
             self._set_knowledge_status(f"无法读取 Markdown：{exc}", DANGER)
             return
@@ -903,39 +943,18 @@ class SystemSettingsDialog:
         self.knowledge_editor.edit_modified(False)
         self.knowledge_path_var.set(self.knowledge_service.relative_path(path))
         self._loaded_knowledge = (domain.value, branch)
-        self._set_knowledge_status("已加载该二级分支的唯一文档，可直接编辑。", SUCCESS)
+        self._set_knowledge_status("已加载该项目的唯一知识文档，可编辑或保存为空。", SUCCESS)
 
     def _clear_knowledge_editor(self) -> None:
         self.knowledge_editor.delete("1.0", "end")
         self.knowledge_editor.edit_modified(False)
         self._loaded_knowledge = None
 
-    def _add_knowledge_branch(self) -> None:
-        if not self._confirm_discard_knowledge():
-            return
-        name = self.knowledge_new_branch_var.get()
-        try:
-            path = self.knowledge_service.create_branch(self._knowledge_domain(), name)
-        except WorkspaceKnowledgeError as exc:
-            messagebox.showerror("无法添加二级分支", str(exc), parent=self.window)
-            return
-        except Exception as exc:
-            messagebox.showerror("添加分支失败", str(exc), parent=self.window)
-            return
-        self.knowledge_new_branch_var.set("")
-        self._refresh_knowledge(preferred_branch=path.stem)
-        self._set_knowledge_status(
-            f"已添加二级分支 {path.stem}，并创建唯一 Markdown 文档。", SUCCESS
-        )
-        if self.on_knowledge_changed:
-            self.on_knowledge_changed()
-        self.knowledge_editor.focus_set()
-
     def _save_knowledge(self) -> bool:
         try:
             path = self.knowledge_service.save_branch(
                 self._knowledge_domain(),
-                self.knowledge_branch_var.get(),
+                next(p.id for p in self.projects if p.name == self.knowledge_branch_var.get()),
                 self.knowledge_editor.get("1.0", "end-1c"),
             )
         except WorkspaceKnowledgeError as exc:
@@ -950,7 +969,7 @@ class SystemSettingsDialog:
             self._knowledge_domain().value,
             self.knowledge_branch_var.get(),
         )
-        self._set_knowledge_status("分支 Markdown 已保存，能力索引已更新。", SUCCESS)
+        self._set_knowledge_status("知识已保存；下次调用自动加载，RAG 需手动重建。", SUCCESS)
         return True
 
     def _on_knowledge_domain_changed(self, _event: tk.Event[tk.Misc]) -> None:
