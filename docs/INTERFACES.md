@@ -1,6 +1,6 @@
 # AutoCoding Engineer 接口与数据契约
 
-本文记录当前 `0.14.1` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
+本文记录当前 `0.14.2` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
 Runtime、持久化和状态契约。
 设计动机和运行流程见[架构说明](ARCHITECTURE.md)。
 新增独立 HTTP 路由、队列状态和 PowerShell 示例见[HTTP API](API.md)。
@@ -1370,3 +1370,7 @@ failed_or_interrupted。无活动保持 null，不能把未观测到活动解释
 0.14.1：ACE Logo 改为透明 PNG，侧栏标识沿用所在面板背景。Windows 在创建窗口前设置
 固定 AppUserModelID `AutoCodingEngineer.ACE.Desktop`，并设置 16/32/256 像素的透明窗口图标。
 重启客户端生效；已有固定的旧 Python 快捷方式可能需要取消固定后重新固定 ACE 窗口。
+
+
+0.14.2：桌面初始窗口改为屏幕宽高的约 70%，居中显示；小屏仍保留边缘限制。
+移除原有 1540×940 上限，保留手动调整与最小窗口约束。
