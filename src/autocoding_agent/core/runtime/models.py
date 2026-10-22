@@ -52,6 +52,7 @@ class RuntimeRunRecord(BaseModel):
     mode: str
     owner_id: str | None = None
     owner_pid: int | None = Field(default=None, ge=1)
+    runtime_pid: int | None = Field(default=None, ge=1)
     status: RunStatus = RunStatus.STARTED
     started_at: datetime = Field(default_factory=_utc_now)
     heartbeat_at: datetime = Field(default_factory=_utc_now)

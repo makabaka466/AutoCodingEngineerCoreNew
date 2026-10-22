@@ -692,6 +692,10 @@ class DesktopClient:
         self._model_ready_cache: bool | None = None
         self._database_ready_cache: bool | None = None
         self._result_queue: queue.Queue[tuple[str, object]] = queue.Queue()
+        self._stop_pending = False
+        self._task_operation = False
+        self._active_task_id: str | None = None
+        self._close_after_stop = False
         self._busy = False
         self._busy_label = ""
         self._busy_tick = 0
@@ -1447,6 +1451,12 @@ class DesktopClient:
             active_background=COLORS["accent_hover"],
         )
         self.send_button.grid(row=0, column=1, sticky="e")
+        self.stop_button = self._button(
+            action_row, "停止", self._request_stop,
+            background="#FBE8E6", active_background="#F4D4CF",
+        )
+        self.stop_button.grid(row=0, column=4, padx=(8, 0))
+        self.stop_button.configure(state="disabled")
         self.git_sync_button = self._button(
             action_row, "更新代码", self._sync_git,
             background="#E8EEF9", active_background="#D8E4F7",
@@ -2810,11 +2820,30 @@ class DesktopClient:
             "正在取消任务",
         )
 
+    def _request_stop(self) -> None:
+        if not self._busy or not self._task_operation or self._stop_pending:
+            return
+        if not self._active_task_id:
+            self.status_var.set("任务正在初始化，保存任务后即可停止。")
+            return
+        try:
+            self._active_application().request_stop(self._active_task_id)
+        except Exception as exc:
+            self.status_var.set(f"停止请求保存失败：{exc}")
+            self._close_after_stop = False
+            return
+        self._stop_pending = True
+        self.stop_button.configure(text="正在停止", state="disabled")
+        self.status_var.set("正在停止：等待当前操作安全结束并保存状态。")
+
     def _run_in_background(
         self,
         operation: Callable[[], AgentOutcome | IncidentOutcome],
         label: str,
     ) -> None:
+        self._task_operation = True
+        self._active_task_id = self.session_id
+        self._stop_pending = False
         self._set_busy(True, label)
 
         def worker() -> None:
@@ -2863,6 +2892,9 @@ class DesktopClient:
                 else:
                     self.status_var.set(f"操作失败：{payload}")
                     messagebox.showerror("操作失败", str(payload), parent=self.root)
+                    if not self.session_id and self._active_task_id:
+                        self.session_id = self._active_task_id
+                        self._flow_session_ids[self.flow] = self.session_id
                     if self.session_id:
                         try:
                             session = self._active_application().get_session(self.session_id)
@@ -2872,10 +2904,19 @@ class DesktopClient:
         except queue.Empty:
             pass
         finally:
-            self.root.after(100, self._drain_results)
+            if self._close_after_stop and not self._busy:
+                self.root.destroy()
+            else:
+                self.root.after(100, self._drain_results)
 
     def _set_busy(self, busy: bool, label: str = "") -> None:
         self._busy = busy
+        if not busy:
+            self._task_operation = False
+            self._stop_pending = False
+        self.stop_button.configure(
+            text="停止", state="normal" if busy and self._task_operation else "disabled",
+        )
         self._busy_label = label
         self._busy_tick = 0
         self._progress_animation_token += 1
@@ -2914,7 +2955,9 @@ class DesktopClient:
             return
         self._busy_tick += 1
         if self._progress_event is None:
-            self.status_var.set(self._busy_label)
+            self.status_var.set(
+                "正在停止：等待安全边界" if self._stop_pending else self._busy_label
+            )
         self.status_badge.configure(
             text="处理中",
             fg=COLORS["progress_accent"],
@@ -2929,6 +2972,11 @@ class DesktopClient:
         *,
         immediate: bool = False,
     ) -> None:
+        if self._task_operation and event.task_id:
+            self._active_task_id = event.task_id
+        if self._stop_pending and event.active:
+            self.status_var.set("正在停止：等待当前操作安全结束并保存状态。")
+            return
         if immediate or not event.active:
             self._transition_progress(event, immediate=True)
             return
@@ -3152,7 +3200,7 @@ class DesktopClient:
             )
             self.approval_text.configure(state="disabled")
             self.reject_button.configure(text="取消任务", command=self._cancel_recovery)
-            self.approve_button.configure(text="只读检查", command=self._resume_recovery)
+            self.approve_button.configure(text="继续任务（先核对）", command=self._resume_recovery)
             self.recovery_replan_button.configure(text="重新规划", command=self._replan_recovery)
             self.recovery_replan_button.grid(row=0, column=2, padx=4)
             self.approve_button.grid_configure(column=3)
@@ -3259,11 +3307,14 @@ class DesktopClient:
 
     def _on_close(self) -> None:
         if self._busy:
-            messagebox.showwarning(
-                "任务仍在运行",
-                "Claude Code 仍在处理当前任务。请等待本轮结束后再关闭客户端。",
-                parent=self.root,
-            )
+            if self._task_operation and self._active_task_id:
+                self._close_after_stop = True
+                self._request_stop()
+            else:
+                messagebox.showwarning(
+                    "任务仍在运行", "当前操作仍在处理，尚未到可停止阶段，请稍后关闭。",
+                    parent=self.root,
+                )
             return
         self.root.destroy()
 

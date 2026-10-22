@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from pathlib import Path, PureWindowsPath
 from uuid import uuid4
@@ -32,6 +33,7 @@ from autocoding_agent.core.progress import (
     ProgressWorkflow,
     emit_progress,
 )
+from autocoding_agent.core.recovery.context import recovery_context
 from autocoding_agent.core.recovery.models import RecoveryAction
 from autocoding_agent.core.runtime.models import (
     RunStatus,
@@ -83,7 +85,7 @@ from autocoding_agent.knowledge_rag.models import KnowledgeDomain
 from autocoding_agent.knowledge_rag.ports import KnowledgeRetriever
 from autocoding_agent.ports.database import DatabaseReader
 from autocoding_agent.ports.hermes_skills import HermesSkillService
-from autocoding_agent.ports.runtime import RuntimePolicyBlockedError
+from autocoding_agent.ports.runtime import RuntimeInterruptedError, RuntimePolicyBlockedError
 from autocoding_agent.ports.structured_runtime import StructuredRuntime
 
 _PAGE_IDENTITY_TOOLS = ["Read"]
@@ -150,6 +152,7 @@ class IncidentEngine:
             workflow=ProgressWorkflow.INCIDENT,
             owner_id=self.owner_id,
             save=self.sessions.save,
+            stop_requested=self._stop_requested,
         )
         self.knowledge_retriever = knowledge_retriever
         self.artifact_recorder = artifact_recorder
@@ -319,6 +322,36 @@ class IncidentEngine:
         }
         return json.dumps(payload, ensure_ascii=False)
 
+    def _pause_at_boundary(
+        self, session: IncidentSession, command: AgentCommand,
+    ) -> IncidentOutcome:
+        message = ("任务已暂停，已保存对话与执行记录。"
+                   "继续时先核对当前状态，不重复执行已确认完成的操作。")
+        session.last_decision = IncidentDecision(status=IncidentStatus.FAILED, message=message)
+        session.status = session.last_decision.status
+        session.messages.append(ChatMessage(role=MessageRole.ASSISTANT, content=message))
+        self.state_machine.transition(
+            session, TaskState.PAUSED, reason=message, actor="user",
+            command_id=command.id, expected_version=session.version,
+        )
+        self._complete_command(session, command)
+        self.sessions.save(session)
+        return self._to_outcome(session)
+
+    def request_stop(self, session_id: str) -> None:
+        """停止请求只写控制记录，工作线程负责保存最终暂停状态。"""
+        session = self.sessions.load(session_id)
+        if self.state_machine.is_terminal(session.task_state):
+            return
+        database = getattr(self.sessions, "database", None)
+        if database is None:
+            raise ValueError("当前存储不支持持久化停止请求。")
+        database.request_stop(session_id)
+
+    def _stop_requested(self, session_id: str) -> bool:
+        database = getattr(self.sessions, "database", None)
+        return database is not None and database.stop_requested(session_id)
+
     def resume(
         self,
         session_id: str,
@@ -339,6 +372,9 @@ class IncidentEngine:
             type=AgentCommandType.RESUME_TASK,
             expected_version=session.version,
         )
+        database = getattr(self.sessions, "database", None)
+        if database is not None:
+            database.clear_stop(session_id)
         if selected == RecoveryAction.REPLAN:
             self.state_machine.transition(
                 session,
@@ -359,6 +395,7 @@ class IncidentEngine:
                 "Recovery choice: continue read-only incident investigation. Recheck current "
                 "code and request only the minimum database evidence still needed."
             )
+        message += recovery_context(session)
         emit_progress(
             progress_sink,
             ProgressEvent.for_phase(
@@ -493,6 +530,8 @@ class IncidentEngine:
                 command_id=command.id,
                 data={
                     "mode": AgentMode.INSPECT.value,
+                    "owner_id": self.runtime_lifecycle.owner_id,
+                    "owner_pid": os.getpid(),
                     "workflow": "incident",
                     "attachment_count": len(attachments),
                     "attachment_names": [item.name for item in attachments],
@@ -727,11 +766,14 @@ class IncidentEngine:
                 self.runtime_lifecycle.finish(
                     session,
                     run,
-                    status=RunStatus.FAILED,
+                    status=(RunStatus.INTERRUPTED if isinstance(exc, RuntimeInterruptedError)
+                            else RunStatus.FAILED),
                     reason=str(exc),
                     command_id=command.id,
                 )
                 self.sessions.save(session)
+                if isinstance(exc, RuntimeInterruptedError):
+                    return self._pause_at_boundary(session, command)
                 return self._fail(session, str(exc), command)
 
             # 一个通过校验的 Runtime 决策表示上一次纠错链已经结束；后续独立模型轮次
@@ -904,6 +946,11 @@ class IncidentEngine:
                 )
                 continue
             # 第 6 步：Hermes 只提供候选经验，结果必须返回主模型核验，不能直接形成结论。
+            if self._stop_requested(session.id):
+                session.messages.append(ChatMessage(
+                    role=MessageRole.ASSISTANT, content=decision.message,
+                ))
+                return self._pause_at_boundary(session, command)
             if decision.status == IncidentStatus.HERMES_SKILL_REQUIRED:
                 if hermes_skill_rounds >= self.max_hermes_skill_rounds:
                     return self._fail(
@@ -1490,6 +1537,8 @@ class IncidentEngine:
             capability_dir=str(capability_dir) if capability_dir else None,
             additional_dirs=attachment_dirs or [],
         )
+        if self._stop_requested(session.id):
+            raise RuntimeInterruptedError("用户已请求停止，尚未启动下一次执行。")
         observed = getattr(self.runtime, "run_structured_observed", None)
         if callable(observed) and run is not None and command_id is not None:
             result = observed(
@@ -1539,6 +1588,8 @@ class IncidentEngine:
             tools=[],
             allowed_tools=[],
         )
+        if self._stop_requested(session.id):
+            raise RuntimeInterruptedError("用户已请求停止，尚未启动下一次执行。")
         observed = getattr(self.runtime, "run_structured_observed", None)
         if callable(observed):
             result = observed(

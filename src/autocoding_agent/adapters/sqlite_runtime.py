@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -88,6 +89,7 @@ class SQLiteRuntimeDatabase:
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA busy_timeout = 5000")
         connection.execute("PRAGMA journal_mode = WAL")
+        connection.execute("PRAGMA synchronous = FULL")
         return connection
 
     def initialize(self, schema: str) -> None:
@@ -95,7 +97,33 @@ class SQLiteRuntimeDatabase:
 
         with self.connect() as connection:
             connection.executescript(schema)
+            connection.execute("CREATE TABLE IF NOT EXISTS stop_requests ("
+                               "workflow TEXT NOT NULL, task_id TEXT NOT NULL, "
+                               "requested_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, "
+                               "PRIMARY KEY (workflow, task_id))")
             connection.commit()
+
+    def request_stop(self, task_id: str) -> None:
+        """独立事务记录停止意图，不与工作线程争抢会话快照版本。"""
+        with closing(self.connect()) as connection, connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO stop_requests (workflow, task_id) VALUES (?, ?)",
+                (self.layout.tasks, self.safe_id(task_id)),
+            )
+
+    def stop_requested(self, task_id: str) -> bool:
+        with closing(self.connect()) as connection:
+            return connection.execute(
+                "SELECT 1 FROM stop_requests WHERE workflow = ? AND task_id = ?",
+                (self.layout.tasks, self.safe_id(task_id)),
+            ).fetchone() is not None
+
+    def clear_stop(self, task_id: str) -> None:
+        with closing(self.connect()) as connection, connection:
+            connection.execute(
+                "DELETE FROM stop_requests WHERE workflow = ? AND task_id = ?",
+                (self.layout.tasks, self.safe_id(task_id)),
+            )
 
     @staticmethod
     def safe_id(task_id: str) -> str:

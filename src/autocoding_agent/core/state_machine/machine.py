@@ -28,7 +28,9 @@ class StaleTaskVersion(RuntimeError):
 
 
 _TRANSITIONS: Mapping[TaskState, frozenset[TaskState]] = {
-    TaskState.CREATED: frozenset({TaskState.INSPECTING, TaskState.CANCELLED, TaskState.FAILED}),
+    TaskState.CREATED: frozenset(
+        {TaskState.INSPECTING, TaskState.PAUSED, TaskState.CANCELLED, TaskState.FAILED}
+    ),
     TaskState.INSPECTING: frozenset(
         {
             TaskState.WAITING_INPUT,
@@ -46,7 +48,7 @@ _TRANSITIONS: Mapping[TaskState, frozenset[TaskState]] = {
         {TaskState.INSPECTING, TaskState.PAUSED, TaskState.CANCELLED, TaskState.FAILED}
     ),
     TaskState.QUERYING_DATA: frozenset(
-        {TaskState.INSPECTING, TaskState.RECOVERY_REQUIRED, TaskState.FAILED}
+        {TaskState.INSPECTING, TaskState.PAUSED, TaskState.RECOVERY_REQUIRED, TaskState.FAILED}
     ),
     TaskState.WAITING_MODIFY_APPROVAL: frozenset(
         {

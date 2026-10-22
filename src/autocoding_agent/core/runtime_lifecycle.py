@@ -25,6 +25,7 @@ from autocoding_agent.core.runtime.models import (
 )
 from autocoding_agent.core.state_machine.models import TaskState
 from autocoding_agent.core.workflow import read_fingerprint
+from autocoding_agent.ports.runtime import RuntimeInterruptedError
 
 
 class RuntimeAggregate(Protocol):
@@ -52,12 +53,14 @@ class RuntimeLifecycle:
         save: SessionSaver,
         error_factory: ErrorFactory = ValueError,
         record_test_commands: bool = False,
+        stop_requested: Callable[[str], bool] | None = None,
     ) -> None:
         self.workflow = workflow
         self.owner_id = owner_id
         self.save = save
         self.error_factory = error_factory
         self.record_test_commands = record_test_commands
+        self.stop_requested = stop_requested or (lambda task_id: False)
 
     def start(
         self,
@@ -109,6 +112,8 @@ class RuntimeLifecycle:
 
         if activity.run_id != run.id or run.status != RunStatus.STARTED:
             raise self.error_factory("Runtime activity does not belong to the active run.")
+        if activity.data.get("runtime_pid"):
+            run.runtime_pid = int(activity.data["runtime_pid"])
         run.heartbeat_at = max(run.heartbeat_at, activity.created_at)
         run.activity_ids.append(activity.id)
         event_type = {
@@ -136,7 +141,7 @@ class RuntimeLifecycle:
         # 成功读取时仅保存源码指纹；后续引用必须仍对应同一内容，绝不存储文件正文。
         if (
             activity.kind == RuntimeEventKind.TOOL_FINISHED
-            and (activity.tool_name or "").casefold() == "read"
+            and (activity.tool_name or "").casefold() in {"read", "write", "edit"}
             and not activity.data.get("is_error", True)
             and hasattr(session, "workspace")
         ):
@@ -146,6 +151,10 @@ class RuntimeLifecycle:
         if self.record_test_commands:
             self._record_completed_test(session, run, activity, command_id, event.id)
         self.save(session)
+
+        # 只读运行可取消；写入/验证运行等待调用结束，避免在副作用中途强杀。
+        if mode == "inspect" and self.stop_requested(session.id):
+            raise RuntimeInterruptedError("用户已请求停止，已保存当前执行记录。")
 
         progress = ProgressProjector.from_runtime(
             activity,

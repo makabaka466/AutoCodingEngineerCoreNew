@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from pathlib import Path, PureWindowsPath
 from uuid import uuid4
@@ -46,6 +47,7 @@ from autocoding_agent.core.progress import (
     ProgressWorkflow,
     emit_progress,
 )
+from autocoding_agent.core.recovery.context import recovery_context
 from autocoding_agent.core.recovery.models import RecoveryAction
 from autocoding_agent.core.runtime.models import (
     RunStatus,
@@ -160,6 +162,7 @@ class AgentEngine:
             save=self.sessions.save,
             error_factory=PolicyViolation,
             record_test_commands=True,
+            stop_requested=self._stop_requested,
         )
         self.knowledge_retriever = knowledge_retriever
         self.hermes = HermesConsultationCoordinator(hermes_skills, artifact_recorder)
@@ -204,6 +207,8 @@ class AgentEngine:
                 data={
                     "state": session.task_state.value,
                     "version": session.version,
+                    "owner_id": self.runtime_lifecycle.owner_id,
+                    "owner_pid": os.getpid(),
                 },
             )
         )
@@ -362,6 +367,34 @@ class AgentEngine:
         )
         return self._run_command(session, message, AgentMode.INSPECT, command, progress_sink)
 
+    def _pause_at_boundary(self, session: AgentSession, command: AgentCommand) -> AgentOutcome:
+        message = ("任务已暂停，已保存对话与执行记录。"
+                   "继续时先核对当前状态，不重复执行已确认完成的操作。")
+        session.last_decision = AgentDecision(status=AgentStatus.FAILED, message=message)
+        session.status = session.last_decision.status
+        session.messages.append(ChatMessage(role=MessageRole.ASSISTANT, content=message))
+        self.state_machine.transition(
+            session, TaskState.PAUSED, reason=message, actor="user",
+            command_id=command.id, expected_version=session.version,
+        )
+        self._complete_command(session, command)
+        self.sessions.save(session)
+        return self._to_outcome(session)
+
+    def request_stop(self, session_id: str) -> None:
+        """停止请求只写控制记录，工作线程负责保存最终暂停状态。"""
+        session = self.sessions.load(session_id)
+        if self.state_machine.is_terminal(session.task_state):
+            return
+        database = getattr(self.sessions, "database", None)
+        if database is None:
+            raise ValueError("当前存储不支持持久化停止请求。")
+        database.request_stop(session_id)
+
+    def _stop_requested(self, session_id: str) -> bool:
+        database = getattr(self.sessions, "database", None)
+        return database is not None and database.stop_requested(session_id)
+
     def resume(
         self,
         session_id: str,
@@ -375,6 +408,9 @@ class AgentEngine:
         session = self.sessions.load(session_id)
         if session.task_state not in {TaskState.PAUSED, TaskState.RECOVERY_REQUIRED}:
             raise ValueError(f"Task state {session.task_state.value} does not require recovery.")
+        database = getattr(self.sessions, "database", None)
+        if database is not None:
+            database.clear_stop(session_id)
         if selected == RecoveryAction.REPLAN:
             command = AgentCommand(
                 task_id=session.id,
@@ -401,6 +437,7 @@ class AgentEngine:
                 "recovery artifacts without modifying files or running side-effecting commands. "
                 "Explain what happened and propose safe next steps."
             )
+        message += recovery_context(session)
         emit_progress(
             progress_sink,
             ProgressEvent.for_phase(
@@ -409,7 +446,13 @@ class AgentEngine:
                 task_id=session_id,
             ),
         )
-        return self.send(session_id, message, progress_sink=progress_sink)
+        # 使用恢复入口读取的版本，不能重新 load 后把重复点击变成新一轮对话。
+        session.pending_approval = None
+        command = AgentCommand(
+            task_id=session.id, type=AgentCommandType.RESUME_TASK,
+            expected_version=session.version,
+        )
+        return self._run_command(session, message, AgentMode.INSPECT, command, progress_sink)
 
     def pause(self, session_id: str) -> AgentOutcome:
         session = self.sessions.load(session_id)
@@ -610,7 +653,8 @@ class AgentEngine:
             AgentEvent(
                 type=EventType.TURN_STARTED,
                 message=f"Started {mode.value} turn.",
-                data={"mode": mode.value},
+                data={"mode": mode.value, "owner_id": self.runtime_lifecycle.owner_id,
+                      "owner_pid": os.getpid()},
             )
         )
         session.updated_at = utc_now()
@@ -674,6 +718,8 @@ class AgentEngine:
                 ),
             )
             try:
+                if self._stop_requested(session.id):
+                    raise RuntimeInterruptedError("用户已请求停止，尚未启动下一次执行。")
                 database_context = compact_database_context(
                     configured=mode == AgentMode.INSPECT and self.database is not None,
                     reference=self.database_reference,
@@ -784,6 +830,8 @@ class AgentEngine:
                         run,
                         command.id,
                     )
+                if isinstance(exc, RuntimeInterruptedError):
+                    return self._pause_at_boundary(session, command)
                 return self._fail(session, str(exc), command.id)
 
             # 一个通过校验的 Runtime 决策表示上一次纠错链已经结束；后续独立调查轮次
@@ -899,6 +947,11 @@ class AgentEngine:
             )
             # 第 7 步：Hermes 和 SQL 都是宿主控制的证据分支。结果必须返回主模型继续判断，
             # 两者都不能绕过主模型静默完成任务。
+            if self._stop_requested(session.id):
+                session.messages.append(ChatMessage(
+                    role=MessageRole.ASSISTANT, content=decision.message,
+                ))
+                return self._pause_at_boundary(session, command)
             if decision.status == AgentStatus.HERMES_SKILL_REQUIRED:
                 if hermes_skill_rounds >= self.max_hermes_skill_rounds:
                     return self._fail(

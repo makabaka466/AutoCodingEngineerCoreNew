@@ -503,7 +503,9 @@ def test_observed_runtime_parses_sanitized_tool_lifecycle(
 
     assert result.runtime_session_id == "runtime-stream"
     assert result.usage.input_tokens == 3
+    assert activities[0].data["runtime_pid"] > 0
     assert [item.kind for item in activities] == [
+        RuntimeEventKind.SYSTEM_INIT,
         RuntimeEventKind.SYSTEM_INIT,
         RuntimeEventKind.TOOL_STARTED,
         RuntimeEventKind.TOOL_FINISHED,

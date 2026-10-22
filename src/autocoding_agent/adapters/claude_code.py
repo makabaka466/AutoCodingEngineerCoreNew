@@ -289,6 +289,11 @@ class ClaudeCodeRuntime:
             [item for item in [turn.capability_dir, *turn.additional_dirs] if item],
         )
         try:
+            if isinstance(getattr(process, "pid", None), int):
+                event_sink(RuntimeActivity(
+                    run_id=run_id, kind=RuntimeEventKind.SYSTEM_INIT,
+                    summary="Runtime process launched.", data={"runtime_pid": process.pid},
+                ))
             while not (stdout_done and process.poll() is not None):
                 now = time.monotonic()
                 if now >= deadline:

@@ -60,10 +60,11 @@ class IncidentRecoveryManager:
             actor="host_recovery",
             payload={"orphaned_run_id": run.id, "workflow": "incident"},
         )
-        run.status = RunStatus.INTERRUPTED
-        run.completed_at = now
-        run.heartbeat_at = max(run.heartbeat_at, now)
-        run.terminal_reason = "The incident Runtime owner ended before recording a result."
+        if run.status == RunStatus.STARTED:
+            run.status = RunStatus.INTERRUPTED
+            run.completed_at = now
+            run.heartbeat_at = max(run.heartbeat_at, now)
+            run.terminal_reason = "The incident Runtime owner ended before recording a result."
         message = (
             "异常诊断的只读 Runtime 在返回结果前中断。任务已暂停，没有自动重放代码读取或"
             "数据库查询；请选择继续只读调查、重新调查或取消。"

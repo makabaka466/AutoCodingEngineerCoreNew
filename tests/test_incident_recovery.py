@@ -174,3 +174,27 @@ if __name__ == "__main__":
         settings=Settings(data_dir=Path(sys.argv[2]), hermes_skills_enabled=False),
         runtime=PendingRuntime(),
     ).start(Path(sys.argv[1]), "Investigate the test page")
+
+
+def test_incident_stop_is_paused_not_failed_and_request_is_durable(tmp_path):
+    from autocoding_agent.core.runtime.models import RuntimeActivity, RuntimeEventKind
+
+    data = tmp_path / "data"
+    workspace = tmp_path / "work"
+    workspace.mkdir()
+
+    class StopRuntime:
+        def run_structured_observed(self, turn, response_model, run_id, event_sink):
+            SQLiteIncidentStore(data).database.request_stop(turn.session_id)
+            event_sink(RuntimeActivity(
+                run_id=run_id, kind=RuntimeEventKind.HEARTBEAT, summary="waiting",
+            ))
+            raise AssertionError("Stop must prevent further work")
+
+    settings = Settings(data_dir=data, claude_command="claude-test.exe")
+    app = build_incident_application(settings=settings, runtime=StopRuntime())
+    outcome = app.start(workspace, "diagnose")
+    session = app.get_session(outcome.session_id)
+    assert session.task_state == TaskState.PAUSED
+    assert session.runs[-1].status == RunStatus.INTERRUPTED
+    assert SQLiteIncidentStore(data).database.stop_requested(session.id)

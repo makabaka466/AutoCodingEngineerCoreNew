@@ -525,7 +525,7 @@ def test_recovery_state_shows_explicit_safe_choices(root: tk.Toplevel) -> None:
     client._render_session(session)
 
     assert "恢复任务" in client.approval_title.cget("text")
-    assert client.approve_button.cget("text") == "只读检查"
+    assert client.approve_button.cget("text") == "继续任务（先核对）"
     assert client.reject_button.cget("text") == "取消任务"
     assert client.recovery_replan_button.winfo_manager() == "grid"
     client._replan_recovery()
@@ -1387,3 +1387,24 @@ def test_incident_repair_button_only_for_completed_diagnosis(
     operations = _capture_operation(client)
     client._start_incident_remediation()
     assert not operations and not application.calls
+
+
+def test_stop_button_records_once_and_waits_for_worker(root, monkeypatch):
+    session = _session(AgentStatus.NEEDS_INPUT)
+    application = FakeApplication([session])
+    requests = []
+    monkeypatch.setattr(application, "request_stop", requests.append, raising=False)
+    client = DesktopClient(root, application)
+    client.session_id = session.id
+    client._active_task_id = session.id
+    client._task_operation = True
+    client._set_busy(True, "running")
+    assert client.stop_button.cget("state") == "normal"
+    client._request_stop()
+    client._request_stop()
+    assert requests == [session.id]
+    assert client._busy
+    assert client.stop_button.cget("text") == "正在停止"
+    assert client.stop_button.cget("state") == "disabled"
+    client._set_busy(False)
+    assert client.stop_button.cget("state") == "disabled"

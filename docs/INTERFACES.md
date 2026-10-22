@@ -1374,3 +1374,9 @@ failed_or_interrupted。无活动保持 null，不能把未观测到活动解释
 
 0.14.2：桌面初始窗口改为屏幕宽高的约 70%，居中显示；小屏仍保留边缘限制。
 移除原有 1540×940 上限，保留手动调整与最小窗口约束。
+
+## 0.15.0 停止接口
+
+`AgentApplication.request_stop(session_id)` 与 `IncidentApplication.request_stop(session_id)` 幂等保存停止意图，返回不表示已经停止。完成任务调用无操作；当前只支持 SQLite 持久存储。轮次结束后读取 task_state，PAUSED 表示可继续，RECOVERY_REQUIRED 表示必须核对可能的副作用。既有 `resume(..., READ_ONLY_INSPECT)` 清除停止标记后只读恢复，不同步版本库、不自动批准修改。HTTP 路由保持既有接口，本次新增入口为桌面 UI 与应用 facade。
+
+桌面按钮：运行中“停止”→“正在停止”→“继续任务（先核对）”；异常流程复用“继续只读诊断”。重复停止不重复执行，运行中不能重复发起继续；跨执行者仍由会话 revision 乐观锁约束。

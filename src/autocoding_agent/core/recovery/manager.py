@@ -74,10 +74,11 @@ class RecoveryManager:
             actor="host_recovery",
             payload={"orphaned_run_id": run.id},
         )
-        run.status = RunStatus.INTERRUPTED
-        run.completed_at = now
-        run.heartbeat_at = max(run.heartbeat_at, now)
-        run.terminal_reason = "The owning process ended before recording a terminal run result."
+        if run.status == RunStatus.STARTED:
+            run.status = RunStatus.INTERRUPTED
+            run.completed_at = now
+            run.heartbeat_at = max(run.heartbeat_at, now)
+            run.terminal_reason = "The owning process ended before recording a terminal run result."
         target = TaskState.PAUSED if run.mode == "inspect" else TaskState.RECOVERY_REQUIRED
         message = (
             "A read-only Runtime run was interrupted. The task is paused and can be inspected "

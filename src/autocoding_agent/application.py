@@ -204,6 +204,10 @@ class AgentApplication:
             progress_sink=progress_sink,
         )
 
+    def request_stop(self, session_id: str) -> None:
+        """记录可恢复停止请求，不取消任务或撤销已完成的操作。"""
+        self._engine.request_stop(session_id)
+
     def resume(
         self,
         session_id: str,

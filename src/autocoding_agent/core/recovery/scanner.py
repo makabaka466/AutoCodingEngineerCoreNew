@@ -7,6 +7,7 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Protocol
 
+from autocoding_agent.core.models import AgentEvent, EventType
 from autocoding_agent.core.recovery.models import RecoveryScanResult
 from autocoding_agent.core.runtime.models import RunStatus, RuntimeRunRecord
 from autocoding_agent.core.state_machine.models import TaskState
@@ -16,6 +17,7 @@ class RecoverableSession(Protocol):
     id: str
     task_state: TaskState
     runs: list[RuntimeRunRecord]
+    events: list[AgentEvent]
 
 
 class RecoverySessionStore(Protocol):
@@ -50,6 +52,29 @@ class OrphanedRunScanner:
             if self.is_terminal(session.task_state):
                 continue
             active = [run for run in session.runs if run.status == RunStatus.STARTED]
+            # 覆盖上下文准备、宿主查询以及 Run 完成后尚未保存流程结果的窗口。
+            preparing = None
+            if not active and session.task_state in {
+                TaskState.CREATED, TaskState.INSPECTING, TaskState.IMPLEMENTING,
+                TaskState.VERIFYING, TaskState.QUERYING_DATA, TaskState.REPLANNING,
+            }:
+                turn = next((event for event in reversed(session.events)
+                             if event.type in {EventType.TURN_STARTED, EventType.TASK_CREATED}),
+                            None)
+                last_run = session.runs[-1] if session.runs else None
+                if turn and (last_run is None or (
+                    turn.data.get("owner_id") and turn.created_at > last_run.started_at
+                )):
+                    preparing = RuntimeRunRecord(
+                        task_id=session.id, state=session.task_state,
+                        mode=turn.data.get("mode", "inspect"),
+                        owner_id=turn.data.get("owner_id"),
+                        owner_pid=turn.data.get("owner_pid"),
+                        started_at=turn.created_at, heartbeat_at=turn.created_at,
+                    )
+                    active = [preparing]
+                elif last_run is not None:
+                    active = [last_run]
             for run in active:
                 if not self._is_orphaned(
                     run,
@@ -59,6 +84,8 @@ class OrphanedRunScanner:
                 ):
                     live.append(run.id)
                     continue
+                if run is preparing:
+                    session.runs.append(run)
                 self.recover(session, run, observed_at)
                 recovered.append(session.id)
                 break
@@ -78,6 +105,8 @@ class OrphanedRunScanner:
         if run.owner_id == current_owner_id:
             return False
         age_seconds = max(0.0, (now - run.heartbeat_at).total_seconds())
+        if run.runtime_pid is not None and _pid_is_alive(run.runtime_pid):
+            return False
         if run.owner_pid is not None:
             return not _pid_is_alive(run.owner_pid)
         return age_seconds >= lease_seconds
