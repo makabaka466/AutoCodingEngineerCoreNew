@@ -131,6 +131,11 @@ def _format_query_observation(item: QueryObservation) -> str:
     if item.status == QueryObservationStatus.FAILED:
         return f"• [{stage}] {item.query_name}: 失败 · {item.error or '未知错误'}"
     suffix = "，已截断" if item.truncated else ""
+    if item.catalog_info is not None:
+        info = item.catalog_info
+        suffix += " · 目录缓存" if info.get("cache_hit") else " · 目录读取"
+        suffix += " · 完整" if info.get("complete") else " · 不完整"
+        suffix += f" · {info.get('fetched_at', '')}"
     return f"• [{stage}] {item.query_name}: {item.returned_rows} 行{suffix}"
 
 

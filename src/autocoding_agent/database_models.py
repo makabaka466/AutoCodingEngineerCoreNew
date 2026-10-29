@@ -6,9 +6,9 @@ import hashlib
 import re
 from datetime import datetime, timezone
 from enum import StrEnum
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field, StringConstraints
+from pydantic import BaseModel, Field, StringConstraints, model_validator
 
 NonEmptyText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 QueryParameter = str | int | float | bool | None
@@ -26,7 +26,12 @@ class DataQuery(BaseModel):
     datasource_id: str | None = Field(
         default=None, description="Authorized project datasource ID. Required when ambiguous.",
     )
-    sql: NonEmptyText = Field(
+    query_kind: Literal["sql", "menu_catalog"] = Field(
+        default="sql", description="sql 查询或配置好的完整菜单目录；目录无需模型编写 SQL。"
+    )
+    refresh_catalog: bool = Field(default=False, description="强制刷新菜单目录缓存。")
+    sql: str = Field(
+        default="",
         description=(
             "Parameterized read-only SQL. Use :name placeholders; the SQL Server host also "
             "accepts @name defensively and binds values without string interpolation."
@@ -37,6 +42,16 @@ class DataQuery(BaseModel):
         description="Values keyed by placeholder name, without ':' or '@'.",
     )
     max_rows: int = Field(default=DEFAULT_QUERY_MAX_ROWS, ge=1, le=DEFAULT_QUERY_MAX_ROWS)
+
+    @model_validator(mode="after")
+    def validate_query_kind(self):
+        if self.query_kind == "sql" and not self.sql.strip():
+            raise ValueError("sql 查询必须提供非空 SQL")
+        if self.query_kind == "menu_catalog" and (self.sql.strip() or self.parameters):
+            raise ValueError("菜单目录只使用已配置 SQL 和参数，请勿在请求中覆盖")
+        if self.refresh_catalog and self.query_kind != "menu_catalog":
+            raise ValueError("只有菜单目录支持刷新")
+        return self
 
 
 class QuerySource(BaseModel):
@@ -59,6 +74,9 @@ class QueryResult(BaseModel):
     returned_rows: int
     truncated: bool = False
     redacted_columns: list[str] = Field(default_factory=list)
+    catalog_info: dict[str, Any] | None = Field(
+        default=None, description="目录来源、完整性及缓存摘要，不包含菜单行。"
+    )
 
 
 class QueryObservationStatus(StrEnum):
@@ -78,6 +96,9 @@ class QueryObservation(BaseModel):
     returned_rows: int = Field(default=0, ge=0)
     truncated: bool = False
     redacted_columns: list[str] = Field(default_factory=list)
+    catalog_info: dict[str, Any] | None = Field(
+        default=None, description="目录来源、完整性及缓存摘要，不包含菜单行。"
+    )
     sql_fingerprint: str | None = None
     parameter_names: list[str] = Field(default_factory=list)
     error: str | None = None

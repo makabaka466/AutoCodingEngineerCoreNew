@@ -196,6 +196,9 @@ class AgentDecision(BaseModel):
 
     @model_validator(mode="after")
     def validate_status_payload(self) -> AgentDecision:
+        if (any(query.query_kind == "menu_catalog" for query in self.queries)
+                and len(self.queries) != 1):
+            raise ValueError("每轮目录请求必须单独执行，不能批量混入其它查询")
         if self.status == AgentStatus.APPROVAL_REQUIRED and self.approval is None:
             raise ValueError("approval is required when status is approval_required")
         if self.status != AgentStatus.APPROVAL_REQUIRED and self.approval is not None:

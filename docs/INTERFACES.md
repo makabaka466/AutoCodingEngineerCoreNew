@@ -1434,3 +1434,10 @@ Session 新增 investigation_entry、entry_history；异常 session 新增 entry
 新修复任务增加 source_incident_revision，来源变化时清除原审批，后续动作须基于最新诊断创建。
 原有 start/send/approve/stop/resume 入口和 HTTP 路由保留；新增参数均有默认值。
 知识配置 KnowledgeDomain 新增 navigation；项目自动准备三个文件，空导航允许保存。
+
+
+## 0.19.0 页面目录与路径映射
+
+项目入口 MD 支持 ace-navigation 配置。DataQuery 新增 query_kind=menu_catalog 与 refresh_catalog，SQL 请求保留原语义；目录请求不允许模型覆盖 SQL/参数。两套工作流复用只读查询、预算与停止机制。QueryResult/QueryObservation.catalog_info 保存目录来源、缓存和完整性；目录不作为已执行业务查询证据。
+
+宿主分页读取 SQL Server/Oracle 目录，完整结果按绑定快照隔离缓存。模型比较候选后仍核对源码/截图；显式路径映射只返回工作区内存在文件。详见 docs/NAVIGATION.md（仓库根目录下）。未进行真实业务库验收。

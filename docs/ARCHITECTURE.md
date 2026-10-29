@@ -948,3 +948,10 @@ OracleDatabaseReader 使用结构化 ConnectParams，Service Name/SID 分开设�
 - 否认或冲突记录保留在 entry_history。显式重新核验须声明 reconsider_excluded，并补充新操作证据和澄清理由。曾恢复成功的入口无需反复重做同一排除审批。
 - 新诊断转修复保存来源 revision，入口作为待复核候选交接。审批及 Runtime 调度边界读取最新诊断；版本变化即清除待审批，运行中的任务在当前调用返回后暂停，保留实际文件快照与操作记录。历史修复任务无来源 revision，保持旧恢复机制。
 - 不增加独立的入口分类模型请求，不做全菜单缓存，不开放数据库写入。路径映射确定性规则由下一阶段实现。
+
+
+## 0.19.0 页面目录与路径映射
+
+项目入口 MD 支持 ace-navigation 配置。DataQuery 新增 query_kind=menu_catalog 与 refresh_catalog，SQL 请求保留原语义；目录请求不允许模型覆盖 SQL/参数。两套工作流复用只读查询、预算与停止机制。QueryResult/QueryObservation.catalog_info 保存目录来源、缓存和完整性；目录不作为已执行业务查询证据。
+
+宿主分页读取 SQL Server/Oracle 目录，完整结果按绑定快照隔离缓存。模型比较候选后仍核对源码/截图；显式路径映射只返回工作区内存在文件。详见 docs/NAVIGATION.md（仓库根目录下）。未进行真实业务库验收。

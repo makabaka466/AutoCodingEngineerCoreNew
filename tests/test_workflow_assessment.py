@@ -222,3 +222,40 @@ def test_legacy_decisions_load_without_claiming_verified_results(tmp_path: Path)
     assert bind_assessment(session, decision, mode="implement").result == (
         ResultKind.MODIFIED_UNVERIFIED
     )
+
+
+@pytest.mark.parametrize("catalog_info", [{"cache_hit": False}, {"cache_hit": True}, {}])
+def test_menu_catalog_is_navigation_hint_not_verified_query_evidence(
+    tmp_path: Path, catalog_info: dict,
+) -> None:
+    (tmp_path / "page.py").write_text("route = '/orders'", encoding="utf-8")
+    session = AgentSession(workspace=str(tmp_path), goal="调查异常")
+    session.events = [
+        _read_event(session),
+        AgentEvent(
+            type=EventType.DATABASE_QUERIES_EXECUTED,
+            message="Loaded navigation hints and business evidence.",
+            data={"queries": [
+                {"name": "menu_directory", "status": "succeeded", "catalog_info": catalog_info},
+                {"name": "order_state", "status": "succeeded", "catalog_info": None},
+            ]},
+        ),
+    ]
+    decision = _incident(_assessment(ResultKind.CAUSE_CONFIRMED))
+    decision.assessment.evidence.append(WorkflowEvidence(
+        kind="query", reference="menu_directory", verified=True, event_id="model-forged",
+    ))
+    assessment = bind_assessment(session, decision, mode="inspect")
+    assert assessment.evidence[0].verified
+    assert not assessment.evidence[1].verified
+    assert assessment.evidence[1].event_id is None
+    assert assessment.result == ResultKind.HYPOTHESIS
+    assert "menu_directory" not in evidence_catalog(session)
+    assert "order_state" in evidence_catalog(session)
+
+    # 同一批次中的普通只读查询仍可绑定，不因目录缓存标记而整体失效。
+    decision.assessment.evidence[-1].reference = "order_state"
+    ordinary = bind_assessment(session, decision, mode="inspect")
+    assert ordinary.evidence[-1].verified
+    assert ordinary.evidence[-1].event_id == session.events[-1].id
+    assert ordinary.result == ResultKind.CAUSE_CONFIRMED

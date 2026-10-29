@@ -134,6 +134,8 @@ def bind_assessment(session: Any, decision: Any, *, mode: str) -> WorkflowAssess
                 matched = event.type.value == "database_queries_executed" and any(
                     row.get("query_name", row.get("name")) == item.reference
                     and row.get("status", "succeeded") == "succeeded"
+                    # 菜单目录只提供导航线索；新获取或缓存命中都不是业务根因证据。
+                    and row.get("catalog_info") is None
                     for row in data.get("queries", [])
                 )
             elif item.kind == "code":
@@ -266,6 +268,7 @@ def evidence_catalog(session: Any) -> str:
             references.extend(
                 {"kind": "query", "reference": row.get("query_name", row.get("name"))}
                 for row in data.get("queries", [])
+                if row.get("catalog_info") is None
             )
     if not references:
         return ""

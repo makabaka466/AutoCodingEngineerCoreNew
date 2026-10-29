@@ -1126,6 +1126,8 @@ class AgentEngine:
                 )
                 try:
                     results = self._execute_database_queries(session, decision)
+                except RuntimeInterruptedError:
+                    return self._pause_at_boundary(session, command)
                 except Exception as exc:
                     return self._fail(session, str(exc), command.id)
                 pending_message = (
@@ -1204,7 +1206,9 @@ class AgentEngine:
             started_at = time.monotonic()
             status = "failed"
             try:
-                results.append(self.database_access.execute(session, query))
+                results.append(self.database_access.execute(
+                    session, query, stop_requested=lambda: self._stop_requested(session.id),
+                ))
                 status = "completed"
             except Exception as exc:
                 # 后一条失败不能抹掉已完成查询的来源，恢复时仍可识别已执行操作。
@@ -1309,6 +1313,7 @@ class AgentEngine:
                     returned_rows=result.returned_rows,
                     truncated=result.truncated,
                     redacted_columns=result.redacted_columns,
+                    catalog_info=result.catalog_info,
                     sql_fingerprint=sql_fingerprint(query.sql),
                     parameter_names=sorted(query.parameters),
                 )
@@ -1336,8 +1341,9 @@ class AgentEngine:
                             "datasource_id": query.datasource_id,
                             "sql_fingerprint": sql_fingerprint(query.sql),
                             "parameter_names": sorted(query.parameters),
+                            "catalog_info": result.catalog_info,
                         }
-                        for query in decision.queries
+                        for query, result in zip(decision.queries, results, strict=True)
                     ],
                 },
             )

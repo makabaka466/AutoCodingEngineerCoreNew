@@ -1207,7 +1207,10 @@ class IncidentEngine:
                     status = "failed"
                     try:
                         results.append(
-                            self.database_access.execute(session, query, query_stage.value),
+                            self.database_access.execute(
+                                session, query, query_stage.value,
+                                stop_requested=lambda: self._stop_requested(session.id),
+                            ),
                         )
                         status = "completed"
                     finally:
@@ -1217,6 +1220,8 @@ class IncidentEngine:
                             query_stage.value, index, status,
                             max(0, int((time.monotonic() - started_at) * 1000)),
                         )
+            except RuntimeInterruptedError:
+                return self._pause_at_boundary(session, command)
             except Exception as exc:
                 detail = " ".join(str(exc).split())[:800]
                 session.query_repair_rounds += 1
@@ -1418,6 +1423,7 @@ class IncidentEngine:
                     returned_rows=result.returned_rows,
                     truncated=result.truncated,
                     redacted_columns=result.redacted_columns,
+                    catalog_info=result.catalog_info,
                     sql_fingerprint=sql_fingerprint(query.sql),
                     parameter_names=sorted(query.parameters),
                 )
@@ -1451,6 +1457,7 @@ class IncidentEngine:
                             "returned_rows": result.returned_rows,
                             "truncated": result.truncated,
                             "redacted_columns": result.redacted_columns,
+                            "catalog_info": result.catalog_info,
                         }
                         for audit, result in zip(self._query_audit(decision), results, strict=True)
                     ],
@@ -1482,6 +1489,7 @@ class IncidentEngine:
                     returned_rows=result.returned_rows,
                     truncated=result.truncated,
                     redacted_columns=result.redacted_columns,
+                    catalog_info=result.catalog_info,
                     sql_fingerprint=sql_fingerprint(query.sql),
                     parameter_names=sorted(query.parameters),
                 )

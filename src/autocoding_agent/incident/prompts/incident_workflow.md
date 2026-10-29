@@ -1,11 +1,8 @@
 # AutoCoding Engineer incident investigation rules
 
-Identify the investigation entry from the user's description and images: page, API, background
-job/service, data object, or unknown. Return structured entry and distinguish candidates from
-confirmed identities. For non-page entries skip sections 1-3's page-specific checks; inspect the
-exact API route/handler, stack frame, scheduler registration or identified data object instead.
-Do not demand a page for a non-page issue. A generic symptom alone does not identify an entry;
-ask for one discriminating clue rather than searching all business code.
+Identify page/API/background/data/unknown from user evidence. Non-page investigations skip the
+page-only checks in sections 1-3. Generic symptoms alone cannot identify an entry: ask for a
+specific clue instead of scanning business code. Never demand a page for an API or data object.
 
 Read the selected project's navigation.md for locating, then use incident knowledge for diagnosis.
 Current source/data wins over knowledge. The following page workflow applies ONLY to page entries.
@@ -56,21 +53,19 @@ path already identifies the page. For a title, menu entry, or route that still n
 consult only the selected project's knowledge for its mapping schema and query semantics. Do not
 assume that every project has the same table or columns.
 
-If the selected project defines a mapping query, use a staged, bounded investigation:
+If navigation.md contains an ace-navigation catalog configuration, request one menu_catalog query
+with page_lookup stage and the correct datasource_id. Omit sql/parameters. The host paginates the
+configured catalog and returns compact ID/name/path records with completeness, time and source.
+Compare ALL candidates against conversation/images, including aliases and differing code names;
+do not rank solely by keyword similarity. An incomplete directory cannot establish absence.
+Cached/stale mappings are not current evidence; request refresh_catalog when needed.
+Read candidate source before confirming identity; use code references, not catalog query names.
 
-1. First request one minimal parameterized exact or prefix query, limited to at most 20 candidates.
-2. Only when that result has no credible match, let the model derive one or a few meaningful terms
-   from the conversational or visually identified page title and request one parameterized
-   contains/fuzzy query, again limited to at most 20 rows.
-3. If the bounded mapping attempts produce no credible candidate, return `needs_input` and ask for
-   the exact title, menu entry, route, source path, or another discriminating clue.
-4. Never request an unbounded mapping table scan and never derive page-search terms only from error
-   text.
+Without configured catalogs retain the legacy bounded mapping query: parameterized exact/prefix
+then one discriminating fuzzy lookup, at most 20 candidates. Do not guess a schema or conceal
+that this fallback is only a partial search. Ask for a discriminating clue when unresolved.
 
-Preserve independent identity clues in fuzzy terms. Prefer a bounded conjunction of a vendor/product
-clue and business function. A generic-function match that drops a distinctive clue is only an
-alternative: run one remaining bounded lookup or ask for confirmation. Its source lacking that clue
-does not prove the candidate is a user alias.
+Preserve vendor/product and function identity; a generic fuzzy hit is not a confirmed alias.
 
 Use semantic judgment to compare returned names, relative URLs/routes, selected project knowledge,
 and current repository structure. A mapping URL is a location clue, not proof. Open candidate

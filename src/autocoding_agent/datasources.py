@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from pathlib import Path
 from uuid import uuid4
 
 from autocoding_agent.config import Settings
@@ -25,6 +26,7 @@ from autocoding_agent.sqlserver_config import (
     SQLServerConnectionConfig,
 )
 from autocoding_agent.sqlserver_service import SQLServerConnectionService
+from autocoding_agent.workspace_knowledge import PROJECT_KNOWLEDGE_ROOT
 
 
 def query_source(session, query: DataQuery) -> QuerySource | None:
@@ -179,10 +181,11 @@ class DataSourceService:
 class TaskDatabaseAccess:
     """两个工作流共享的入口；不在引擎全局切换连接，避免任务之间串库。"""
 
-    def __init__(self, service, legacy, reference) -> None:
+    def __init__(self, service, legacy, reference, *, knowledge_root: Path | None = None) -> None:
         self.service: DataSourceService | None = service
         self.legacy = legacy
         self.reference = reference
+        self.knowledge_root = knowledge_root or PROJECT_KNOWLEDGE_ROOT
 
     def bind(self, session) -> None:
         if self.service is not None:
@@ -220,7 +223,13 @@ class TaskDatabaseAccess:
             }, ensure_ascii=False)
         )
 
-    def execute(self, session, query: DataQuery, stage: str | None = None) -> QueryResult:
+    def execute(
+        self, session, query: DataQuery, stage: str | None = None, *, stop_requested=None,
+    ) -> QueryResult:
+        if query.query_kind == "menu_catalog":
+            if stage not in {None, "page_lookup"}:
+                raise ValueError("目录请求必须使用 page_lookup，不能代替业务数据查询")
+            return self._menu_catalog(session, query, stop_requested)
         if session.database_binding is not None:
             if self.service is None:
                 raise ValueError("项目数据源服务不可用")
@@ -232,3 +241,44 @@ class TaskDatabaseAccess:
         if session.database_reference != self.reference:
             raise ValueError("任务原有数据库连接已变化，请恢复原配置或新建任务")
         return self.legacy.execute(query)
+
+
+    def _menu_catalog(self, session, query: DataQuery, stop_requested) -> QueryResult:
+        """宿主加载当前项目显式配置；目录只给候选，不替模型决定入口。"""
+        from autocoding_agent.navigation_catalog import MenuCatalogService
+        from autocoding_agent.navigation_config import load_navigation_config
+        from autocoding_agent.navigation_paths import resolve_navigation_path
+
+        snapshot = session.database_binding
+        if self.service is None or snapshot is None or not session.project:
+            raise ValueError("完整目录需要项目绑定的数据源，请配置后新建任务")
+        source_id = query.datasource_id or snapshot.binding.menu_default
+        if source_id is None:
+            raise ValueError("请指定菜单数据源或设置项目菜单默认库")
+        if source_id not in snapshot.binding.source_ids:
+            raise ValueError("目录数据源不属于当前项目")
+        configured = load_navigation_config(session.project, self.knowledge_root)
+        matches = [item for item in configured.catalogs if item.datasource_id == source_id
+                   or (item.datasource_id == "menu_default"
+                       and source_id == snapshot.binding.menu_default)]
+        if len(matches) != 1:
+            raise ValueError("请在项目入口 MD 的 ace-navigation 中配置唯一匹配的目录 SQL")
+        config = matches[0].model_copy(update={"datasource_id": source_id})
+        query.datasource_id = source_id
+        catalog = MenuCatalogService(self.service.settings.data_dir).load(
+            session, config, self, refresh=query.refresh_catalog, stop_requested=stop_requested,
+        )
+        rows = []
+        for row in catalog.rows:
+            resolved = resolve_navigation_path(
+                session.workspace, row["menu_path"], configured.path_mappings,
+            )
+            rows.append({**row, "candidate_paths": resolved.candidate_paths,
+                         "path_notes": resolved.conflicts or resolved.missing})
+        return QueryResult(
+            query_name=query.name,
+            source=QuerySource.model_validate(snapshot.sources[source_id].model_dump()),
+            columns=["menu_id", "menu_name", "menu_path", "candidate_paths", "path_notes"],
+            rows=rows, returned_rows=len(rows), truncated=not catalog.complete,
+            catalog_info=catalog.model_dump(mode="json", exclude={"rows"}),
+        )
