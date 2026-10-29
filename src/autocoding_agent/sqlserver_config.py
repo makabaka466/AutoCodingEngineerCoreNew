@@ -70,11 +70,14 @@ class SecretStore(Protocol):
 class KeyringSecretStore:
     """Use Windows Credential Manager through the standard keyring package."""
 
+    def __init__(self, account: str = _KEYRING_ACCOUNT) -> None:
+        self.account = account
+
     def get(self) -> str | None:
         try:
             import keyring
 
-            return keyring.get_password(_KEYRING_SERVICE, _KEYRING_ACCOUNT)
+            return keyring.get_password(_KEYRING_SERVICE, self.account)
         except Exception as exc:
             raise SQLServerConfigError(f"无法读取系统凭据：{exc}") from exc
 
@@ -82,7 +85,7 @@ class KeyringSecretStore:
         try:
             import keyring
 
-            keyring.set_password(_KEYRING_SERVICE, _KEYRING_ACCOUNT, password)
+            keyring.set_password(_KEYRING_SERVICE, self.account, password)
         except Exception as exc:
             raise SQLServerConfigError(f"无法保存到系统凭据管理器：{exc}") from exc
 
@@ -92,7 +95,7 @@ class KeyringSecretStore:
             from keyring.errors import PasswordDeleteError
 
             try:
-                keyring.delete_password(_KEYRING_SERVICE, _KEYRING_ACCOUNT)
+                keyring.delete_password(_KEYRING_SERVICE, self.account)
             except PasswordDeleteError:
                 pass
         except Exception as exc:

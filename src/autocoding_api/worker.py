@@ -10,6 +10,7 @@ from threading import Event, Thread
 from autocoding_agent.application import build_application
 from autocoding_agent.config import Settings
 from autocoding_agent.core.state_machine.models import TaskState
+from autocoding_agent.datasources import DataSourceService
 from autocoding_agent.git_version import GitTarget, GitVersionError
 from autocoding_agent.incident.application import build_incident_application
 from autocoding_agent.sqlserver_service import SQLServerConnectionService
@@ -64,7 +65,10 @@ def build_services(config: ServerConfig):
     }
     sql = SQLServerConnectionService(settings)
     state = sql.inspect()
-    if state.config is not None and not state.configured:
+    if (
+        state.config is not None and not state.configured
+        and not DataSourceService(settings).path.exists()
+    ):
         raise RuntimeError("数据库已配置但凭据不可用，请检查服务账户")
     reader = sql.reader()
     reference = reader.reference if reader is not None else None

@@ -8,6 +8,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
+from test_datasources import catalog as catalog
 
 from autocoding_agent.config import Settings
 from autocoding_agent.core.models import (
@@ -71,6 +72,58 @@ from autocoding_agent.workspace_config import (
     WorkspaceProject,
 )
 from autocoding_agent.workspace_knowledge import KnowledgeDomain, MarkdownKnowledgeService
+
+
+def test_settings_edits_named_source_and_project_binding(root, catalog, tmp_path):
+    from tkinter import ttk
+    from types import SimpleNamespace
+
+    service, _, _ = catalog
+    knowledge = MarkdownKnowledgeService(tmp_path / "knowledge-state")
+    projects = WorkspaceConfigService(
+        store=WorkspaceConfigStore(service.settings.data_dir), knowledge=knowledge,
+    )
+    project = projects.save_project("项目 A", tmp_path)
+    dialog = SystemSettingsDialog(
+        root,
+        SimpleNamespace(inspect=lambda: ModelSetupState(
+            installation=ClaudeInstallation(found=False), endpoint="", model="",
+            has_api_key=False, ready=False,
+        )),
+        SimpleNamespace(
+            inspect=lambda: SQLServerConfigState(),
+            drivers=lambda: ["ODBC Driver 17 for SQL Server"],
+            settings=service.settings,
+        ),
+        workspace_service=projects, knowledge_service=knowledge,
+    )
+    dialog.notebook.select(dialog.database_tab)
+    dialog.source_combo.current(2)
+    dialog._select_source()
+    assert dialog.db_name_var.get() == "ds-menu"
+    assert dialog.db_password_var.get() == ""
+    dialog.db_name_var.set("edited-menu")
+    dialog._save_database()
+    editor = next(
+        child for child in dialog.window.winfo_children() if isinstance(child, tk.Toplevel)
+    )
+    next(child for child in editor.winfo_children() if isinstance(child, ttk.Button)).invoke()
+    assert service.connection("ds-menu").inspect().config.database == "edited-menu"
+    assert service.connection("ds-business").inspect().config.database == "ds-business"
+    assert not (service.settings.data_dir / "database" / "sqlserver.json").exists()
+    dialog._edit_project_sources()
+    editor = next(
+        child for child in dialog.window.winfo_children() if isinstance(child, tk.Toplevel)
+    )
+    choices = next(child for child in editor.winfo_children() if isinstance(child, tk.Listbox))
+    choices.selection_set(0)
+    choices.selection_set(1)
+    next(child for child in editor.winfo_children() if isinstance(child, ttk.Button)).invoke()
+    assert service.load().projects[project.id].source_ids == ["ds-menu", "ds-business"]
+    root.deiconify()
+    dialog.window.deiconify()
+    dialog.window.update()
+    assert dialog.database_tab.winfo_reqheight() <= dialog.database_tab.winfo_height()
 
 
 class FakeApplication:
@@ -731,6 +784,7 @@ def test_system_settings_combines_model_and_shared_database_without_revealing_se
             return model_state
 
     class FakeDatabaseService:
+        settings = Settings(data_dir=tmp_path / "state")
         def inspect(self) -> SQLServerConfigState:
             return database_state
 
@@ -1098,7 +1152,10 @@ def test_project_settings_creates_both_documents_and_keeps_them_on_rename(
             installation=ClaudeInstallation(found=False), endpoint="", model="",
             has_api_key=False, ready=False,
         )),
-        SimpleNamespace(inspect=lambda: SQLServerConfigState(), drivers=lambda: []),
+        SimpleNamespace(
+            inspect=lambda: SQLServerConfigState(), drivers=lambda: [],
+            settings=Settings(data_dir=tmp_path / "state"),
+        ),
         workspace_service=service, knowledge_service=knowledge,
     )
     dialog._new_workspace_project()

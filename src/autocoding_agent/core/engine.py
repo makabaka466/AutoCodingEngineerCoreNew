@@ -73,8 +73,13 @@ from autocoding_agent.core.workflow import (
     bind_assessment,
     evidence_catalog,
 )
-from autocoding_agent.database_models import QueryObservation, QueryResult, sql_fingerprint
-from autocoding_agent.database_prompt import compact_database_context
+from autocoding_agent.database_models import (
+    QueryObservation,
+    QueryObservationStatus,
+    QueryResult,
+    sql_fingerprint,
+)
+from autocoding_agent.datasources import TaskDatabaseAccess, query_source
 from autocoding_agent.knowledge_rag.models import KnowledgeDomain
 from autocoding_agent.knowledge_rag.ports import KnowledgeRetriever
 from autocoding_agent.ports.database import DatabaseReader
@@ -153,6 +158,7 @@ class AgentEngine:
         self.artifact_recorder = artifact_recorder
         self.database = database
         self.database_reference = database_reference
+        self.database_access = TaskDatabaseAccess(None, database, database_reference)
         self.max_query_rounds = max_query_rounds
         self.max_replan_rounds = max_replan_rounds
         self.owner_id = owner_id or str(uuid4())
@@ -212,6 +218,7 @@ class AgentEngine:
                 },
             )
         )
+        self.database_access.bind(session)
         self.sessions.create(session)
         return self._run_command(
             session, message.strip(), AgentMode.INSPECT, command, progress_sink
@@ -720,9 +727,9 @@ class AgentEngine:
             try:
                 if self._stop_requested(session.id):
                     raise RuntimeInterruptedError("用户已请求停止，尚未启动下一次执行。")
-                database_context = compact_database_context(
-                    configured=mode == AgentMode.INSPECT and self.database is not None,
-                    reference=self.database_reference,
+                database_context = (
+                    self.database_access.context(session) if mode == AgentMode.INSPECT
+                    else "Database queries are only available during inspection."
                 )
                 handler = self.handlers.for_state(session.task_state)
                 handler_result = handler.execute(
@@ -1132,16 +1139,8 @@ class AgentEngine:
         session: AgentSession,
         decision: AgentDecision,
     ) -> list[QueryResult]:
-        if self.database is None:
-            raise PolicyViolation(
-                "The task needs database evidence, but no shared SQL Server connection is "
-                "configured. Save one in System Settings and start a new task."
-            )
-        if session.database_reference != self.database_reference:
-            raise PolicyViolation(
-                "The database configuration bound to this task has changed. Start a new task "
-                "to use the newly saved connection."
-            )
+        if not self.database_access.available(session):
+            raise PolicyViolation("当前项目未绑定可用的只读数据源，请在项目维护中配置后新建任务")
         if session.query_rounds >= self.max_query_rounds:
             raise PolicyViolation(
                 f"The task exceeded {self.max_query_rounds} database query rounds."
@@ -1151,8 +1150,24 @@ class AgentEngine:
             started_at = time.monotonic()
             status = "failed"
             try:
-                results.append(self.database.execute(query))
+                results.append(self.database_access.execute(session, query))
                 status = "completed"
+            except Exception as exc:
+                # 后一条失败不能抹掉已完成查询的来源，恢复时仍可识别已执行操作。
+                if results:
+                    partial = decision.model_copy(
+                        update={"queries": decision.queries[:len(results)]},
+                    )
+                    self._record_query_results(session, partial, results)
+                session.query_observations.append(QueryObservation(
+                    query_name=query.name, purpose=query.purpose,
+                    source=query_source(session, query),
+                    datasource_id=query.datasource_id, status=QueryObservationStatus.FAILED,
+                    sql_fingerprint=sql_fingerprint(query.sql),
+                    parameter_names=sorted(query.parameters),
+                    error=" ".join(str(exc).split())[:800],
+                ))
+                raise
             finally:
                 logger.info(
                     "database_query_timing session_id=%s workflow=development query_index=%d "
@@ -1235,6 +1250,8 @@ class AgentEngine:
                 QueryObservation(
                     query_name=query.name,
                     purpose=query.purpose,
+                    source=result.source,
+                    datasource_id=query.datasource_id,
                     returned_rows=result.returned_rows,
                     truncated=result.truncated,
                     redacted_columns=result.redacted_columns,
@@ -1262,6 +1279,7 @@ class AgentEngine:
                     "queries": [
                         {
                             "name": query.name,
+                            "datasource_id": query.datasource_id,
                             "sql_fingerprint": sql_fingerprint(query.sql),
                             "parameter_names": sorted(query.parameters),
                         }

@@ -42,6 +42,7 @@ from autocoding_agent.database_models import (
     QueryObservation,
     QueryObservationStatus,
 )
+from autocoding_agent.datasources import DataSourceService
 from autocoding_agent.embedding_setup import EmbeddingSetupService, EmbeddingSetupState
 from autocoding_agent.incident.application import (
     IncidentApplication,
@@ -119,6 +120,13 @@ def _format_query_observation(item: QueryObservation) -> str:
         "page_lookup": "页面定位",
         "business_data": "业务数据",
     }.get(item.stage or "", "数据查询")
+    if item.source is not None:
+        stage += (
+            f" · {item.source.name} / {item.source.environment}"
+            f" / {item.source.schema_name or '默认 Schema'}"
+        )
+    elif item.datasource_id:
+        stage += f" · {item.datasource_id}"
     if item.status == QueryObservationStatus.FAILED:
         return f"• [{stage}] {item.query_name}: 失败 · {item.error or '未知错误'}"
     suffix = "，已截断" if item.truncated else ""
@@ -1713,7 +1721,19 @@ class DesktopClient:
             except Exception:
                 self._database_ready_cache = False
         database_ready = self._database_ready_cache
-        self.database_health_var.set("已配置" if database_ready else "未配置")
+        database_label = "已配置" if database_ready else "未配置"
+        if hasattr(self.sqlserver_service, "settings"):
+            try:
+                sources = DataSourceService(self.sqlserver_service.settings)
+                if sources.path.exists():
+                    binding = sources.load().projects.get(self._flow_projects.get(self.flow))
+                    count = len(binding.source_ids) if binding is not None else 0
+                    database_ready = bool(count)
+                    database_label = f"项目已绑定 · {count} 个" if count else "项目未绑定"
+            except Exception:
+                database_ready = False
+                database_label = "数据源配置异常"
+        self.database_health_var.set(database_label)
         self.database_health_label.configure(
             fg=COLORS["success"] if database_ready else COLORS["muted"]
         )
@@ -2307,6 +2327,7 @@ class DesktopClient:
             on_embedding_saved=self._apply_embedding_configuration,
             on_database_saved=self._apply_sqlserver_configuration,
             on_workspace_saved=self._apply_workspace_configuration,
+            on_datasources_changed=self._refresh_overview,
             on_knowledge_changed=self._refresh_project_options,
         )
 

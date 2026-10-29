@@ -21,6 +21,7 @@ from autocoding_agent.database_models import (
     QueryObservationStatus,
     QueryResult,
 )
+from autocoding_agent.datasource_models import TaskDataSources
 
 __all__ = [
     "DataQuery",
@@ -238,6 +239,7 @@ class IncidentSession(BaseModel):
     problem: str
     project: str | None = None
     page_hint: str | None = None
+    database_binding: TaskDataSources | None = None
     database_reference: str | None = None
     source: str = "manual"
     external_reference: str | None = None

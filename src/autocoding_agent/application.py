@@ -25,6 +25,7 @@ from autocoding_agent.core.recovery.manager import RecoveryManager
 from autocoding_agent.core.recovery.models import RecoveryAction, RecoveryScanResult
 from autocoding_agent.core.runtime.models import RuntimeRunRecord
 from autocoding_agent.core.state_machine.machine import AgentStateMachine
+from autocoding_agent.datasources import DataSourceService, TaskDatabaseAccess
 from autocoding_agent.git_version import GitTarget, GitVersionService
 from autocoding_agent.incident.models import IncidentSession
 from autocoding_agent.knowledge_rag.ports import KnowledgeRetriever
@@ -305,5 +306,8 @@ def build_application(
             else build_configured_hermes_service(configured)
         ),
         max_hermes_skill_rounds=configured.hermes_skill_max_rounds,
+    )
+    engine.database_access = TaskDatabaseAccess(
+        DataSourceService(configured), database, database_reference,
     )
     return AgentApplication(engine, log_path, recovery_scan, configured.data_dir, git_targets)

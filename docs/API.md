@@ -188,3 +188,11 @@ $recoveryJob = Invoke-RestMethod -Method Post -Uri "$apiBase/v1/tasks/$($job.tas
 恢复规则继续适用；服务不会自动重放写操作。若审批的领域命令回执已落盘而队列尚未确认，
 Worker 重启会识别回执并补齐队列结果，不会重新执行该审批。本版没有正式的系统服务安装脚本、
 开机自启、外部 HTTPS 入口或钉钉适配层；这些属于下一阶段的常驻部署。
+
+
+## 项目数据源（0.16.0）
+
+Worker 与桌面复用项目数据源路由。将项目配置的 `knowledge_project` 设置为稳定 ACE 项目 ID，
+在相同 data_dir 下维护 `database/datasources.json` 及命名连接，服务账户需要对应 OS 凭据。
+目录启用后，新任务只能访问该项目绑定的源，不回落到全局 SQL Server 或 SQLite 配置。
+旧任务按旧绑定继续校验；配置变化后核对并新建任务。当前没有新增远程数据源管理接口。

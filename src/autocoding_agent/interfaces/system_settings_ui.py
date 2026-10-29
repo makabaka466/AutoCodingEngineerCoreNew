@@ -8,7 +8,10 @@ import tkinter as tk
 from collections.abc import Callable
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
+from uuid import uuid4
 
+from autocoding_agent.datasource_models import DataSourceDefinition
+from autocoding_agent.datasources import DataSourceService
 from autocoding_agent.embedding_setup import (
     SUPPORTED_EMBEDDING_DIMENSIONS,
     EmbeddingConnectionConfig,
@@ -16,6 +19,7 @@ from autocoding_agent.embedding_setup import (
     EmbeddingSetupService,
     EmbeddingSetupState,
 )
+from autocoding_agent.interfaces.datasource_ui import edit_project_sources, edit_source
 from autocoding_agent.model_setup import (
     ClaudeModelSetupService,
     ModelSetupError,
@@ -71,10 +75,13 @@ class SystemSettingsDialog:
         on_database_saved: Callable[[SQLServerConfigState], None] | None = None,
         on_knowledge_changed: Callable[[], None] | None = None,
         on_workspace_saved: Callable[[WorkspaceConfigState], None] | None = None,
+        on_datasources_changed: Callable[[], None] | None = None,
     ) -> None:
         self.parent = parent
         self.model_service = model_service
         self.database_service = database_service
+        self.datasource_service = DataSourceService(database_service.settings)
+        self._editing_source_id = None
         self.embedding_service = embedding_service or EmbeddingSetupService()
         self.knowledge_service = knowledge_service or MarkdownKnowledgeService()
         self.workspace_service = workspace_service or WorkspaceConfigService(
@@ -88,6 +95,7 @@ class SystemSettingsDialog:
         self.on_database_saved = on_database_saved
         self.on_knowledge_changed = on_knowledge_changed
         self.on_workspace_saved = on_workspace_saved
+        self.on_datasources_changed = on_datasources_changed
         self.required_model_setup = required_model_setup
         self.model_state = model_service.inspect()
         self.embedding_state = self.embedding_service.inspect()
@@ -183,6 +191,7 @@ class SystemSettingsDialog:
         self._build_model_tab()
         self._build_embedding_tab()
         self._build_database_tab()
+        self._build_source_selector()
         self._build_workspace_tab()
         self._build_knowledge_tab()
 
@@ -442,6 +451,64 @@ class SystemSettingsDialog:
             button.pack(side="left", padx=(0, 18))
             self.db_option_buttons.append(button)
 
+    def _build_source_selector(self) -> None:
+        # 原连接字段和测试逻辑继续复用，仅增加稳定的数据源选择。
+        for child in self.database_tab.grid_slaves():
+            child.grid_configure(row=int(child.grid_info()["row"]) + 1)
+        self.source_combo = ttk.Combobox(self.database_tab, state="readonly", width=65)
+        self.source_combo.grid(row=0, column=0, sticky="ew", padx=26, pady=8)
+        self._refresh_sources()
+        self.source_combo.bind("<<ComboboxSelected>>", self._select_source)
+
+    def _refresh_sources(self) -> None:
+        self._source_choices = list(self.datasource_service.load().sources.values())
+        self.source_combo.configure(values=["旧单连接（兼容历史任务）", "新增项目数据源"] + [
+            f"{source.name} / {source.environment} [{source.datasource_id}]"
+            for source in self._source_choices
+        ])
+        ids = [None, "new"] + [source.datasource_id for source in self._source_choices]
+        self.source_combo.current(ids.index(self._editing_source_id))
+
+    def _select_source(self, _event=None) -> None:
+        index = self.source_combo.current()
+        self._editing_source_id = (
+            None if index == 0 else "new" if index == 1
+            else self._source_choices[index - 2].datasource_id
+        )
+        service = self._selected_connection_service()
+        state = service.inspect()
+        config = state.config
+        # 新增保留当前表单作为模板，但不复制密码，避免凭据意外跨连接复用。
+        if config is not None:
+            for field, value in {
+                "server": config.server, "port": str(config.port), "name": config.database,
+                "driver": config.driver, "auth": config.authentication.value,
+                "username": config.username or "", "encrypt": config.encrypt,
+                "trust": config.trust_server_certificate,
+            }.items():
+                getattr(self, f"db_{field}_var").set(value)
+        self.db_password_var.set("")
+        self._load_database_state(state)
+
+    def _selected_connection_service(self):
+        if self._editing_source_id is None:
+            return self.database_service
+        return self.datasource_service.connection(
+            "ds-unsaved" if self._editing_source_id == "new" else self._editing_source_id,
+        )
+
+    def _edit_project_sources(self) -> None:
+        if self._editing_project_id is None:
+            messagebox.showinfo(
+                "请先保存项目", "新增项目保存后才能绑定数据源。", parent=self.window,
+            )
+            return
+        edit_project_sources(
+            self.window, self.datasource_service, self._editing_project_id,
+            self.workspace_name_var.get(),
+            on_saved=self.on_datasources_changed,
+        )
+
     def _build_workspace_tab(self) -> None:
         tab = self.workspace_tab
         tab.grid_columnconfigure(0, weight=1)
@@ -462,6 +529,9 @@ class SystemSettingsDialog:
         self.workspace_combo.bind("<<ComboboxSelected>>", self._select_workspace_project)
         self._button(project_row, "新增项目", self._new_workspace_project, PANEL, TEXT).pack(
             side="left", padx=10,
+        )
+        self._button(project_row, "绑定数据源", self._edit_project_sources, PANEL, TEXT).pack(
+            side="left", padx=4,
         )
         self._field_label(tab, "项目名称", 2)
         self._entry(tab, self.workspace_name_var).grid(
@@ -799,13 +869,14 @@ class SystemSettingsDialog:
             messagebox.showerror("连接配置不完整", str(exc), parent=self.window)
             return
         password = self.db_password_var.get()
+        connection_service = self._selected_connection_service()
         self._set_database_busy(True)
         self._set_database_status("正在测试连接…", ACCENT)
 
         def work() -> None:
             try:
                 self._test_results.put(
-                    ("success", self.database_service.test(config, password))
+                    ("success", connection_service.test(config, password))
                 )
             except Exception as exc:
                 self._test_results.put(("error", exc))
@@ -829,6 +900,33 @@ class SystemSettingsDialog:
 
     def _save_database(self) -> None:
         if self._testing_database:
+            return
+        if self._editing_source_id is not None:
+            try:
+                config = self._collect_database_config()
+                definition = self.datasource_service.load().sources.get(self._editing_source_id)
+                if definition is None:
+                    definition = DataSourceDefinition(
+                        datasource_id=f"ds-{uuid4().hex}", name="新数据源", environment="未指定",
+                    )
+            except Exception as exc:
+                messagebox.showerror("数据源未保存", str(exc), parent=self.window)
+                return
+            password = self.db_password_var.get()
+
+            def save_source(updated):
+                if updated.environment == "未指定":
+                    raise ValueError("请明确填写此数据源的实际环境")
+                self.datasource_service.save_source(updated, config, password)
+                self._editing_source_id = updated.datasource_id
+                self.db_password_var.set("")
+                self._refresh_sources()
+                self._load_database_state(self._selected_connection_service().inspect())
+                self._set_database_status("数据源已保存，请在项目维护中绑定后新建任务。", SUCCESS)
+                if self.on_datasources_changed is not None:
+                    self.on_datasources_changed()
+
+            edit_source(self.window, definition, save_source)
             return
         try:
             state = self.database_service.save(
@@ -1013,6 +1111,7 @@ class SystemSettingsDialog:
 
     def _set_database_busy(self, busy: bool) -> None:
         self._testing_database = busy
+        self.source_combo.configure(state="disabled" if busy else "readonly")
         state = "disabled" if busy else "normal"
         for control in (
             self.db_server_entry,

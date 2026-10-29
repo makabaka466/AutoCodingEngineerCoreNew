@@ -23,6 +23,9 @@ class DataQuery(BaseModel):
 
     name: NonEmptyText
     purpose: NonEmptyText
+    datasource_id: str | None = Field(
+        default=None, description="Authorized project datasource ID. Required when ambiguous.",
+    )
     sql: NonEmptyText = Field(
         description=(
             "Parameterized read-only SQL. Use :name placeholders; the SQL Server host also "
@@ -36,10 +39,21 @@ class DataQuery(BaseModel):
     max_rows: int = Field(default=DEFAULT_QUERY_MAX_ROWS, ge=1, le=DEFAULT_QUERY_MAX_ROWS)
 
 
+class QuerySource(BaseModel):
+    """查询来源；环境是用户配置标签，不代表程序验证过部署环境。"""
+
+    datasource_id: str = Field(description="稳定数据源 ID")
+    name: str = Field(description="数据源展示名称")
+    environment: str = Field(description="用户配置的环境标签")
+    schema_name: str = Field(default="", description="预期 Schema/Owner，SQL 应显式限定")
+    database_type: str = Field(default="sqlserver", description="数据库方言")
+
+
 class QueryResult(BaseModel):
     """Bounded and sanitized data returned only to the active model turn."""
 
     query_name: str
+    source: QuerySource | None = None
     columns: list[str]
     rows: list[dict[str, Any]]
     returned_rows: int
@@ -56,6 +70,8 @@ class QueryObservation(BaseModel):
     """Persisted audit metadata; raw database rows are intentionally excluded."""
 
     query_name: str
+    source: QuerySource | None = None
+    datasource_id: str | None = None
     purpose: str
     status: QueryObservationStatus = QueryObservationStatus.SUCCEEDED
     stage: str | None = None

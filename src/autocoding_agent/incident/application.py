@@ -19,6 +19,7 @@ from autocoding_agent.core.progress import ProgressSink
 from autocoding_agent.core.recovery.models import RecoveryAction, RecoveryScanResult
 from autocoding_agent.core.runtime.models import RuntimeRunRecord
 from autocoding_agent.core.state_machine.machine import AgentStateMachine
+from autocoding_agent.datasources import DataSourceService, TaskDatabaseAccess
 from autocoding_agent.git_version import GitTarget, GitVersionService
 from autocoding_agent.incident.capability_store import IncidentCapabilityStore
 from autocoding_agent.incident.engine import IncidentEngine
@@ -217,5 +218,8 @@ def build_incident_application(
         ),
         artifact_recorder=artifact_recorder,
         max_hermes_skill_rounds=configured.hermes_skill_max_rounds,
+    )
+    engine.database_access = TaskDatabaseAccess(
+        DataSourceService(configured), selected_database, selected_reference,
     )
     return IncidentApplication(engine, log_path, recovery_scan, configured.data_dir, git_targets)

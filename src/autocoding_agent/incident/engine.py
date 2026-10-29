@@ -66,7 +66,7 @@ from autocoding_agent.database_models import (
     QueryResult,
     sql_fingerprint,
 )
-from autocoding_agent.database_prompt import compact_database_context
+from autocoding_agent.datasources import TaskDatabaseAccess, query_source
 from autocoding_agent.incident.capability_store import IncidentCapabilityStore
 from autocoding_agent.incident.models import (
     IncidentCompletionKind,
@@ -144,6 +144,7 @@ class IncidentEngine:
         self.max_business_query_rounds = max_business_query_rounds
         self.max_query_repair_rounds = max_query_repair_rounds
         self.database_reference = database_reference
+        self.database_access = TaskDatabaseAccess(None, database, database_reference)
         self.capabilities = capabilities
         self.model = model
         self.state_machine = state_machine or AgentStateMachine()
@@ -197,6 +198,7 @@ class IncidentEngine:
                 data={"state": TaskState.CREATED.value, "workflow": "incident"},
             )
         )
+        self.database_access.bind(session)
         self.sessions.create(session)
         command = AgentCommand(
             task_id=session.id,
@@ -1085,20 +1087,12 @@ class IncidentEngine:
                 self._emit_outcome_progress(session, progress_sink)
                 return self._to_outcome(session)
 
-            if self.database is None:
+            if not self.database_access.available(session):
                 return self._fail(
                     session,
-                    "The investigation needs database evidence, but no incident database is "
-                    "configured. "
-                    "Configure the SQL Server connection in the desktop client, or pass a "
-                    "supported database through the application interface.",
-                    command,
-                )
-            if session.database_reference != self.database_reference:
-                return self._fail(
-                    session,
-                    "The database configuration bound to this incident changed. Start a new "
-                    "incident to use the newly saved SQL Server connection.",
+                    "当前项目未绑定可用的只读数据源，请配置后新建任务"
+                    if session.database_binding is not None
+                    else "No incident database is configured. Configure a read-only connection.",
                     command,
                 )
             query_stage = decision.query_stage
@@ -1158,7 +1152,9 @@ class IncidentEngine:
                     started_at = time.monotonic()
                     status = "failed"
                     try:
-                        results.append(self.database.execute(query))
+                        results.append(
+                            self.database_access.execute(session, query, query_stage.value),
+                        )
                         status = "completed"
                     finally:
                         logger.info(
@@ -1361,6 +1357,8 @@ class IncidentEngine:
                 QueryObservation(
                     query_name=query.name,
                     purpose=query.purpose,
+                    source=result.source,
+                    datasource_id=query.datasource_id,
                     status=QueryObservationStatus.SUCCEEDED,
                     stage=decision.query_stage.value if decision.query_stage else None,
                     returned_rows=result.returned_rows,
@@ -1395,6 +1393,7 @@ class IncidentEngine:
                     "queries": [
                         {
                             **audit,
+                            "source": result.source.model_dump() if result.source else None,
                             "returned_rows": result.returned_rows,
                             "truncated": result.truncated,
                             "redacted_columns": result.redacted_columns,
@@ -1422,6 +1421,8 @@ class IncidentEngine:
                 QueryObservation(
                     query_name=query.name,
                     purpose=query.purpose,
+                    source=result.source,
+                    datasource_id=query.datasource_id,
                     status=QueryObservationStatus.SUCCEEDED,
                     stage=decision.query_stage.value if decision.query_stage else None,
                     returned_rows=result.returned_rows,
@@ -1436,6 +1437,8 @@ class IncidentEngine:
             QueryObservation(
                 query_name=failed_query_name,
                 purpose=failed_query.purpose,
+                source=query_source(session, failed_query),
+                datasource_id=failed_query.datasource_id,
                 status=QueryObservationStatus.FAILED,
                 stage=decision.query_stage.value if decision.query_stage else None,
                 sql_fingerprint=sql_fingerprint(failed_query.sql),
@@ -1464,6 +1467,7 @@ class IncidentEngine:
         return [
             {
                 "name": query.name,
+                "datasource_id": query.datasource_id,
                 "purpose": query.purpose,
                 "sql_fingerprint": sql_fingerprint(query.sql),
                 "parameter_names": sorted(query.parameters),
@@ -1484,10 +1488,7 @@ class IncidentEngine:
         *,
         allow_compact: bool = False,
     ) -> tuple[IncidentDecision, AgentUsage]:
-        database_context = compact_database_context(
-            configured=self.database is not None,
-            reference=self.database_reference,
-        )
+        database_context = self.database_access.context(session)
         previous_runtime_session_id = session.runtime_session_id
         capability_dir = (
             self.capabilities.prepare(session.workspace, session.project)

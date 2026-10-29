@@ -1,6 +1,6 @@
 # AutoCoding Engineer 接口与数据契约
 
-本文记录当前 `0.14.2` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
+本文记录当前 `0.16.0` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
 Runtime、持久化和状态契约。
 设计动机和运行流程见[架构说明](ARCHITECTURE.md)。
 新增独立 HTTP 路由、队列状态和 PowerShell 示例见[HTTP API](API.md)。
@@ -1380,3 +1380,22 @@ failed_or_interrupted。无活动保持 null，不能把未观测到活动解释
 `AgentApplication.request_stop(session_id)` 与 `IncidentApplication.request_stop(session_id)` 幂等保存停止意图，返回不表示已经停止。完成任务调用无操作；当前只支持 SQLite 持久存储。轮次结束后读取 task_state，PAUSED 表示可继续，RECOVERY_REQUIRED 表示必须核对可能的副作用。既有 `resume(..., READ_ONLY_INSPECT)` 清除停止标记后只读恢复，不同步版本库、不自动批准修改。HTTP 路由保持既有接口，本次新增入口为桌面 UI 与应用 facade。
 
 桌面按钮：运行中“停止”→“正在停止”→“继续任务（先核对）”；异常流程复用“继续只读诊断”。重复停止不重复执行，运行中不能重复发起继续；跨执行者仍由会话 revision 乐观锁约束。
+
+
+## 0.16.0 数据源契约
+
+- `DataSourceDefinition`：稳定 `datasource_id`，name、database_type（当前 sqlserver）、environment、schema_name、subproject、purpose；无连接凭据。
+- `ProjectDataSources`：source_ids、menu_default、business_default；默认项必须在绑定范围内。
+- `DataSourceService.save_source(definition, config, password="")`：保存独立 SQL Server 连接及元信息。
+- `DataSourceService.bind_project(project, binding)`：保存项目授权；未知 ID 或越界默认值拒绝保存。
+- `DataSourceService.snapshot(project)`：生成无凭据的任务绑定快照；目录不存在返回 None 表示兼容旧模式。
+- `AgentSession` / `IncidentSession.database_binding`：可空，持久化任务授权、配置指纹和默认项；不批量改写旧快照。
+- `DataQuery.datasource_id`：可空；多源无默认时必须显式指定，未授权 ID 拒绝执行。
+- `QueryResult.source` / `QueryObservation.source`：可空的 `QuerySource`，记录 ID、名称、环境、配置 Schema 和方言。
+- `QueryObservation.datasource_id`：保存实际解析或尝试使用的数据源 ID；失败和部分成功均可审计。
+
+现有 start/send/approve 等接口签名不变。通过应用构建器创建的服务自动读取其 settings.data_dir
+下的数据源目录；直接构造低层引擎仍可注入单连接用于独立测试。
+HTTP Worker 的领域 project 使用 ServerConfig 中的 `knowledge_project`，部署时应配置为同一
+稳定 ACE 项目 ID，并在同一 data_dir 维护绑定；仅复用相同工作目录不会授予数据库访问权。
+已有 SQLite/单连接任务保持原有访问方式；目录启用后的新任务以项目绑定为准。

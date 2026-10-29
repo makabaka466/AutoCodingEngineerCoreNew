@@ -16,6 +16,7 @@ from autocoding_agent.core.runtime.models import RuntimeRunRecord
 from autocoding_agent.core.state_machine.models import CommandReceipt, TaskState
 from autocoding_agent.core.workflow import WorkflowAssessment
 from autocoding_agent.database_models import DataQuery, QueryObservation
+from autocoding_agent.datasource_models import TaskDataSources
 
 NonEmptyText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 
@@ -256,6 +257,7 @@ class AgentSession(BaseModel):
     last_decision: AgentDecision | None = None
     last_usage: AgentUsage = Field(default_factory=AgentUsage)
     capability_document: str | None = None
+    database_binding: TaskDataSources | None = None
     database_reference: str | None = None
     query_observations: list[QueryObservation] = Field(default_factory=list)
     hermes_skill_observations: list[HermesSkillObservation] = Field(default_factory=list)
