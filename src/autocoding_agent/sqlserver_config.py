@@ -119,6 +119,10 @@ class SQLServerConfigState(BaseModel):
 class SQLServerConfigStore:
     """Atomically store non-secret settings and delegate the password to the OS."""
 
+    config_model = SQLServerConnectionConfig
+    state_model = SQLServerConfigState
+    label = "SQL Server"
+
     def __init__(self, data_dir: str | Path, secrets: SecretStore | None = None) -> None:
         self.path = Path(data_dir).expanduser().resolve() / "database" / "sqlserver.json"
         self.secrets = secrets or KeyringSecretStore()
@@ -127,13 +131,13 @@ class SQLServerConfigStore:
         config: SQLServerConnectionConfig | None = None
         if self.path.is_file():
             try:
-                config = SQLServerConnectionConfig.model_validate_json(
+                config = self.config_model.model_validate_json(
                     self.path.read_text(encoding="utf-8")
                 )
             except (OSError, ValueError) as exc:
-                raise SQLServerConfigError(f"SQL Server 配置文件无效：{exc}") from exc
+                raise SQLServerConfigError(f"{self.label} 配置文件无效：{exc}") from exc
         has_password = bool(self.secrets.get()) if config is not None else False
-        return SQLServerConfigState(config=config, has_password=has_password)
+        return self.state_model(config=config, has_password=has_password)
 
     def save(
         self,
@@ -182,6 +186,6 @@ class SQLServerConfigStore:
         if config.authentication == SQLServerAuthentication.WINDOWS:
             return
         if not config.username:
-            raise SQLServerConfigError("SQL Server 认证需要填写用户名。")
+            raise SQLServerConfigError(f"{self.label} 认证需要填写用户名。")
         if not password and not self.secrets.get():
-            raise SQLServerConfigError("SQL Server 认证需要填写密码。")
+            raise SQLServerConfigError(f"{self.label} 认证需要填写密码。")

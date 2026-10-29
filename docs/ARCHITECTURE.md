@@ -1,6 +1,6 @@
 # AutoCoding Engineer 架构说明
 
-本文描述当前 `0.16.0` 代码已经实现的架构。数据字段、公共方法和命令行参数见
+本文描述当前 `0.17.0` 代码已经实现的架构。数据字段、公共方法和命令行参数见
 [接口与数据契约](INTERFACES.md)。
 
 开发质量约束合并进已有 investigate/propose/implement 方法：调查现有风格与复用点，方案
@@ -919,3 +919,19 @@ Oracle 适配或新的远程配置 API。配置界面应由单个管理实例维
 
 连接目录同时提交配置指纹，若保存中断导致连接文件与目录不一致，新旧任务均拒绝使用该源，
 需重新保存恢复一致性。执行使用已校验的连接对象，不在校验后重新加载目标文件。
+
+
+## 0.17.0 Oracle 只读适配
+
+DataSourceDefinition.database_type 扩展为 sqlserver/oracle，DataSourceService 按显式类型解析配置和
+构建读取器。命名连接不能原地更换数据库类型；SQL Server 原配置、凭据、任务指纹保持兼容。
+OracleConfigStore 复用原存储的原子保存和凭据回退，通过配置/状态模型钩子替换契约，不复制保存逻辑。
+OracleConnectionService 与既有只读端口一致，两套应用和 HTTP Worker 自动获得 Oracle 路由能力。
+
+OracleDatabaseReader 使用结构化 ConnectParams，Service Name/SID 分开设置；默认 Thin，Thick
+客户端初始化由进程锁保护，模式或目录冲突明确拒绝。查询在只读事务内执行，原生绑定变量检查后
+传字典参数；有界抓取、重复列去重、敏感列遮蔽以及有界 LOB 读取。共享列名去重避免与已有别名碰撞。
+连接测试只取版本与身份。TCP 建连及单次往返均有限制；未引入额外模型调用或自动数据库重试。
+
+桌面数据库页保留原 SQL Server 表单，Oracle 使用独立连接表单并共用项目绑定页。
+详见 [Oracle 配置与限制](ORACLE.md)。

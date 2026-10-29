@@ -15,6 +15,9 @@ from autocoding_agent.adapters.database_safety import (
     sensitive_columns,
     validate_read_only_sql,
 )
+from autocoding_agent.adapters.database_safety import (
+    unique_column_names as _unique_column_names,
+)
 from autocoding_agent.database_models import (
     DEFAULT_QUERY_MAX_ROWS,
     DEFAULT_QUERY_TIMEOUT_SECONDS,
@@ -260,13 +263,3 @@ def _bind_named_parameters(
     if unused:
         raise ReadOnlyQueryError(f"Unused query parameters: {', '.join(sorted(unused))}")
     return "".join(rendered), values
-
-
-def _unique_column_names(columns: list[str]) -> list[str]:
-    counts: dict[str, int] = {}
-    unique: list[str] = []
-    for column in columns:
-        count = counts.get(column, 0) + 1
-        counts[column] = count
-        unique.append(column if count == 1 else f"{column}_{count}")
-    return unique

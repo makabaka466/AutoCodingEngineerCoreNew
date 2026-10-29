@@ -126,6 +126,34 @@ def test_settings_edits_named_source_and_project_binding(root, catalog, tmp_path
     assert dialog.database_tab.winfo_reqheight() <= dialog.database_tab.winfo_height()
 
 
+def test_oracle_dialog_saves_independent_source_and_does_not_echo_password(root, catalog):
+    from autocoding_agent.interfaces.oracle_settings_ui import OracleSettingsDialog
+
+    service, _, _ = catalog
+    dialog = OracleSettingsDialog(root, service)
+    for key, value in {
+        "name": "车载 Oracle", "environment": "test", "schema_name": "MES",
+        "server": "oracle.example", "database": "MES_SERVICE", "username": "reader",
+        "password": "oracle-secret",
+    }.items():
+        dialog.variables[key].set(value)
+    root.deiconify()
+    dialog.window.update()
+    assert dialog.variables["mode"].get() == "thin"
+    assert dialog.window.winfo_reqheight() < dialog.window.winfo_screenheight()
+    dialog._save()
+    definition = service.load().sources[dialog.source_id]
+    assert definition.database_type == "oracle"
+    assert service.connection(dialog.source_id).inspect().configured
+    editor = OracleSettingsDialog(root, service, definition)
+    assert editor.variables["database"].get() == "MES_SERVICE"
+    assert editor.variables["password"].get() == ""
+    editor.variables["database"].set("MES_OTHER")
+    editor._save()
+    assert service.connection(dialog.source_id).inspect().config.database == "MES_OTHER"
+    assert service.connection("ds-menu").inspect().config.database == "ds-menu"
+
+
 class FakeApplication:
     def __init__(self, sessions: list[AgentSession] | None = None) -> None:
         self.sessions = {item.id: item for item in sessions or []}
@@ -839,7 +867,7 @@ def test_system_settings_combines_model_and_shared_database_without_revealing_se
     assert [dialog.notebook.tab(tab, "text") for tab in dialog.notebook.tabs()] == [
         "模型与 Claude Code",
         "Embedding",
-        "SQL Server",
+        "数据库",
         "项目维护",
         "MD 能力配置",
     ]

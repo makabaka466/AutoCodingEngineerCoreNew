@@ -196,3 +196,8 @@ Worker 与桌面复用项目数据源路由。将项目配置的 `knowledge_proj
 在相同 data_dir 下维护 `database/datasources.json` 及命名连接，服务账户需要对应 OS 凭据。
 目录启用后，新任务只能访问该项目绑定的源，不回落到全局 SQL Server 或 SQLite 配置。
 旧任务按旧绑定继续校验；配置变化后核对并新建任务。当前没有新增远程数据源管理接口。
+
+
+
+0.17.0：上述项目绑定也支持 Oracle，Worker 复用相同适配器；同进程 Oracle 模式须统一，
+配置模式变更需重启 Worker。依赖安装包含 python-oracledb；服务端 API 不新增数据库写入或远程配置接口。

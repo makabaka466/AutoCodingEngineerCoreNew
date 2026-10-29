@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "auto-coding-engineer-core-new"
-version = "0.16.0"
+version = "0.17.0"
 description = "A platform-independent software-development agent powered by Claude Code."
 requires-python = ">=3.12"
 dependencies = [
@@ -13,6 +13,7 @@ dependencies = [
     "pydantic>=2.8,<3",
     "pydantic-settings>=2.3,<3",
     "pyodbc>=5.3,<6",
+    "oracledb>=3.4,<4",
     "typer>=0.16,<1",
 ]
 

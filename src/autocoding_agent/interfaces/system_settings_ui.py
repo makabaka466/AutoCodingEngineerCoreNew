@@ -20,6 +20,7 @@ from autocoding_agent.embedding_setup import (
     EmbeddingSetupState,
 )
 from autocoding_agent.interfaces.datasource_ui import edit_project_sources, edit_source
+from autocoding_agent.interfaces.oracle_settings_ui import OracleSettingsDialog
 from autocoding_agent.model_setup import (
     ClaudeModelSetupService,
     ModelSetupError,
@@ -185,7 +186,7 @@ class SystemSettingsDialog:
         self.knowledge_tab = tk.Frame(self.notebook, bg=CARD)
         self.notebook.add(self.model_tab, text="模型与 Claude Code")
         self.notebook.add(self.embedding_tab, text="Embedding")
-        self.notebook.add(self.database_tab, text="SQL Server")
+        self.notebook.add(self.database_tab, text="数据库")
         self.notebook.add(self.workspace_tab, text="项目维护")
         self.notebook.add(self.knowledge_tab, text="MD 能力配置")
         self._build_model_tab()
@@ -462,15 +463,35 @@ class SystemSettingsDialog:
 
     def _refresh_sources(self) -> None:
         self._source_choices = list(self.datasource_service.load().sources.values())
-        self.source_combo.configure(values=["旧单连接（兼容历史任务）", "新增项目数据源"] + [
-            f"{source.name} / {source.environment} [{source.datasource_id}]"
+        self.source_combo.configure(values=["旧单连接（兼容历史任务）", "新增 SQL Server"] + [
+            f"{source.name} / {source.environment} / {source.database_type} "
+            f"[{source.datasource_id}]"
             for source in self._source_choices
-        ])
+        ] + ["新增 Oracle 数据源"])
         ids = [None, "new"] + [source.datasource_id for source in self._source_choices]
         self.source_combo.current(ids.index(self._editing_source_id))
 
     def _select_source(self, _event=None) -> None:
         index = self.source_combo.current()
+        selected = (
+            self._source_choices[index - 2] if 2 <= index < len(self._source_choices) + 2 else None
+        )
+        if index == len(self._source_choices) + 2 or (
+            selected and selected.database_type == "oracle"
+        ):
+            # Oracle 使用独立字段表单，返回后恢复 SQL Server 表单，避免串用连接字段。
+            self.source_combo.current(0)
+            self._select_source()
+
+            def saved():
+                self._refresh_sources()
+                if self.on_datasources_changed is not None:
+                    self.on_datasources_changed()
+
+            self._oracle_dialog = OracleSettingsDialog(
+                self.window, self.datasource_service, selected, on_saved=saved,
+            )
+            return
         self._editing_source_id = (
             None if index == 0 else "new" if index == 1
             else self._source_choices[index - 2].datasource_id

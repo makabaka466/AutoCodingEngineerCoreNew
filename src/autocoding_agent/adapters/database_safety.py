@@ -59,3 +59,23 @@ def _without_literals_and_quoted_identifiers(sql: str) -> str:
     without_strings = re.sub(r"'(?:''|[^'])*'", "''", sql)
     without_brackets = re.sub(r"\[(?:\]\]|[^]])*]", "[]", without_strings)
     return re.sub(r'"(?:""|[^"])*"', '""', without_brackets)
+
+
+def unique_column_names(columns: list[str]) -> list[str]:
+    """为重复列名编号，同时避开查询本身已有的别名，防止结果字典覆盖证据。"""
+    counts: dict[str, int] = {}
+    reserved = set(columns)
+    used: set[str] = set()
+    unique: list[str] = []
+    for column in columns:
+        count = counts.get(column, 0) + 1
+        candidate = column
+        if column in used:
+            candidate = f"{column}_{count}"
+            while candidate in used or candidate in reserved:
+                count += 1
+                candidate = f"{column}_{count}"
+        counts[column] = count
+        used.add(candidate)
+        unique.append(candidate)
+    return unique

@@ -59,10 +59,10 @@ else {
 Push-Location $projectRoot
 try {
     if ($Web) {
-        & $pythonExe -c "import autocoding_agent, keyring, pyodbc, streamlit" 2>$null
+        & $pythonExe -c "import autocoding_agent, keyring, pyodbc, oracledb, streamlit" 2>$null
     }
     else {
-        & $pythonExe -c "import autocoding_agent, keyring, pyodbc, tkinter" 2>$null
+        & $pythonExe -c "import autocoding_agent, keyring, pyodbc, oracledb, tkinter" 2>$null
     }
     $dependenciesReady = $LASTEXITCODE -eq 0
     if ($ForceInstall -or -not $dependenciesReady) {

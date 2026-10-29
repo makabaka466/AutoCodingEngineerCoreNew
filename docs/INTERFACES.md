@@ -1,6 +1,6 @@
 # AutoCoding Engineer 接口与数据契约
 
-本文记录当前 `0.16.0` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
+本文记录当前 `0.17.0` 已实现的软件开发、异常诊断、Python、CLI、桌面客户端、Streamlit、
 Runtime、持久化和状态契约。
 设计动机和运行流程见[架构说明](ARCHITECTURE.md)。
 新增独立 HTTP 路由、队列状态和 PowerShell 示例见[HTTP API](API.md)。
@@ -1399,3 +1399,16 @@ failed_or_interrupted。无活动保持 null，不能把未观测到活动解释
 HTTP Worker 的领域 project 使用 ServerConfig 中的 `knowledge_project`，部署时应配置为同一
 稳定 ACE 项目 ID，并在同一 data_dir 维护绑定；仅复用相同工作目录不会授予数据库访问权。
 已有 SQLite/单连接任务保持原有访问方式；目录启用后的新任务以项目绑定为准。
+
+
+## 0.17.0 Oracle 契约
+
+- DataSourceDefinition.database_type：sqlserver 或 oracle。
+- OracleConnectionConfig：server、port（1521）、database（标识值）、identifier_type（service_name/sid）、username、mode（thin/thick）、client_lib_dir、connection_timeout_seconds。
+- OracleConfigState：config、has_password、configured。密码不属于公开配置模型。
+- DataSourceService.connection(source_id, database_type=None)：按目录类型选择连接服务；新增未入目录的 Oracle 源须显式传 oracle。
+- save_source 接受对应类型的配置，不接受类型错配，也不允许改变已有 ID 的数据库类型。
+- OracleConnectionService：inspect/save/test/reader；OracleDatabaseReader：execute/describe_schema/test_connection。
+- QueryResult/QueryObservation 的 source.database_type 记录 oracle；两套流程及 HTTP 路由签名保持不变。
+
+驱动错误返回安全错误码和固定提示；数据库返回行仍只进入当前模型轮次，持久记录仅保存审计元信息。

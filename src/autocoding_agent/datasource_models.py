@@ -11,7 +11,9 @@ class DataSourceDefinition(QuerySource):
     """非秘密元数据；连接参数保存在独立连接文件中。"""
 
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
-    database_type: Literal["sqlserver"] = Field(default="sqlserver", description="当前支持的方言")
+    database_type: Literal["sqlserver", "oracle"] = Field(
+        default="sqlserver", description="数据库方言",
+    )
     datasource_id: str = Field(pattern=r"^ds-[a-zA-Z0-9_-]+$", description="稳定数据源 ID")
     name: str = Field(min_length=1, max_length=100, description="展示名称")
     environment: str = Field(min_length=1, max_length=100, description="用户确认的环境标签")

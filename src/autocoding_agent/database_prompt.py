@@ -16,6 +16,9 @@ def compact_database_context(*, configured: bool, reference: str | None) -> str:
     if normalized.startswith("sqlserver://"):
         dialect = "Microsoft SQL Server (T-SQL)"
         metadata = "INFORMATION_SCHEMA.COLUMNS or bounded sys.tables/sys.columns SELECTs"
+    elif normalized.startswith("oracle://"):
+        dialect = "Oracle SQL"
+        metadata = "bounded ALL_TAB_COLUMNS or USER_TAB_COLUMNS queries, scoped by owner/table"
     elif normalized.endswith((".db", ".sqlite", ".sqlite3")):
         dialect = "SQLite"
         metadata = "sqlite_master and bounded PRAGMA table_info reads"

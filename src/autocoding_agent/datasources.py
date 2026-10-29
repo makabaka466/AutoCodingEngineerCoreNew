@@ -16,6 +16,8 @@ from autocoding_agent.datasource_models import (
     ProjectDataSources,
     TaskDataSources,
 )
+from autocoding_agent.oracle_config import OracleConfigStore, OracleConnectionConfig
+from autocoding_agent.oracle_service import OracleConnectionService
 from autocoding_agent.sqlserver_config import (
     KeyringSecretStore,
     SQLServerAuthentication,
@@ -56,26 +58,43 @@ class DataSourceService:
         finally:
             temporary.unlink(missing_ok=True)
 
-    def connection(self, source_id: str) -> SQLServerConnectionService:
+    def connection(self, source_id: str, database_type: str | None = None):
         # 先验证 ID，不能让外部输入拼接成任意文件路径或凭据名。
         if not source_id.startswith("ds-") or not all(
             c.isascii() and (c.isalnum() or c in "-_") for c in source_id
         ):
             raise ValueError("无效数据源 ID")
-        store = SQLServerConfigStore(
+        if database_type is None:
+            definition = self.load().sources.get(source_id)
+            database_type = definition.database_type if definition else "sqlserver"
+        if database_type not in {"sqlserver", "oracle"}:
+            raise ValueError("不支持的数据源类型")
+        store_type = OracleConfigStore if database_type == "oracle" else SQLServerConfigStore
+        store = store_type(
             self.settings.data_dir, secrets=KeyringSecretStore(source_id),
         )
         store.path = self.path.parent / "connections" / f"{source_id}.json"
-        return SQLServerConnectionService(self.settings, store)
+        service_type = (
+            OracleConnectionService if database_type == "oracle" else SQLServerConnectionService
+        )
+        return service_type(self.settings, store)
 
     def save_source(
-        self, definition: DataSourceDefinition, config: SQLServerConnectionConfig,
+        self, definition: DataSourceDefinition,
+        config: SQLServerConnectionConfig | OracleConnectionConfig,
         password: str = "",
     ) -> None:
-        if definition.database_type != "sqlserver":
-            raise ValueError("本阶段仅支持 SQL Server；Oracle 将在下一阶段接入")
+        expected_type = (
+            OracleConnectionConfig if definition.database_type == "oracle"
+            else SQLServerConnectionConfig
+        )
+        if not isinstance(config, expected_type):
+            raise ValueError("连接参数与数据库类型不一致")
         catalog = self.load()
-        self.connection(definition.datasource_id).save(config, password)
+        old = catalog.sources.get(definition.datasource_id)
+        if old is not None and old.database_type != definition.database_type:
+            raise ValueError("已有数据源不能改变数据库类型，请新增数据源")
+        self.connection(definition.datasource_id, definition.database_type).save(config, password)
         catalog.sources[definition.datasource_id] = definition
         catalog.connection_fingerprints[definition.datasource_id] = hashlib.sha256(
             config.model_dump_json().encode(),
@@ -106,12 +125,13 @@ class DataSourceService:
 
     def _configuration(
         self, source: DataSourceDefinition, expected: str | None,
-    ) -> tuple[SQLServerConnectionConfig, str]:
+    ) -> tuple[SQLServerConnectionConfig | OracleConnectionConfig, str]:
         # 不读取密码；包含连接目标、Schema、环境及用途，配置变化不能静默影响旧任务。
-        path = self.connection(source.datasource_id).store.path
+        connection = self.connection(source.datasource_id, source.database_type)
+        path = connection.store.path
         if not path.is_file():
             raise ValueError("数据源连接配置不存在，请重新保存")
-        config = SQLServerConnectionConfig.model_validate_json(path.read_text(encoding="utf-8"))
+        config = connection.store.config_model.model_validate_json(path.read_text(encoding="utf-8"))
         if hashlib.sha256(config.model_dump_json().encode()).hexdigest() != expected:
             raise ValueError("数据源连接与目录不一致，可能保存中断，请重新保存该数据源")
         payload = {"source": source.model_dump(), "connection": config.model_dump(mode="json")}
@@ -145,7 +165,7 @@ class DataSourceService:
         if fingerprint != snapshot.fingerprints.get(source_id):
             raise ValueError("任务绑定的数据源配置已变化，请核对环境后新建任务")
         query.datasource_id = source_id
-        connection = self.connection(source_id)
+        connection = self.connection(source_id, source.database_type)
         password = connection.store.password_for(config)
         if config.authentication == SQLServerAuthentication.SQL_PASSWORD and not password:
             raise ValueError("数据源凭据不可用，请检查当前运行账户的连接配置")
@@ -185,7 +205,10 @@ class TaskDatabaseAccess:
             "Only these project-bound read-only datasources are authorized. Select datasource_id "
             "using subproject, purpose and the user's environment; ask when ambiguous. "
             "Environment labels are user configuration, not independently verified deployment. "
-            "Use SQL Server T-SQL and parameterized :name values. Qualify tables with the "
+            "Use each source's database_type: sqlserver means T-SQL (TOP, sys/INFORMATION_SCHEMA); "
+            "oracle means Oracle SQL (ROWNUM, ALL_TAB_COLUMNS/USER_TAB_COLUMNS, dual). "
+            "Never mix dialects. Oracle uses :name binds, not @name or ?. "
+            "Use parameterized :name values. Qualify tables with the "
             "configured schema after checking source code. "
             "Schema is context, not a security boundary. "
             "Menu and business evidence may use different sources. Defaults apply only when no "
