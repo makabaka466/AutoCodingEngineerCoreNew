@@ -52,7 +52,7 @@ def test_grep_requires_bounded_output_and_file_scope(tmp_path: Path) -> None:
         "Grep",
         {
             "pattern": "FCModelUpload",
-            "path": ".",
+            "path": "CKClient",
             "glob": "*.cs",
             "head_limit": 50,
         },
@@ -113,3 +113,14 @@ def test_combined_search_call_budget_is_enforced(tmp_path: Path) -> None:
 
     assert violation is not None
     assert "调用超过" in violation.reason
+
+
+def test_root_overview_is_not_permission_to_scan_all_business_code(tmp_path):
+    guard = BoundedSearchGuard(str(tmp_path))
+    assert guard.inspect("Glob", {"pattern": "*.sln"}) is None
+    assert guard.inspect("Grep", {
+        "pattern": "Order", "path": ".", "glob": "*.cs", "head_limit": 20,
+    }) is not None
+    assert guard.inspect("Grep", {
+        "pattern": "Order", "path": ".", "glob": "**/OrderController.cs", "head_limit": 20,
+    }) is None

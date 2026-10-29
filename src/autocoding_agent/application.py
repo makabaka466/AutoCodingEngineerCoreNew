@@ -10,6 +10,7 @@ from uuid import uuid4
 from autocoding_agent.adapters.capability_store import CapabilityStore
 from autocoding_agent.adapters.claude_code import ClaudeCodeRuntime
 from autocoding_agent.adapters.hermes_skills import build_configured_hermes_service
+from autocoding_agent.adapters.sqlite_incident_store import SQLiteIncidentStore
 from autocoding_agent.adapters.sqlite_task_store import SQLiteTaskStore
 from autocoding_agent.adapters.task_artifact_store import TaskArtifactStore
 from autocoding_agent.adapters.workspace_snapshot import GitWorkspaceObserver
@@ -111,6 +112,11 @@ class AgentApplication:
                 if session.source_incident_key == key:
                     return self.outcome(session.id)
             context = {
+                "entry": incident.investigation_entry.model_dump(mode="json")
+                if incident.investigation_entry else None,
+                "entry_history": [
+                    item.model_dump(mode="json") for item in incident.entry_history[-8:]
+                ],
                 "incident_id": incident.id,
                 "cycle": incident.cycle_number,
                 "problem": incident.problem,
@@ -138,6 +144,10 @@ class AgentApplication:
                 message,
                 incident.project,
                 source_incident_key=key,
+                source_entry=incident.investigation_entry,
+                source_incident_revision=(
+                    incident.revision if incident.investigation_entry else None
+                ),
                 session_id=session_id,
                 progress_sink=progress_sink,
             )
@@ -278,7 +288,20 @@ def build_application(
         current_owner_id=owner_id,
         lease_seconds=configured.runtime_lease_seconds,
     )
+    incident_sessions = SQLiteIncidentStore(configured.data_dir)
+
+    def source_incident_current(session: AgentSession) -> bool:
+        # 只读校验；拒绝已重开、被否认或无法读取的诊断，不影响普通开发任务。
+        try:
+            incident_id, cycle = (session.source_incident_key or "").rsplit(":", 1)
+            incident = incident_sessions.load(incident_id)
+            return (incident.cycle_number == int(cycle) and incident.can_remediate
+                    and incident.revision == session.source_incident_revision)
+        except (ValueError, FileNotFoundError):
+            return False
+
     engine = AgentEngine(
+        source_incident_current=source_incident_current,
         runtime=runtime or ClaudeCodeRuntime(configured),
         sessions=sessions,
         capabilities=CapabilityStore(

@@ -17,6 +17,7 @@ from pathlib import Path
 from tkinter import messagebox, simpledialog, ttk
 
 from autocoding_agent.application import AgentApplication, build_application
+from autocoding_agent.core.investigation import entry_text
 from autocoding_agent.core.models import (
     AgentOutcome,
     AgentSession,
@@ -1882,7 +1883,7 @@ class DesktopClient:
         return (
             "描述任务目标、约束条件，以及相关文件或页面线索…"
             if self.flow == FlowKind.DEVELOPMENT
-            else "请描述页面标题或路径及异常现象，也可直接粘贴异常截图…"
+            else "描述异常及页面、接口、任务或数据对象线索，也可粘贴截图…"
         )
 
     def _knowledge_domain(self) -> KnowledgeDomain:
@@ -2023,6 +2024,8 @@ class DesktopClient:
             details: list[str] = []
             if decision.assessment:
                 details.append(assessment_text(decision.assessment))
+            if session.investigation_entry:
+                details.append(entry_text(session.investigation_entry))
             if decision.evidence:
                 details.append("依据")
                 details.extend(
@@ -2108,6 +2111,10 @@ class DesktopClient:
             details: list[str] = []
             if decision.assessment:
                 details.append(assessment_text(decision.assessment))
+            if decision.entry:
+                details.append(entry_text(decision.entry))
+                details.extend(f"• {path}" for path in decision.entry.source_paths)
+                details.extend(f"待确认：{item}" for item in decision.entry.conflicts)
             if decision.page:
                 route = f" · {decision.page.route}" if decision.page.route else ""
                 details.append(f"定位页面\n{decision.page.name}{route}")

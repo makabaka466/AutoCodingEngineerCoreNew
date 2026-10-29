@@ -185,6 +185,11 @@ def bind_assessment(session: Any, decision: Any, *, mode: str) -> WorkflowAssess
         elif assessment.result not in {ResultKind.PARTIAL, ResultKind.HYPOTHESIS}:
             assessment.result = ResultKind.ANALYSIS
         assessment.phase = ProgressPhase.COMPLETED
+        entry = getattr(decision, "entry", None)
+        if (entry is not None and entry.kind == "data"
+                and assessment.result == ResultKind.CAUSE_CONFIRMED):
+            assessment.result = ResultKind.HYPOTHESIS
+            assessment.missing = [*assessment.missing[:5], "数据入口证据不能确认代码根因。"]
     elif decision.status.value == "needs_input":
         assessment.phase = ProgressPhase.WAITING_INPUT
     elif decision.status.value == "approval_required":

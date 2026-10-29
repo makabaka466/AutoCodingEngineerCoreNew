@@ -606,7 +606,7 @@ class SystemSettingsDialog:
         self.knowledge_domain_combo = ttk.Combobox(
             branch_row,
             textvariable=self.knowledge_domain_var,
-            values=["开发", "异常处理"],
+            values=["入口定位", "开发", "异常处理"],
             state="readonly",
             width=10,
             font=("Microsoft YaHei UI", 9),
@@ -1007,16 +1007,16 @@ class SystemSettingsDialog:
         state = WorkspaceConfigState(config=project, available=True)
         self._load_workspace_state(state)
         self._refresh_knowledge(preferred_branch=project.name)
-        self._set_workspace_status("项目已保存，开发和异常知识文件均已准备。", SUCCESS)
+        self._set_workspace_status("项目已保存，入口定位、开发和异常知识文件均已准备。", SUCCESS)
         if self.on_workspace_saved:
             self.on_workspace_saved(state)
 
     def _knowledge_domain(self) -> KnowledgeDomain:
-        return (
-            KnowledgeDomain.INCIDENT
-            if self.knowledge_domain_var.get() == "异常处理"
-            else KnowledgeDomain.DEVELOPMENT
-        )
+        return {
+            "入口定位": KnowledgeDomain.NAVIGATION,
+            "异常处理": KnowledgeDomain.INCIDENT,
+            "开发": KnowledgeDomain.DEVELOPMENT,
+        }[self.knowledge_domain_var.get()]
 
     def _refresh_knowledge(
         self,
@@ -1117,7 +1117,9 @@ class SystemSettingsDialog:
         if self._loaded_knowledge is None:
             return
         domain, branch = self._loaded_knowledge
-        self.knowledge_domain_var.set("异常处理" if domain == "incident" else "开发")
+        self.knowledge_domain_var.set(
+            {"incident": "异常处理", "navigation": "入口定位", "development": "开发"}[domain]
+        )
         self.knowledge_branch_var.set(branch)
 
     def _set_knowledge_status(self, message: str, color: str) -> None:

@@ -384,14 +384,16 @@ stateDiagram-v2
 菜单和异常区域。标题、路径和视觉特征是否可信由模型结合语义判断，宿主不实现 OCR 关键词、颜色、
 固定坐标、文件名或字符串相似度规则。
 
-没有截图时，对话中的可信标题或页面路径任一项都可以作为调查入口；两者都没有时返回
+以下规则针对页面型入口；接口、后台任务和数据对象不强求页面。页面问题没有截图时，
+对话中的可信标题或页面路径任一项都可以作为调查入口；两者都没有时返回
 `needs_input`。有截图时，图片没有明显标题但对话有标题/路径，模型先按对话线索定位候选，再与
 图片特征交叉验证；对话和图片都没有可信页面身份时才询问。候选与图片存在实质冲突时，模型可在
 当前代码证据足够时自行消解，否则请用户确认哪个页面发生异常，不能扫描全部页面映射。
 
 通用强制流程保存在应用包内的 `incident/prompts/incident_workflow.md`，由
 `load_incident_workflow_rules()` 每轮加载；它不包含 `Menu`、QTMES 等项目事实。项目表结构、页面
-映射 SQL 和代码架构由用户所选 `knowledge/incident/<项目>/<项目>.md` 提供。单次页面映射、数据
+映射 SQL 和源码定位由 `knowledge/navigation/<项目>/<项目>.md` 提供；
+业务诊断知识由 `knowledge/incident/<项目>/<项目>.md` 提供。单次页面映射、数据
 摘要和诊断进入异常 Capability，只有人工确认后才进入 RAG，避免用按需检索承担必执行规则。
 
 可信相对源码路径可以直接读取验证，不要求为了流程一致性再查询映射表。标题或路由需要映射时，
@@ -407,9 +409,9 @@ stateDiagram-v2
 页面验证后，模型沿最小相关路径追踪请求、服务和数据访问代码；没有编辑、命令或数据库工具。
 文字异常先定位产生现象的代码分支，截图异常先定位可见异常区域，再进入相同调用链。需要业务
 数据时，模型从已读代码与 schema 中提取/形成最多五条结构化、参数化 `DataQuery`，由
-`IncidentEngine` 直接交给 `DatabaseReader`，不能要求用户手工运行 SQL。`completed` 契约除页面
-身份和诊断外，还强制至少一个已验证的工作区相对页面源文件；从路径开始调查时，模型从当前代码
-补全结构化页面名称。
+`IncidentEngine` 直接交给 `DatabaseReader`，不能要求用户手工运行 SQL。`completed` 要求入口
+身份有可核对依据；源码入口需要已验证的工作区相对文件，数据入口需要匹配数据源的成功查询，
+不虚构页面源码。从页面路径开始调查时，模型从当前代码补全结构化页面名称。
 
 异常查询由模型显式标注为 `page_lookup` 或 `business_data`。前者用于最多两轮有界页面映射，后者
 只有在页面源码已验证后才能使用，并拥有独立的两轮业务数据额度；SQL 执行错误另有一次纠错额度，
@@ -514,7 +516,7 @@ Windows 上的生成模型 API Key 只持久化到当前用户的 `HKCU\Environm
 能力记忆位于 `Settings.data_dir/workspaces/<workspace_id>/`，不会写入目标仓库。其下按领域
 分成 `development/` 与 `incident/`；两边各有自己的索引、task JSON 和 Markdown，不会互读。
 项目根目录的 `knowledge/<development|incident>/<项目ID>/<项目ID>.md` 保存用户维护的
-基础知识，每个项目在两套流程各有一份固定 Markdown，新建为空。任务开始时，只有用户在对话页“项目”
+基础知识，每个项目有共享导航、开发与异常三份固定 Markdown，新建为空。任务开始时，只有用户在对话页“项目”
 选择框选中的 MD 会同步到当前工作区能力目录的 `pinned/` 只读视图并进入索引；所选项目 ID
 持久化在新 session 中，后续对话继续使用同一份知识。自动完成任务产生的文档仍进入
 `capabilities/`。开发与异常处理各有自己的文件，项目名称修改不改变文件位置。
@@ -868,7 +870,7 @@ ClaudeCodeRuntime 使用 monotonic 时钟记录宿主可观测耗时；重叠工
 
 WorkspaceConfigStore 增加 projects.json 项目目录，WorkspaceProject 以稳定 ID 关联名称、
 当前路径、旧路径及 Git 目标。旧单项目配置保持读取/保存兼容；原文件不删除。
-WorkspaceConfigService 负责确保每个项目两份知识文档存在。文件只在缺失时创建，保存为空合法。
+WorkspaceConfigService 负责确保每个项目三份知识文档存在（0.18.0 增加共享导航）。文件只在缺失时创建，保存为空合法。
 桌面选择器显示名称，传入应用的 project 为稳定 ID；历史按项目身份或旧路径过滤，再按开发/
 异常应用分开读取。修改路径不重写已有任务快照。项目路径及其旧路径不可重复归属其他项目。
 
@@ -935,3 +937,14 @@ OracleDatabaseReader 使用结构化 ConnectParams，Service Name/SID 分开设�
 
 桌面数据库页保留原 SQL Server 表单，Oracle 使用独立连接表单并共用项目绑定页。
 详见 [Oracle 配置与限制](ORACLE.md)。
+
+## 0.18.0：调查入口与共享导航
+
+- `core/investigation.py` 统一入口类型、身份状态、证据引用及排除历史。模型负责语义身份判断；宿主复用 `bind_assessment` 核对实际事件与当前源码指纹。来源可信不等于因果成立。
+- IncidentDecision.entry、AgentDecision.entry 与持久化 session.investigation_entry/entry_history 分离当前结果和历史。接口/后台入口通过真实源码读取核对，数据入口通过绑定源的实际成功查询核对，可不提供源码路径。
+- 新 Claude Code 异常任务保存 entry_contract_version=1，遗漏入口不能回退旧 page 契约绕过校验。历史任务及未声明 investigation_entry_version 的旧 Runtime 保持兼容；升级 Runtime 应声明版本 1。开发中新建能力可能没有现存入口，不强制凭空造入口，但一旦使用入口契约，修改审批前须通过核验。
+- navigation/development/incident 三份项目 MD。只同步所选项目导航至开发/异常 pinned/<project>/navigation.md，索引只链接当前项目；模型按阶段读取，不把三份正文重复注入所有轮次。
+- 首轮开放有界 Read/Glob/Grep，根目录只看清单或明确文件，禁止根目录按语言全文扫描；原有 8 次搜索/100 条 Grep 上限和一次纠错保留。异常搜索无法继续时进入 WAITING_INPUT，不把预算耗尽写成诊断成功。
+- 否认或冲突记录保留在 entry_history。显式重新核验须声明 reconsider_excluded，并补充新操作证据和澄清理由。曾恢复成功的入口无需反复重做同一排除审批。
+- 新诊断转修复保存来源 revision，入口作为待复核候选交接。审批及 Runtime 调度边界读取最新诊断；版本变化即清除待审批，运行中的任务在当前调用返回后暂停，保留实际文件快照与操作记录。历史修复任务无来源 revision，保持旧恢复机制。
+- 不增加独立的入口分类模型请求，不做全菜单缓存，不开放数据库写入。路径映射确定性规则由下一阶段实现。

@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field, StringConstraints, model_validator
 from autocoding_agent.core.artifacts.models import ArtifactRecord
 from autocoding_agent.core.audit.models import DecisionRecord, RiskLevel
 from autocoding_agent.core.hermes import HermesSkillObservation, HermesSkillRequest
+from autocoding_agent.core.investigation import InvestigationEntry
 from autocoding_agent.core.runtime.models import RuntimeRunRecord
 from autocoding_agent.core.state_machine.models import CommandReceipt, TaskState
 from autocoding_agent.core.workflow import WorkflowAssessment
@@ -172,6 +173,9 @@ class CapabilityDraft(BaseModel):
 class AgentDecision(BaseModel):
     """The only machine-readable decision accepted from the model runtime."""
 
+    entry: InvestigationEntry | None = Field(
+        default=None, description="当前调查入口；旧任务兼容为空。"
+    )
     status: AgentStatus
     assessment: WorkflowAssessment | None = Field(
         default=None, description="阶段推进依据、证据出处与本轮结果等级；None 兼容历史会话。"
@@ -241,10 +245,18 @@ class AgentEvent(BaseModel):
 class AgentSession(BaseModel):
     """Persistent state for one user task and its clarification/approval turns."""
 
+    investigation_entry: InvestigationEntry | None = Field(
+        default=None, description="当前入口及宿主核验状态。"
+    )
+    entry_history: list[InvestigationEntry] = Field(
+        default_factory=list, description="已替换或撤销的入口历史。"
+    )
     id: str = Field(default_factory=lambda: str(uuid4()))
     workspace: str
     goal: str
     project: str | None = None
+    source_incident_revision: int | None = Field(
+        default=None, description="入口契约交接时的诊断快照版本；变更后禁止继续原审批。")
     source_incident_key: str | None = Field(
         default=None, description="手动进入异常处理时关联的诊断会话 ID 和轮次；历史开发任务为空。"
     )
@@ -343,6 +355,7 @@ class RuntimeResult(BaseModel):
 
 
 class AgentOutcome(BaseModel):
+    entry: InvestigationEntry | None = None
     session_id: str
     workspace: str
     status: AgentStatus

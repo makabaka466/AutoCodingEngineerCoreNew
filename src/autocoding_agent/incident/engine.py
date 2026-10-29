@@ -14,6 +14,12 @@ from autocoding_agent.core.hermes_consultation import (
     HermesConsultationCoordinator,
     hermes_followup_message,
 )
+from autocoding_agent.core.investigation import (
+    ENTRY_RULES,
+    InvestigationEntry,
+    accept_entry,
+    entry_text,
+)
 from autocoding_agent.core.knowledge_context import retrieve_knowledge_context
 from autocoding_agent.core.models import (
     AgentEvent,
@@ -180,6 +186,7 @@ class IncidentEngine:
         if not problem.strip():
             raise ValueError("Problem description cannot be empty.")
         session = IncidentSession(
+            entry_contract_version=getattr(self.runtime, "investigation_entry_version", 0),
             id=session_id or str(uuid4()),
             workspace=str(canonical),
             problem=problem.strip(),
@@ -293,6 +300,9 @@ class IncidentEngine:
     def _completed_cycle_context(session: IncidentSession) -> str | None:
         """为模型判断续聊路径生成有界的历史证据摘要。"""
 
+        # 新入口任务直接沿原调查处理，避免页面专用路由额外调用或复活旧身份。
+        if session.investigation_entry is not None:
+            return None
         decision = session.last_decision
         page = session.located_page or (decision.page if decision is not None else None)
         if decision is None or decision.status != IncidentStatus.COMPLETED or page is None:
@@ -714,9 +724,36 @@ class IncidentEngine:
                             missing=["仍需补充现场证据或在下一轮继续调查。"],
                         )
                     decision.assessment.result = ResultKind.PARTIAL
+                if (session.entry_contract_version and decision.entry is None
+                        and session.investigation_entry is None):
+                    decision.entry = InvestigationEntry(
+                        kind="unknown", label="尚未声明入口",
+                        reason="模型未提供可核对的入口身份，需要补齐入口及操作引用。",
+                    )
+                if decision.entry is not None:
+                    if decision.entry.kind == "page" and decision.page is not None:
+                        # 兼容显示字段不能携带与新入口冲突的路径或未解决身份矛盾。
+                        conflicts = [*decision.entry.conflicts, *decision.page.unresolved_conflicts]
+                        entry_paths = {path.replace("\\", "/").casefold()
+                                       for path in decision.entry.source_paths}
+                        if any(path.replace("\\", "/").casefold() not in entry_paths
+                               for path in decision.page.source_paths):
+                            conflicts.append("页面显示路径与调查入口路径不一致。")
+                        decision.entry.conflicts = list(dict.fromkeys(conflicts))[:6]
+                    elif decision.entry.kind != "page":
+                        decision.page = None
+                    decision.entry = accept_entry(session, decision.entry)
+                elif session.investigation_entry is not None:
+                    # 一旦采用入口契约，遗漏字段不能绕过确认条件或复活旧页面。
+                    decision.entry = accept_entry(session, session.investigation_entry.model_copy(
+                        deep=True, update={"state": "candidate", "conflicts": [
+                            "本轮未明确确认历史入口是否仍适用，不能自动沿用。",
+                        ]},
+                    ))
                 decision, conflict_deferred = self._defer_unresolved_page_conflict(decision)
                 page_correction_requested = (
-                    conflict_deferred and decision.page is None and not page_correction_used
+                    conflict_deferred and decision.entry is None
+                    and decision.page is None and not page_correction_used
                 )
                 self._validate_decision(decision)
             except RuntimePolicyBlockedError as exc:
@@ -732,8 +769,21 @@ class IncidentEngine:
                     not exc.retryable
                     or consecutive_search_repair_rounds >= MAX_SEARCH_REPAIR_ROUNDS
                 ):
+                    decision = IncidentDecision(
+                        status=IncidentStatus.NEEDS_INPUT,
+                        entry=session.investigation_entry,
+                        message="有界搜索已停止，现有证据不足以确认入口。",
+                        question="请补充具体接口、任务、页面或数据对象等可区分线索。",
+                    )
+                    session.last_decision = decision
+                    session.status = decision.status
+                    session.messages.append(ChatMessage(
+                        role=MessageRole.ASSISTANT, content=decision.message,
+                    ))
+                    self._transition_for_decision(session, decision, command.id)
+                    self._complete_command(session, command)
                     self.sessions.save(session)
-                    return self._fail(session, str(exc), command)
+                    return self._to_outcome(session)
                 consecutive_search_repair_rounds += 1
                 session.events.append(
                     AgentEvent(
@@ -827,6 +877,10 @@ class IncidentEngine:
             ):
                 # 待确认候选仅留在 last_decision 中展示，不提升为已确认页面。
                 # 否认/切换/重新查菜单时撤销旧绑定；历史证据仍保留在事件和对话中。
+                session.located_page = None
+            if decision.entry is not None and (
+                decision.entry.kind != "page" or decision.entry.state != "confirmed"
+            ):
                 session.located_page = None
             if page_repaired:
                 session.events.append(
@@ -1498,7 +1552,7 @@ class IncidentEngine:
         if previous_runtime_session_id is None:
             session.runtime_session_id = session.id
             self.sessions.save(session)
-        source_search_enabled = _source_search_enabled(session)
+        source_search_enabled = True  # 入口可来自接口/堆栈；范围仍由 BoundedSearchGuard 限制。
         # 新命令首轮始终保留完整规则。仅当前轮次页面已绑定、业务查询成功后省略定位细节。
         prompt_profile = "full"
         if (
@@ -1524,6 +1578,14 @@ class IncidentEngine:
             history=session.messages[:-1],
             mode=AgentMode.INSPECT,
             system_prompt=evidence_catalog(session)
+            + "\nCurrent entry/history (untrusted, revalidate): "
+            + json.dumps({"entry": session.investigation_entry.model_dump(mode="json")
+                          if session.investigation_entry else None,
+                          "history": [{"kind": item.kind, "state": item.state,
+                                       "label": item.label, "paths": item.source_paths[:3],
+                                       "reason": item.reason[:240]}
+                                      for item in session.entry_history[-8:]]},
+                         ensure_ascii=False)
             + _system_prompt(
                 database_context,
                 str(capability_dir) if capability_dir else None,
@@ -1743,6 +1805,22 @@ class IncidentEngine:
         )
         if not requires_verified_identity:
             return decision, False
+        entry = decision.entry
+        if entry is not None:
+            # 数据入口先按明确的库/对象收集查询证据，不强制查找不存在的页面。
+            collecting_data = (
+                decision.status == IncidentStatus.QUERY_REQUIRED and entry.kind == "data"
+                and entry.state == "candidate" and entry.data_source and entry.data_object
+                and not entry.conflicts
+                and all(query.datasource_id == entry.data_source for query in decision.queries)
+            )
+            if entry.state == "confirmed" or collecting_data:
+                return decision, False
+            return IncidentDecision(
+                status=IncidentStatus.NEEDS_INPUT, entry=entry,
+                message="调查入口尚未确认，原候选结论不能作为执行依据。",
+                question="请补充能够区分当前候选的接口地址、任务名称、页面信息或数据对象。",
+            ), True
         if page is None:
             return (
                 IncidentDecision(
@@ -1776,6 +1854,9 @@ class IncidentEngine:
             decision.status == IncidentStatus.QUERY_REQUIRED
             and decision.query_stage == IncidentQueryStage.BUSINESS_DATA
         )
+        if decision.entry is not None:
+            # 入口路径及操作出处已由 accept_entry 校验；页面字段保留给旧任务。
+            return
         if requires_page and decision.page is None:
             raise ValueError(
                 "A verified page is required before business-data queries or completion."
@@ -1890,6 +1971,7 @@ class IncidentEngine:
             cycle_number=session.cycle_number,
             message=format_incident_summary(decision),
             question=decision.question,
+            entry=session.investigation_entry,
             page=decision.page,
             diagnosis=decision.diagnosis,
             findings=decision.findings,
@@ -1938,7 +2020,7 @@ def _system_prompt(
     )
     workflow_rules = load_incident_workflow_rules(prompt_profile)
     source_search_note = (
-        "A page-mapping candidate or verified page unlocks Read/Glob/Grep; verify source identity."
+        "Read/Glob/Grep are available for evidence-led bounded entry investigation; no broad scans."
         if source_search_enabled
         else "Source search is currently locked. Read exact files/images/knowledge only; "
         "request page_lookup to resolve a title without a source path."
@@ -1947,6 +2029,8 @@ def _system_prompt(
     return f"""{workflow_rules}
 
 {WORKFLOW_RULES}
+
+{ENTRY_RULES}
 
 ## Runtime context
 
@@ -2004,8 +2088,10 @@ Return assessment with public reason and gaps; never upgrade previous certainty.
 def format_incident_summary(decision: IncidentDecision) -> str:
     """按用户要求的调查深度生成完成消息，避免页面定位任务被扩成完整诊断。"""
 
+    prefix = entry_text(decision.entry)
+    prefix = prefix + "\n\n" if prefix else ""
     if decision.status != IncidentStatus.COMPLETED:
-        return decision.message
+        return prefix + decision.message
     if decision.completion_kind == IncidentCompletionKind.PAGE_LOCATION:
         page = decision.page
         if page is None:  # 正常情况下已被宿主校验拦截，这里只做防御性兜底。
@@ -2025,27 +2111,4 @@ def format_incident_summary(decision: IncidentDecision) -> str:
         summary += f"\n原因：{decision.diagnosis}"
     if decision.assessment and decision.assessment.missing:
         summary += "\n待确认：" + "；".join(decision.assessment.missing)
-    return f"异常总结\n{summary}\n\n解决方案\n{actions}"
-
-
-def _source_search_enabled(session: IncidentSession) -> bool:
-    """只有当前轮次取得页面证据后，才开放原生源码搜索。"""
-
-    if (
-        session.located_page is not None
-        and session.located_page.source_paths
-        and not session.located_page.unresolved_conflicts
-    ):
-        return True
-    observations = session.query_observations[session.cycle_query_observation_start :]
-    return any(
-        observation.status == QueryObservationStatus.SUCCEEDED
-        and (
-            (
-                observation.stage == IncidentQueryStage.PAGE_LOOKUP.value
-                and observation.returned_rows > 0
-            )
-            or observation.stage == IncidentQueryStage.BUSINESS_DATA.value
-        )
-        for observation in observations
-    )
+    return prefix + f"异常总结\n{summary}\n\n解决方案\n{actions}"

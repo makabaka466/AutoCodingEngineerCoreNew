@@ -228,7 +228,7 @@ def test_incident_prompt_uses_dialogue_then_image_for_page_identity(
     prompt = runtime.turns[0].system_prompt
     assert "Before inspecting any screenshot" in prompt
     assert "credible page title or page path" in prompt
-    assert "image has no clear title but the conversation provides" in prompt
+    assert "when an image lacks a title, use credible conversational identity" in prompt
     assert "ask the user to confirm which" in prompt
     assert "A reliable page name is a mandatory precondition" not in prompt
     assert "at most 20 candidates" in prompt
@@ -339,7 +339,7 @@ def test_unconfirmed_candidate_cannot_authorize_followup_query(
     assert second.status == IncidentStatus.NEEDS_INPUT
     assert second.page is None
     assert database.queries == []
-    assert runtime.turns[1].tools == ["Read"]
+    assert runtime.turns[1].tools == ["Read", "Glob", "Grep"]
     repairs = [event.data.get("repair") for event in second.events]
     assert repairs.count("discard_unconfirmed_legacy_page") == int(legacy_cached)
 
@@ -368,7 +368,7 @@ def test_page_switch_revokes_previous_binding_before_new_investigation(tmp_path:
     second = engine.send(first.session_id, "Now investigate the payment page.")
     assert second.status == IncidentStatus.NEEDS_INPUT
     assert second.page is None
-    assert runtime.turns[2].tools == ["Read"]
+    assert runtime.turns[2].tools == ["Read", "Glob", "Grep"]
     assert engine.get_session(first.session_id).located_page is None
 
 
@@ -899,11 +899,11 @@ def test_agent_resolves_page_with_host_executed_sql_before_page_is_known(
     assert outcome.status == IncidentStatus.COMPLETED
     assert database.queries == [menu_query]
     assert len(runtime.turns) == 2
-    assert runtime.turns[0].tools == ["Read"]
-    assert runtime.turns[0].allowed_tools == ["Read"]
-    assert "Source search is currently locked" in runtime.turns[0].system_prompt
+    assert runtime.turns[0].tools == ["Read", "Glob", "Grep"]
+    assert runtime.turns[0].allowed_tools == ["Read", "Glob", "Grep"]
+    assert "evidence-led bounded entry investigation" in runtime.turns[0].system_prompt
     assert runtime.turns[1].tools == ["Read", "Glob", "Grep"]
-    assert "page-mapping candidate" in runtime.turns[1].system_prompt
+    assert "evidence-led bounded entry investigation" in runtime.turns[1].system_prompt
     assert "Never print SQL as an instruction to the user" in runtime.turns[0].system_prompt
     observation = outcome.query_observations[0]
     assert observation.sql_fingerprint is not None
@@ -1013,8 +1013,8 @@ def test_page_lookup_budget_does_not_consume_business_query_budget(
     assert saved.business_query_rounds == 1
     assert saved.query_repair_rounds == 0
     assert [turn.tools for turn in runtime.turns] == [
-        ["Read"],
-        ["Read"],
+        ["Read", "Glob", "Grep"],
+        ["Read", "Glob", "Grep"],
         ["Read", "Glob", "Grep"],
         ["Read", "Glob", "Grep"],
     ]
@@ -1083,7 +1083,7 @@ def test_incident_flow_restores_verified_page_when_model_omits_it(
     assert '"name": "Order details"' in runtime.turns[1].user_message
     assert saved.query_repair_rounds == 0
     assert [turn.tools for turn in runtime.turns] == [
-        ["Read"],
+        ["Read", "Glob", "Grep"],
         ["Read", "Glob", "Grep"],
         ["Read", "Glob", "Grep"],
     ]
@@ -1177,7 +1177,8 @@ def test_incident_flow_stops_after_one_source_search_policy_correction(
 
     outcome = engine.start(workspace, "The upload page does not save a log")
 
-    assert outcome.status == IncidentStatus.FAILED
+    assert outcome.status == IncidentStatus.NEEDS_INPUT
+    assert outcome.task_state == TaskState.WAITING_INPUT
     assert runtime.calls == 2
     saved = store.load(outcome.session_id)
     assert sum(

@@ -119,6 +119,8 @@ class _TurnTiming:
 class ClaudeCodeRuntime:
     """Run one turn through Claude Code without reimplementing its agent loop."""
 
+    investigation_entry_version = 1
+
     def __init__(
         self,
         settings: Settings,

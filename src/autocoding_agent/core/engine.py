@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import time
+from collections.abc import Callable
 from pathlib import Path, PureWindowsPath
 from uuid import uuid4
 
@@ -23,6 +24,12 @@ from autocoding_agent.core.handlers import (
 from autocoding_agent.core.hermes_consultation import (
     HermesConsultationCoordinator,
     hermes_followup_message,
+)
+from autocoding_agent.core.investigation import (
+    ENTRY_RULES,
+    InvestigationEntry,
+    accept_entry,
+    entry_text,
 )
 from autocoding_agent.core.knowledge_context import retrieve_knowledge_context
 from autocoding_agent.core.models import (
@@ -133,6 +140,7 @@ class AgentEngine:
         knowledge_retriever: KnowledgeRetriever | None = None,
         hermes_skills: HermesSkillService | None = None,
         max_hermes_skill_rounds: int = 1,
+        source_incident_current: Callable[[AgentSession], bool] | None = None,
     ) -> None:
         if max_query_rounds < 1 or max_query_rounds > 5:
             raise ValueError("max_query_rounds must be between 1 and 5")
@@ -173,6 +181,7 @@ class AgentEngine:
         self.knowledge_retriever = knowledge_retriever
         self.hermes = HermesConsultationCoordinator(hermes_skills, artifact_recorder)
         self.max_hermes_skill_rounds = max_hermes_skill_rounds
+        self.source_incident_current = source_incident_current
 
     def start(
         self,
@@ -181,6 +190,8 @@ class AgentEngine:
         project: str | None = None,
         *,
         source_incident_key: str | None = None,
+        source_incident_revision: int | None = None,
+        source_entry: InvestigationEntry | None = None,
         session_id: str | None = None,
         progress_sink: ProgressSink | None = None,
     ) -> AgentOutcome:
@@ -197,6 +208,11 @@ class AgentEngine:
             database_reference=self.database_reference,
             cycle_objective=message.strip(),
             source_incident_key=source_incident_key,
+            source_incident_revision=source_incident_revision,
+            investigation_entry=(source_entry.model_copy(deep=True, update={
+                "state": "candidate", "evidence": [],
+                "reason": "来自诊断交接的入口，修改审批前需重新核对当前源码和数据。",
+            }) if source_entry else None),
         )
         session.events.append(
             AgentEvent(
@@ -293,9 +309,17 @@ class AgentEngine:
         session = self.sessions.load(session_id)
         if duplicate := self._duplicate_command_outcome(session, command_id):
             return duplicate
+        if not self._remediation_source_current(session):
+            raise ValueError("诊断依据已更新，原审批失效；请从最新诊断重新进入异常处理。")
         approval = session.pending_approval
         if approval is None:
             raise ValueError("This session has no pending approval request.")
+        if approval.scope == ApprovalScope.MODIFY and session.investigation_entry is not None:
+            entry = accept_entry(session, session.investigation_entry)
+            if entry.state != "confirmed":
+                session.pending_approval = None
+                self.sessions.save(session)
+                raise ValueError("入口证据已失效，请重新分析并生成修改方案后再审批。")
         if approval.scope == ApprovalScope.MODIFY and approval.proposal is None:
             raise ValueError(
                 "This saved approval predates change proposals. Send a revised instruction so "
@@ -373,6 +397,21 @@ class AgentEngine:
             "Continue without that permission and provide the best truthful alternative."
         )
         return self._run_command(session, message, AgentMode.INSPECT, command, progress_sink)
+
+    def _remediation_source_current(self, session: AgentSession) -> bool:
+        """在审批与执行边界核对诊断快照；已发生的副作用留给恢复流程核对。"""
+        if session.source_incident_revision is None:
+            return True  # 历史任务没有快照版本，保留原恢复/审批机制。
+        current = self.source_incident_current
+        if current is not None and current(session):
+            return True
+        session.pending_approval = None
+        session.messages.append(ChatMessage(
+            role=MessageRole.SYSTEM,
+            content="诊断依据已变更，原方案及审批已失效；保留已执行记录，不自动回滚。",
+        ))
+        self.sessions.save(session)
+        return False
 
     def _pause_at_boundary(self, session: AgentSession, command: AgentCommand) -> AgentOutcome:
         message = ("任务已暂停，已保存对话与执行记录。"
@@ -700,6 +739,8 @@ class AgentEngine:
         # 第 4 步：每次循环只对应一次可审计的 Runtime 调用。宿主服务可以返回证据并触发
         # 下一次模型调用，但每次调用边界都会单独记录，不会被隐藏。
         while True:
+            if not self._remediation_source_current(session):
+                return self._pause_at_boundary(session, command)
             existing_runtime_session_id = session.runtime_session_id
             if existing_runtime_session_id is None:
                 # 启动前先保存预分配的 Claude 会话 ID，避免超时后把可能产生副作用的首轮
@@ -740,7 +781,8 @@ class AgentEngine:
                         user_message=pending_message,
                         history=tuple(session.messages[:-1]),
                         system_prompt=(
-                            self.skills.build_system_prompt(
+                            ENTRY_RULES + "\n" + entry_text(session.investigation_entry) + "\n"
+                            + self.skills.build_system_prompt(
                                 mode,
                                 readable_capability_dir,
                                 database_context,
@@ -905,6 +947,8 @@ class AgentEngine:
                 return self._fail(session, str(exc), command.id)
 
             # 第 6 步：只接受通过契约校验的结构化决策，并持久化其理由和证据。
+            if not self._remediation_source_current(session):
+                return self._pause_at_boundary(session, command)
             decision = result.decision
             if budget_closure_requested:
                 if decision.status == AgentStatus.QUERY_REQUIRED:
@@ -920,6 +964,16 @@ class AgentEngine:
                         missing=["需要补充现场证据或在下一轮继续调查。"],
                     )
                 decision.assessment.result = ResultKind.PARTIAL
+            if decision.entry is not None:
+                decision.entry = accept_entry(session, decision.entry)
+            if (mode == AgentMode.INSPECT and session.investigation_entry is not None
+                    and session.investigation_entry.state != "confirmed"
+                    and decision.status == AgentStatus.APPROVAL_REQUIRED):
+                decision = AgentDecision(
+                    status=AgentStatus.NEEDS_INPUT, entry=session.investigation_entry,
+                    message=entry_text(session.investigation_entry)
+                    + "\n请先确认入口或补充区分线索，再生成修改审批。",
+                )
             supplied_assessment = decision.assessment is not None
             decision.assessment = bind_assessment(session, decision, mode=mode.value)
             if supplied_assessment and decision.status in {
@@ -1587,6 +1641,7 @@ class AgentEngine:
         if decision is None or session.status is None:
             raise ValueError(f"Session {session.id} has not produced an outcome yet.")
         return AgentOutcome(
+            entry=session.investigation_entry,
             session_id=session.id,
             workspace=session.workspace,
             status=session.status,

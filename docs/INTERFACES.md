@@ -10,7 +10,7 @@ Runtime、持久化和状态契约。
 - `WorkspaceConfigService.list_projects()`：返回项目列表，确保两类知识文件存在。
 - `WorkspaceConfigService.save_project(name, workspace, git_remote=None, git_branch=None, *, project_id=None)`：新增或更新项目；更新保留 ID。
 - `WorkspaceProject`：继承路径/Git 配置，增加 id、name、previous_paths、migrated。
-- `MarkdownKnowledgeService.ensure_project(project_id, *, legacy_name=None)`：幂等创建两份知识文档；只在迁移匹配明确时复制旧内容。
+- `MarkdownKnowledgeService.ensure_project(project_id, *, legacy_name=None)`：幂等创建三份知识文档；只在迁移匹配明确时复制旧内容。
 - `save_branch` 现在允许空内容；UI 取消手动新增分支，项目选项来自统一目录。
 
 桌面新会话的 `project` 传稳定 ID，历史任务字段不批量改写。Git 按当前工作目录匹配项目。
@@ -850,8 +850,8 @@ SQL Server 页包含服务器、端口、数据库、已安装 ODBC 驱动、Win
 `<data_dir>/workspace/projects.json`；旧单项目配置会迁移且保留原文件。
 当前和旧目录不得重复绑定其他项目；修改目录不改变已有会话执行路径。
 
-“MD 能力配置”按“开发/异常处理 → 项目”导航，项目列表与维护页同步。
-每个项目自动创建两份固定文档，允许保存为空，不再手动新增分支。未保存内容在切换选择或
+“MD 能力配置”按“入口定位/开发/异常处理 → 项目”导航，项目列表与维护页同步。
+每个项目自动创建三份固定文档，允许保存为空，不再手动新增分支。未保存内容在切换选择或
 关闭窗口前会提示。只读路径框显示真实文档位置，项目改名不会移动文件。
 
 ## 9. Streamlit Web UI
@@ -1412,3 +1412,25 @@ HTTP Worker 的领域 project 使用 ServerConfig 中的 `knowledge_project`，�
 - QueryResult/QueryObservation 的 source.database_type 记录 oracle；两套流程及 HTTP 路由签名保持不变。
 
 驱动错误返回安全错误码和固定提示；数据库返回行仍只进入当前模型轮次，持久记录仅保存审计元信息。
+
+## 0.18.0 调查入口契约
+
+`IncidentDecision.entry` / `AgentDecision.entry` / outcome.entry 新增可选结构，旧字段保留：
+
+| 字段 | 含义 |
+| --- | --- |
+| kind | page / api / background / data / unknown |
+| state | candidate / confirmed / excluded；宿主可降为候选 |
+| label、reason | 对象标识及简短、可核对的身份依据 |
+| source_paths | 工作区相对路径，必须存在；源码引用须关联真实读取及当前指纹 |
+| data_source、data_object | 数据源 ID 和目标对象；数据入口无需虚构页面 |
+| evidence | 复用 WorkflowEvidence，verified/event_id 由宿主重算 |
+| conflicts | 身份冲突；不用于承载一般诊断缺口 |
+| excluded_event_count | 宿主记录排除时的事件边界，只接受边界之后的新证据 |
+| reconsider_excluded | 显式重新核验已排除对象，须新事实与新操作引用 |
+
+Session 新增 investigation_entry、entry_history；异常 session 新增 entry_contract_version。
+新 Claude Code 异常任务使用版本 1，不能省略入口绕过核验；旧任务/旧 Runtime 的 page 接口保持兼容。
+新修复任务增加 source_incident_revision，来源变化时清除原审批，后续动作须基于最新诊断创建。
+原有 start/send/approve/stop/resume 入口和 HTTP 路由保留；新增参数均有默认值。
+知识配置 KnowledgeDomain 新增 navigation；项目自动准备三个文件，空导航允许保存。

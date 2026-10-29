@@ -21,6 +21,7 @@ from autocoding_agent.adapters.capability_store import (
     session_index_records,
     sync_knowledge_documents,
 )
+from autocoding_agent.core.investigation import entry_text
 from autocoding_agent.core.workflow import assessment_text
 from autocoding_agent.incident.models import (
     IncidentCompletionKind,
@@ -210,7 +211,8 @@ class IncidentCapabilityStore:
         safe: Any,
     ) -> str:
         page = decision.page
-        page_name = safe(page.name) if page else "未确认页面"
+        page_name = (safe(decision.entry.label) if decision.entry
+                     else (safe(page.name) if page else "未确认页面"))
         route = safe(page.route) if page and page.route else "未记录"
         paths = [*(page.source_paths if page else []), *(page.related_paths if page else [])]
         findings = [
@@ -255,6 +257,8 @@ class IncidentCapabilityStore:
 
 {safe(decision.diagnosis or decision.message)}
 
+{safe(entry_text(decision.entry))}
+
 {safe(assessment_text(decision.assessment))}
 
 ## 证据与发现
@@ -283,7 +287,8 @@ class IncidentCapabilityStore:
         safe: Any,
     ) -> str:
         page = decision.page
-        page_name = safe(page.name) if page else "未确认页面"
+        page_name = (safe(decision.entry.label) if decision.entry
+                     else (safe(page.name) if page else "未确认页面"))
         route = safe(page.route) if page and page.route else "未记录"
         paths = [*(page.source_paths if page else []), *(page.related_paths if page else [])]
         findings = [
@@ -324,6 +329,8 @@ class IncidentCapabilityStore:
 ### {conclusion_title}
 
 {safe(decision.diagnosis or decision.message)}
+
+{safe(entry_text(decision.entry))}
 
 {safe(assessment_text(decision.assessment))}
 

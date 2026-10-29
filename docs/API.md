@@ -201,3 +201,8 @@ Worker 与桌面复用项目数据源路由。将项目配置的 `knowledge_proj
 
 0.17.0：上述项目绑定也支持 Oracle，Worker 复用相同适配器；同进程 Oracle 模式须统一，
 配置模式变更需重启 Worker。依赖安装包含 python-oracledb；服务端 API 不新增数据库写入或远程配置接口。
+
+## 0.18.0 入口信息与诊断修复
+
+任务详细快照和领域 outcome 增加 entry/ investigation_entry 及 entry_history，展示入口种类、状态、路径和简短依据。
+原有 HTTP 路由、身份认证和可靠执行接口不变。新诊断转修复绑定诊断 revision；诊断被更新后旧审批会被拒绝，运行中的任务在执行边界暂停。客户端应刷新任务详情，不重试失效的审批。

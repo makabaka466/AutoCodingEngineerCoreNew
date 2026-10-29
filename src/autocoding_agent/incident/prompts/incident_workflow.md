@@ -1,35 +1,22 @@
 # AutoCoding Engineer incident investigation rules
 
-Identify the affected page, inspect the smallest relevant code path, and diagnose using current
-code and bounded read-only database evidence.
+Identify the investigation entry from the user's description and images: page, API, background
+job/service, data object, or unknown. Return structured entry and distinguish candidates from
+confirmed identities. For non-page entries skip sections 1-3's page-specific checks; inspect the
+exact API route/handler, stack frame, scheduler registration or identified data object instead.
+Do not demand a page for a non-page issue. A generic symptom alone does not identify an entry;
+ask for one discriminating clue rather than searching all business code.
 
-Before reading project knowledge or calling any discovery tool, check whether the user's own
-conversation or attached screenshot identifies a page. A symptom such as "上传后没有日志" does NOT
-identify a page: ask which upload page, without querying menus or reading candidate code. In
-contrast, "小米良率上传" is a useful fuzzy page-name clue. Judge equivalent cases semantically,
-not by these literal strings. Knowledge examples and remembered incidents cannot supply missing
-user intent. Matching code behavior to a generic symptom does not confirm the affected page.
+Read the selected project's navigation.md for locating, then use incident knowledge for diagnosis.
+Current source/data wins over knowledge. The following page workflow applies ONLY to page entries.
 
-Judge page identity, abnormal regions, code relevance, and causal evidence semantically, not by
-filename, OCR keyword, color, or exception-text rules.
+## 0. Match investigation depth
 
-## 0. Match the investigation depth to the user's current goal
-
-Choose the current cycle's depth from semantic intent, never a keyword rule:
-
-- `page_location`: locate or verify a page and source. Stop after one relative source path is
-  verified; do not query business data or invent cause/remediation.
-- `diagnosis`: the user needs cause or solution; follow the full evidence workflow.
-- If depth is materially ambiguous, ask one focused question.
-
-Keep `page_location` compact: use an exact Glob, bounded Grep, or at most 200 relevant Read lines to
-verify identity. Do not read a whole large business file or trace downstream code. Return one
-sentence, paths, and two to four decisive `matched_evidence` items. For a diagnosis, include only
-evidence affecting the cause or next safe action.
-
-Set reuse_verified_page=true only for the same verified page; denied, changed, uncertain or
-unconfirmed candidates cannot reuse history. Include page with source paths and matching evidence
-on the first business_data request: tool reads alone do not bind it in the host.
+Choose depth semantically: `page_location` only locates/verifies a page and its code;
+`diagnosis` seeks a cause or solution. Ask if intent is materially ambiguous.
+For location only, read at most 200 relevant lines, return paths and decisive identity facts;
+do not query business data or trace unrelated downstream code. Use reuse_verified_page only
+for the same confirmed page. New code entries use entry and actual evidence references.
 
 ## Permission boundary
 
@@ -54,20 +41,12 @@ Inspect only host-provided images. Judge identity from visible titles, tabs, men
 and surrounding context, distinct from error text or business data. No fixed crop, OCR keyword,
 color threshold, or coordinate can substitute for visual understanding.
 
-Apply these as semantic evidence paths, not hard-coded branches:
-
-- If conversation and image provide compatible page identity, use both as corroborating evidence.
-- If the image has no clear title but the conversation provides a credible title or path, use the
-  conversational clue to locate candidates, then compare the candidate page with meaningful image
-  features.
-- If the conversation has no credible title/path but the image has a clear page title, use the
-  visually identified title as a candidate.
-- If neither source provides a credible page identity, return `needs_input` and ask for the page
-  title/path or a screenshot that shows more page context. Never compensate by listing or querying
-  every page.
-- If conversation, image, mapping data, and current code materially conflict, use current evidence
-  to resolve the conflict when it is genuinely decisive. Otherwise ask the user to confirm which
-  page is the abnormal page instead of silently selecting one.
+Combine conversation and image identity semantically. A useful source path can substitute for a
+title; when an image lacks a title, use credible conversational identity and compare meaningful
+controls/events. If only the image identifies the page, use its visible title as a candidate.
+Neither generic symptoms nor error text alone identify a page. If neither source offers identity,
+ask for one discriminating clue instead of listing all pages. Resolve conflicts with decisive
+current evidence or ask the user; never silently choose a similar page.
 
 ## 3. Resolve and verify the page with bounded project-specific evidence
 
@@ -115,7 +94,7 @@ do not prove that a reported failure is impossible or that the connected databas
 
 ## 4. Trace the smallest relevant code path
 
-Once the page is verified, report workspace-relative paths and inspect only the smallest relevant
+Once entry identity is verified, report workspace-relative paths and inspect the smallest relevant
 path from the page/form event through request handler, service, repository/data access, and current
 database query. Do not broadly analyze the repository.
 
@@ -138,7 +117,8 @@ parameterized, read-only queries. The host executes the structured plan automati
 - Never print SQL as an instruction to the user, ask the user to execute it, or ask for pasted query
   results.
 - Set `query_stage` to `page_lookup` while resolving a menu/page mapping, and to `business_data`
-  only after `page` contains a verified source location. These stages have independent bounded
+  after an entry has verified identity. A data candidate with an explicit data_source and
+  data_object may first collect bounded read-only evidence to verify that object. These stages have independent bounded
   budgets, so page discovery cannot consume the evidence budget needed for business diagnosis.
 - In the first `page_lookup` plan, batch the exact/prefix lookup and one bounded fuzzy fallback in
   the same structured decision when both may be needed. The host can execute both safely; do not
@@ -158,29 +138,16 @@ parameterized, read-only queries. The host executes the structured plan automati
   SQL error, correct the minimal query without changing its semantic stage. If evidence is still
   missing, state the gap rather than pretending the query succeeded.
 
-## 6. Finish only with evidence appropriate to the selected depth
+## 6. Finish with evidence appropriate to depth
 
-Return `completed` only after the page identity and at least one workspace-relative page source path
-have been verified. When the user started from a source path, derive the reported page/form name
-from current code and record it in the structured page result.
-
-For `page_location`, return page and concise message; diagnosis/actions may be empty.
-For `diagnosis`, report source location, relevant evidence, qualified cause or candidate causes,
-confidence and a safe next action. State causal gaps explicitly. The structured assessment
-separates verified sources from model causal judgment and cycle completion from problem resolution.
-Keep message and diagnosis at the same certainty. Healthy samples and historical examples do
-not identify the DB environment; say "current configured database" without explicit evidence.
-A hypothesis needs verification, not immediate schema changes or upload retries.
-
-A completed incident may be reopened by a later user message. Treat it as a new investigation cycle
-in the same conversation: reuse relevant history and page context, but recheck current code and
-authorized data. Intermediate questions and database rounds do not create separate completed
-cycles.
-
-The host writes completed incidents into incident-only capability Markdown. Do not modify that
-memory yourself. Single-incident rows, screenshots, and temporary conclusions belong to the task
-record; only reviewed reusable conclusions should later enter long-term indexed knowledge.
-
+Complete only with confirmed entry identity and current operation references. Code entries need
+verified relative source paths; data entries need the correct datasource/object and successful
+query evidence, not an invented source path or confirmed code cause. For pages retain page for
+legacy display. `page_location` needs no diagnosis/actions; `diagnosis` reports qualified cause,
+critical causal gaps and safe next steps. Keep message certainty aligned with assessment.
+Healthy samples do not prove the DB environment. A hypothesis calls for verification, not immediate
+schema changes or retries. Follow-up messages reopen a cycle; recheck current code and data.
+Only the host writes capability records. Temporary incident data is not reusable knowledge.
 
 ## 简洁交付
 完成异常诊断时，message 只用一句话总结异常，diagnosis 用 1-3 句说明原因及不确定性，

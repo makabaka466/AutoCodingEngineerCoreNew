@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field, StringConstraints, model_validator
 
 from autocoding_agent.core.artifacts.models import ArtifactRecord
 from autocoding_agent.core.hermes import HermesSkillObservation, HermesSkillRequest
+from autocoding_agent.core.investigation import InvestigationEntry
 from autocoding_agent.core.models import AgentEvent, AgentUsage, ChatMessage, utc_now
 from autocoding_agent.core.runtime.models import RuntimeRunRecord
 from autocoding_agent.core.state_machine.models import CommandReceipt, TaskState
@@ -139,6 +140,9 @@ class IncidentContinuationDecision(BaseModel):
 class IncidentDecision(BaseModel):
     """One model decision in the incident investigation state machine."""
 
+    entry: InvestigationEntry | None = Field(
+        default=None, description="当前调查入口；旧任务兼容为空。"
+    )
     status: IncidentStatus
     assessment: WorkflowAssessment | None = Field(
         default=None, description="阶段推进依据、证据出处与本轮交付等级；None 兼容历史会话。"
@@ -170,15 +174,15 @@ class IncidentDecision(BaseModel):
     page: LocatedPage | None = Field(
         default=None,
         description=(
-            "Required for business_data and completed decisions. Repeat the verified page "
-            "identity and workspace-relative source paths on every such decision."
+            "Page display and legacy compatibility. For non-page investigations use entry; "
+            "never invent a page or source path for an API, background job or data object."
         ),
     )
     query_stage: IncidentQueryStage | None = Field(
         default=None,
         description=(
             "Required when status is query_required. Use page_lookup while resolving the "
-            "page/menu mapping; use business_data only after page source code is verified."
+            "page/menu mapping; use business_data for evidence about the identified entry/object."
         ),
     )
     queries: list[DataQuery] = Field(default_factory=list, max_length=5)
@@ -234,6 +238,16 @@ class IncidentDecision(BaseModel):
 
 
 class IncidentSession(BaseModel):
+    entry_contract_version: int = Field(
+        default=0, ge=0, le=1,
+        description="入口契约版本；0 兼容旧任务及旧运行时，1 禁止遗漏入口绕过核验。"
+    )
+    investigation_entry: InvestigationEntry | None = Field(
+        default=None, description="当前入口及宿主核验状态。"
+    )
+    entry_history: list[InvestigationEntry] = Field(
+        default_factory=list, description="已替换或撤销的入口历史。"
+    )
     id: str = Field(default_factory=lambda: str(uuid4()))
     workspace: str
     problem: str
@@ -280,6 +294,7 @@ class IncidentSession(BaseModel):
             and decision and decision.status == IncidentStatus.COMPLETED
             and decision.completion_kind == IncidentCompletionKind.DIAGNOSIS
             and decision.diagnosis and decision.recommended_actions
+            and (self.investigation_entry is None or self.investigation_entry.state == "confirmed")
         )
 
     @model_validator(mode="before")
@@ -353,6 +368,7 @@ class IncidentSession(BaseModel):
 
 
 class IncidentOutcome(BaseModel):
+    entry: InvestigationEntry | None = None
     session_id: str
     workspace: str
     status: IncidentStatus

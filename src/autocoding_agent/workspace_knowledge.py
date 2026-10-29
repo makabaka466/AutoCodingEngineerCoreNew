@@ -11,6 +11,7 @@ from uuid import uuid4
 class KnowledgeDomain(StrEnum):
     DEVELOPMENT = "development"
     INCIDENT = "incident"
+    NAVIGATION = "navigation"
 
 
 class WorkspaceKnowledgeError(ValueError):
@@ -42,7 +43,7 @@ class MarkdownKnowledgeService:
         )
 
     def ensure_project(self, project_id: str, *, legacy_name: str | None = None) -> None:
-        """每个项目固定两份用户知识；只创建缺失文件，绝不覆盖用户编辑。"""
+        """每个项目固定三份用户知识；只创建缺失文件，绝不覆盖用户编辑。"""
         for domain in KnowledgeDomain:
             path = self.branch_path(domain, project_id)
             if path.exists():

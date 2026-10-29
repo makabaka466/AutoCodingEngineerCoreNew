@@ -11,6 +11,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
+from autocoding_agent.core.investigation import entry_text
 from autocoding_agent.core.models import AgentDecision, AgentSession, CapabilityDraft
 from autocoding_agent.core.workflow import assessment_text
 
@@ -273,6 +274,8 @@ class CapabilityStore:
 - 工作轮次：{session.cycle_number}
 - 结果：{safe(decision.message)}
 
+{safe(entry_text(session.investigation_entry))}
+
 {safe(assessment_text(decision.assessment))}
 - 变更文件：{", ".join(safe(path) for path in decision.changed_files) or "无"}
 """
@@ -298,6 +301,8 @@ class CapabilityStore:
 - 本轮目标：{safe(session.cycle_objective or session.goal)}
 - 完成时间：{session.updated_at.isoformat()}
 - 本轮结果：{safe(decision.message)}
+
+{safe(entry_text(session.investigation_entry))}
 
 {safe(assessment_text(decision.assessment))}
 - 变更文件：{", ".join(safe(path) for path in decision.changed_files) or "无"}
@@ -552,7 +557,10 @@ def pinned_markdown_entries(directory: Path, project: str | None = None) -> list
     pinned_root = directory / "pinned"
     if project:
         selected = (pinned_root / project / f"{project}.md").resolve()
-        documents = [selected] if selected.is_relative_to(pinned_root.resolve()) else []
+        documents = (
+            [selected, selected.with_name("navigation.md")]
+            if selected.is_relative_to(pinned_root.resolve()) else []
+        )
     else:
         documents = sorted(pinned_root.rglob("*.md"))
     for document in documents:
@@ -580,6 +588,19 @@ def sync_knowledge_documents(
         sources = [selected]
     else:
         sources = list(source_root.rglob("*.md"))
+    # 入口规则只同步所选项目，不聚合其它项目，正文仍由模型按定位阶段读取。
+    if project and source_root.name in {"development", "incident"}:
+        navigation = source_root.parent / "navigation" / project / f"{project}.md"
+        target = pinned_root / project / "navigation.md"
+        if navigation.is_file():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            content = navigation.read_text(encoding="utf-8")
+            if not target.is_file() or target.read_text(encoding="utf-8") != content:
+                temporary = target.with_suffix(".tmp")
+                temporary.write_text(content, encoding="utf-8")
+                temporary.replace(target)
+        elif target.is_file():
+            target.unlink()  # 删除已移除规则的缓存，避免继续使用过期入口说明。
     for source in sources:
         target = pinned_root / source.relative_to(source_root)
         target.parent.mkdir(parents=True, exist_ok=True)

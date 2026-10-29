@@ -121,7 +121,7 @@ def test_incident_profiles_have_identical_host_results_and_next_input_restores_f
         assert database.queries == [query]
         assert "## 1. Assess" in runtime.turns[0].system_prompt
         assert ("## Previously checked page identity" in runtime.turns[1].system_prompt) == enabled
-        assert runtime.turns[0].tools == ["Read"]
+        assert runtime.turns[0].tools == ["Read", "Glob", "Grep"]
         assert runtime.turns[1].tools == ["Read", "Glob", "Grep"]
         if not conflict:
             engine.send(outcome.session_id, "The same order now has a different error")

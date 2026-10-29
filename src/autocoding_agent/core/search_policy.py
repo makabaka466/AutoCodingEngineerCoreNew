@@ -21,6 +21,8 @@ BOUNDED_SEARCH_RULES = f"""## Bounded source search
 When the current Runtime exposes Read, Glob, or Grep, source discovery must remain evidence-led
 and small. The model decides what evidence is relevant; the host enforces only the outer boundary.
 
+- A bounded root overview may inspect exact manifests (for example `*.sln`, `*.csproj`,
+  `package.json`). It is orientation, not evidence of the user's target or permission to scan code.
 - Read a known workspace-relative file directly. If a database mapping returns a namespace,
   class, route, or relative URL, derive an exact filename first (for example
   `**/FCModelUpload.cs`) and use that narrow Glob before asking the user for a path.
@@ -114,6 +116,8 @@ class BoundedSearchGuard:
         pattern = str(raw_input.get("pattern") or "").strip()
         if not pattern:
             return self._violation(tool_name, "Grep pattern 为空")
+        if pattern in {".", ".*", ".+", "^", "$", "^.*$"}:
+            return self._violation(tool_name, "Grep 缺少可区分的源码线索", retryable=True)
         if len(pattern) > 500:
             return self._violation(tool_name, "Grep pattern 过长")
 
@@ -139,6 +143,15 @@ class BoundedSearchGuard:
                 "目录级 Grep 必须提供 glob 或 type 文件过滤器",
                 retryable=True,
             )
+        if not exact_file and self._resolved_path(path_value or ".") == self.workspace:
+            pattern = _normalized_glob(str(raw_input.get("glob") or ""))
+            if not pattern or _is_repository_wide_glob(pattern) or re.fullmatch(
+                r"\*+(?:\.\{?[^/{}]+(?:,[^/{}]+)*\}?)?", pattern
+            ):
+                return self._violation(
+                    tool_name, "根目录 Grep 需限定已定位文件或候选子目录，不能仅按语言扫描全仓",
+                    retryable=True,
+                )
         return None
 
     def _is_allowed_path(self, value: str) -> bool:
