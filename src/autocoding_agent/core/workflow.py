@@ -82,6 +82,9 @@ is not a gate. Completed ends a cycle, not necessarily the problem. Use hypothes
 causes; cause_confirmed needs cited source and no causal gaps; modified_unverified without
 successful relevant validation; partial when exhausted. Normal tool return is not test success.
 Diagnosis never applies remediation. Keep message certainty aligned with result.
+For needs_input, message must explain progress, the exact blocker, why it matters, and one
+specific question with the expected answer format/example. Never just say 'provide more info'.
+Ask only for user-owned facts; tools/evidence bookkeeping and approvals are not missing intent.
 """
 
 
@@ -215,6 +218,21 @@ def bind_assessment(session: Any, decision: Any, *, mode: str) -> WorkflowAssess
         if assessment.result != requested_result and len(assessment.missing) < 6:
             assessment.missing.append("未满足已确认结果所需的本轮可核对证据和验证条件。")
     return assessment
+
+
+def clarification_text(decision: Any) -> str:
+    """主对话展示真实缺口和问题，不让问题只留在结构化字段或详情面板。"""
+    lines = [decision.message]
+    assessment = decision.assessment
+    if assessment is not None:
+        for label, values in (("已完成", assessment.confirmed), ("尚缺信息", assessment.missing)):
+            extra = [value for value in values[:3] if value not in decision.message]
+            if extra:
+                lines.append(label + "：" + "；".join(extra))
+    question = getattr(decision, "question", None)
+    if question and question not in decision.message:
+        lines.append("需要你回答：" + question)
+    return "\n\n".join(lines)
 
 
 def assessment_text(assessment: WorkflowAssessment | None) -> str:

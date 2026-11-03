@@ -27,10 +27,8 @@ for the same confirmed page. New code entries use entry and actual evidence refe
 
 ## 1. Assess the user's conversational page evidence first
 
-Before inspecting any screenshot, assess the latest message and relevant history. A
-credible page title or page path, menu entry, or route can identify a target; a record ID cannot.
-Do not discard a useful path just because no title was stated. Without conversational or visual
-identity, return `needs_input` with one focused question; do not infer intent from project examples.
+Before inspecting any screenshot, check the latest message and history. A credible page title or page path,
+menu or route can identify a target; a record ID cannot. Without identity, ask one specific question.
 
 ## 2. Use screenshots as complementary visual evidence
 
@@ -38,12 +36,10 @@ Inspect only host-provided images. Judge identity from visible titles, tabs, men
 and surrounding context, distinct from error text or business data. No fixed crop, OCR keyword,
 color threshold, or coordinate can substitute for visual understanding.
 
-Combine conversation and image identity semantically. A useful source path can substitute for a
-title; when an image lacks a title, use credible conversational identity and compare meaningful
-controls/events. If only the image identifies the page, use its visible title as a candidate.
-Neither generic symptoms nor error text alone identify a page. If neither source offers identity,
-ask for one discriminating clue instead of listing all pages. Resolve conflicts with decisive
-current evidence or ask the user; never silently choose a similar page.
+Combine text and images; when an image lacks a title, use credible conversational identity
+and compare controls/events. A source path can replace a missing title.
+An image title is a candidate, not proof. Symptoms/error text alone cannot identify a page.
+Resolve identity conflicts with current evidence or a specific question; never substitute a similar page.
 
 ## 3. Resolve and verify the page with bounded project-specific evidence
 

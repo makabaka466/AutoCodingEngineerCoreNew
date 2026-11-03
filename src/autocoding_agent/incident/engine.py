@@ -18,7 +18,9 @@ from autocoding_agent.core.investigation import (
     ENTRY_RULES,
     InvestigationEntry,
     accept_entry,
+    entry_repair_prompt,
     entry_text,
+    entry_verification_gaps,
 )
 from autocoding_agent.core.knowledge_context import retrieve_knowledge_context
 from autocoding_agent.core.models import (
@@ -65,6 +67,7 @@ from autocoding_agent.core.workflow import (
     WorkflowAssessment,
     assessment_progress_text,
     bind_assessment,
+    clarification_text,
     evidence_catalog,
 )
 from autocoding_agent.database_models import (
@@ -566,6 +569,7 @@ class IncidentEngine:
         hermes_skill_rounds = 0
         consecutive_search_repair_rounds = 0
         page_correction_used = False
+        entry_repair_used = False
         budget_closure_requested = False
         first_investigation_turn = True
 
@@ -731,6 +735,7 @@ class IncidentEngine:
                         kind="unknown", label="尚未声明入口",
                         reason="模型未提供可核对的入口身份，需要补齐入口及操作引用。",
                     )
+                claimed_entry = decision.entry is not None and decision.entry.state == "confirmed"
                 if decision.entry is not None:
                     if decision.entry.kind == "page" and decision.page is not None:
                         # 兼容显示字段不能携带与新入口冲突的路径或未解决身份矛盾。
@@ -752,6 +757,10 @@ class IncidentEngine:
                         ]},
                     ))
                 decision, conflict_deferred = self._defer_unresolved_page_conflict(decision)
+                entry_correction_requested = (
+                    conflict_deferred and claimed_entry and decision.entry is not None
+                    and decision.entry.kind != "unknown" and not decision.entry.conflicts
+                )
                 page_correction_requested = (
                     conflict_deferred and decision.entry is None
                     and decision.page is None and not page_correction_used
@@ -981,6 +990,29 @@ class IncidentEngine:
                     },
                 )
             )
+            if entry_correction_requested:
+                checked = decision.entry
+                if entry_repair_used:
+                    return self._pause_at_boundary(session, command, message=(
+                        "当前阻塞：ACE 尚未完成入口证据核验，暂未形成可信的诊断结论。\n"
+                        + "\n".join(entry_verification_gaps(checked))
+                        + "\n无需重复说明需求。可点击继续任务，让 ACE 核对这些记录。"
+                    ))
+                entry_repair_used = True
+                pending_message = entry_repair_prompt(checked)
+                session.events.append(AgentEvent(
+                    type=EventType.POLICY_REPAIR_REQUESTED,
+                    message="正在补齐入口证据关联，尚未执行该决策的业务查询。",
+                    command_id=command.id, correlation_id=run.id,
+                    data={"policy": "investigation_entry", "repair_round": 1,
+                          "missing": entry_verification_gaps(checked)},
+                ))
+                emit_progress(progress_sink, ProgressEvent.for_phase(
+                    ProgressWorkflow.INCIDENT, ProgressPhase.VERIFYING_PAGE,
+                    task_id=session.id, detail="正在核对已有读取记录和缺失证据，无需重复说明需求。",
+                ))
+                self.sessions.save(session)
+                continue
             if page_correction_requested:
                 # 页面可能已经在工具上下文中核实，仅结构化响应漏填。每个用户命令只补问
                 # 模型一次，不执行被拒绝的 SQL，不猜路径，也不立即把格式问题转嫁给用户。
@@ -1830,8 +1862,9 @@ class IncidentEngine:
                 return decision, False
             return IncidentDecision(
                 status=IncidentStatus.NEEDS_INPUT, entry=entry,
-                message="调查入口尚未确认，原候选结论不能作为执行依据。",
-                question="请补充能够区分当前候选的接口地址、任务名称、页面信息或数据对象。",
+                message="当前阻塞：入口身份尚未通过核验。\n"
+                + "\n".join(entry_verification_gaps(entry)),
+                question=f"本次要调查的是“{entry.label}”吗？如不是，请提供正确的入口名称或路径。",
             ), True
         if page is None:
             return (
@@ -2103,7 +2136,8 @@ def format_incident_summary(decision: IncidentDecision) -> str:
     prefix = entry_text(decision.entry)
     prefix = prefix + "\n\n" if prefix else ""
     if decision.status != IncidentStatus.COMPLETED:
-        return prefix + decision.message
+        return prefix + (clarification_text(decision)
+                         if decision.status == IncidentStatus.NEEDS_INPUT else decision.message)
     if decision.completion_kind == IncidentCompletionKind.PAGE_LOCATION:
         page = decision.page
         if page is None:  # 正常情况下已被宿主校验拦截，这里只做防御性兜底。

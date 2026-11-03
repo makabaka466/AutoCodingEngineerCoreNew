@@ -1453,3 +1453,13 @@ Session 新增 investigation_entry、entry_history；异常 session 新增 entry
 - 范围违规仍为 bounded_source_search，最多一次自动纠正。无新增自动续轮、模型调用、接口路由或数据库权限。
 - UI 显示源码搜索用量/目录累计次数/收敛提示，不能仅凭搜索工具推断正在找页面或页面已确认。
 - 继续任务携带已保存搜索范围、公开摘要和文件是否变化；缺失工具结果仍为 unknown，不推断执行成功。
+
+
+## 0.19.2 澄清显示与入口证据纠正
+
+- 保持现有 API、方法调用及决策字段兼容；无新必填字段。
+- needs_input 的 message 必须说明进展、阻塞原因、影响及明确问题/回答格式；主对话补充 assessment 的 confirmed/missing。
+- 异常 question 同步进入主对话消息，避免只有状态“等待补充”而看不到实际问题。
+- source_paths 的漏填 code 引用由宿主关联真实读取，实际来源继续使用 evidence.event_id/verified 审计。
+- POLICY_REPAIR_REQUESTED 使用 policy=investigation_entry、repair_round=1 和 missing 列表记录内部补查。
+  每条用户命令至多一次，结果仍过入口/审批门禁；失败后复用 PAUSED/resume，不让用户替宿主补工具记录。

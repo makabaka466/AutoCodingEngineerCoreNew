@@ -62,6 +62,99 @@ def test_confirmed_code_entry_requires_actual_current_read(tmp_path, kind):
     assert accept_entry(session, entry(kind)).state == "candidate"
 
 
+def test_omitted_source_reference_binds_real_read_but_never_promotes_candidate(tmp_path):
+    session = IncidentSession(workspace=str(tmp_path), problem="异常")
+    record_read(session, tmp_path)
+    checked = accept_entry(session, entry(evidence=[]))
+    assert checked.state == "confirmed"
+    assert checked.evidence[0].event_id == session.events[0].id
+    assert checked.evidence[0].verified
+    assert accept_entry(session, entry(state="candidate", evidence=[])).state == "candidate"
+    (tmp_path / "handler.py").write_text("changed", encoding="utf-8")
+    checked = accept_entry(session, entry(evidence=[]))
+    assert checked.state == "candidate"
+    from autocoding_agent.core.investigation import entry_text
+    assert "尚未关联当前有效的源码读取记录：handler.py" in entry_text(checked)
+
+
+@pytest.mark.parametrize("workflow", ["development", "incident"])
+@pytest.mark.parametrize("reads_on_turn", [1, 2, 99])
+def test_entry_bookkeeping_repairs_or_pauses_without_asking_for_user_intent(
+    tmp_path, workflow, reads_on_turn,
+):
+    from test_agent_flows import _approval
+
+    from autocoding_agent.core.models import AgentUsage, ApprovalScope, RuntimeResult
+    from autocoding_agent.incident.application import build_incident_application
+    from autocoding_agent.ports.structured_runtime import StructuredRuntimeResult
+
+    (tmp_path / "handler.py").write_text("route = '/orders'", encoding="utf-8")
+
+    class Runtime:
+        def __init__(self):
+            self.turns = []
+
+        def run_observed(self, turn, run_id, sink):
+            result = self.run_structured_observed(turn, None, run_id, sink)
+            return RuntimeResult(decision=result.output, runtime_session_id=turn.session_id)
+
+        def run_structured_observed(self, turn, model, run_id, sink):
+            self.turns.append(turn)
+            if len(self.turns) >= reads_on_turn:
+                sink(RuntimeActivity(
+                    run_id=run_id, kind=RuntimeEventKind.TOOL_FINISHED,
+                    summary="Read handler", tool_name="Read",
+                    data={"path": "handler.py", "is_error": False},
+                ))
+            if workflow == "development":
+                decision = _approval(ApprovalScope.MODIFY)
+                decision.entry = entry(evidence=[])
+            else:
+                decision = IncidentDecision(
+                    status="completed", entry=entry(evidence=[]), message="分析完成",
+                    diagnosis="尚待验证的原因", recommended_actions=["核对日志"],
+                )
+            return StructuredRuntimeResult(
+                output=decision, runtime_session_id=turn.session_id, usage=AgentUsage(),
+            )
+
+    runtime = Runtime()
+    build = build_application if workflow == "development" else build_incident_application
+    app = build(settings=Settings(data_dir=tmp_path / "state"), runtime=runtime)
+    result = app.start(tmp_path, "调查 POST /orders")
+    assert len(runtime.turns) == min(reads_on_turn, 2)
+    saved = app.get_session(result.session_id)
+    if reads_on_turn == 99:
+        assert result.task_state == TaskState.PAUSED
+        assert "handler.py" in result.message
+        assert "无需重复说明需求" in result.message
+    else:
+        assert result.task_state == (TaskState.WAITING_MODIFY_APPROVAL
+                                    if workflow == "development" else TaskState.COMPLETED)
+        assert saved.investigation_entry.state == "confirmed"
+    if reads_on_turn > 1:
+        assert "Host verification gaps" in runtime.turns[1].user_message
+        assert any(e.data.get("policy") == "investigation_entry" for e in saved.events)
+
+
+def test_incident_question_is_visible_in_conversation_and_gaps_are_not_hidden():
+    from autocoding_agent.core.workflow import WorkflowAssessment
+    from autocoding_agent.incident.engine import format_incident_summary
+
+    decision = IncidentDecision(
+        status="needs_input", message="已核对回车事件，现场复现条件尚不明确。",
+        question="未选择仓位时应禁止所有提交，还是仅禁止扫码回车？请回复其中一种。",
+        assessment=WorkflowAssessment(
+            phase="waiting_input", reason="两种行为影响不同入口。",
+            confirmed=["扫码事件已定位"], missing=["非扫码提交是否也需要卡控"],
+        ),
+    )
+    rendered = format_incident_summary(decision)
+    assert decision.question in rendered
+    assert "已完成：扫码事件已定位" in rendered
+    assert "尚缺信息：非扫码提交是否也需要卡控" in rendered
+
+
 @pytest.mark.parametrize("path", ["../outside.py", "C:/Windows/system.ini", "missing.py"])
 def test_entry_rejects_outside_or_missing_source(tmp_path, path):
     session = IncidentSession(workspace=str(tmp_path), problem="异常")

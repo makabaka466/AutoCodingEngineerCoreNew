@@ -29,7 +29,9 @@ from autocoding_agent.core.investigation import (
     ENTRY_RULES,
     InvestigationEntry,
     accept_entry,
+    entry_repair_prompt,
     entry_text,
+    entry_verification_gaps,
 )
 from autocoding_agent.core.knowledge_context import retrieve_knowledge_context
 from autocoding_agent.core.models import (
@@ -78,6 +80,7 @@ from autocoding_agent.core.workflow import (
     WorkflowAssessment,
     assessment_progress_text,
     bind_assessment,
+    clarification_text,
     evidence_catalog,
 )
 from autocoding_agent.database_models import (
@@ -737,6 +740,7 @@ class AgentEngine:
         )
         hermes_skill_rounds = 0
         consecutive_search_repair_rounds = 0
+        entry_repair_used = False
         budget_closure_requested = False
 
         # 第 4 步：每次循环只对应一次可审计的 Runtime 调用。宿主服务可以返回证据并触发
@@ -974,18 +978,49 @@ class AgentEngine:
                         missing=["需要补充现场证据或在下一轮继续调查。"],
                     )
                 decision.assessment.result = ResultKind.PARTIAL
+            claimed_entry = decision.entry is not None and decision.entry.state == "confirmed"
             if decision.entry is not None:
                 decision.entry = accept_entry(session, decision.entry)
             if (mode == AgentMode.INSPECT and session.investigation_entry is not None
                     and session.investigation_entry.state != "confirmed"
                     and decision.status == AgentStatus.APPROVAL_REQUIRED):
+                checked = session.investigation_entry
+                if claimed_entry and checked.kind != "unknown" and not checked.conflicts:
+                    # 内部证据缺口由模型补查一次；不丢给用户，也不能自动放行审批。
+                    session.runtime_session_id = result.runtime_session_id
+                    session.last_usage = merge_usage(session.last_usage, result.usage)
+                    if entry_repair_used:
+                        return self._pause_at_boundary(session, command, message=(
+                            "当前阻塞：ACE 尚未完成入口证据核验，修改方案暂未进入审批。\n"
+                            + "\n".join(entry_verification_gaps(checked))
+                            + "\n无需重复说明需求。可点击继续任务，让 ACE 核对这些记录。"
+                        ))
+                    entry_repair_used = True
+                    pending_message = entry_repair_prompt(checked)
+                    session.events.append(AgentEvent(
+                        type=EventType.POLICY_REPAIR_REQUESTED,
+                        message="正在补齐入口证据关联，尚未执行修改。",
+                        command_id=command.id, correlation_id=run.id,
+                        data={"policy": "investigation_entry", "repair_round": 1,
+                              "missing": entry_verification_gaps(checked)},
+                    ))
+                    emit_progress(progress_sink, ProgressEvent.for_phase(
+                        ProgressWorkflow.DEVELOPMENT, ProgressPhase.VERIFYING_PAGE,
+                        task_id=session.id,
+                        detail="正在核对已有读取记录和缺失证据，无需重复说明需求。",
+                    ))
+                    self.sessions.save(session)
+                    continue
                 decision = AgentDecision(
                     status=AgentStatus.NEEDS_INPUT, entry=session.investigation_entry,
                     message=entry_text(session.investigation_entry)
-                    + "\n请先确认入口或补充区分线索，再生成修改审批。",
+                    + f"\n需要你回答：本次要处理的是“{checked.label}”吗？"
+                    "如不是，请提供正确的入口名称或路径；确认前不会修改代码。",
                 )
             supplied_assessment = decision.assessment is not None
             decision.assessment = bind_assessment(session, decision, mode=mode.value)
+            if decision.status == AgentStatus.NEEDS_INPUT:
+                decision.message = clarification_text(decision)
             if supplied_assessment and decision.status in {
                 AgentStatus.QUERY_REQUIRED, AgentStatus.HERMES_SKILL_REQUIRED
             }:
