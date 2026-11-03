@@ -82,6 +82,7 @@ from autocoding_agent.core.workflow import (
     bind_assessment,
     clarification_text,
     evidence_catalog,
+    task_analysis_context,
 )
 from autocoding_agent.database_models import (
     QueryObservation,
@@ -279,6 +280,9 @@ class AgentEngine:
         command: AgentCommand,
     ) -> None:
         previous_cycle = session.cycle_number
+        previous_analysis = (session.task_analysis.model_dump(mode="json")
+                             if session.task_analysis else None)
+        session.task_analysis = None
         session.cycle_number += 1
         session.cycle_objective = message
         session.cycle_query_observation_start = len(session.query_observations)
@@ -296,6 +300,7 @@ class AgentEngine:
                 actor=command.actor,
                 command_id=command.id,
                 data={
+                    "previous_analysis": previous_analysis,
                     "from_cycle": previous_cycle,
                     "to_cycle": session.cycle_number,
                 },
@@ -797,6 +802,7 @@ class AgentEngine:
                                 self.hermes.catalog_prompt(),
                             )
                             + evidence_catalog(session)
+                            + task_analysis_context(session)
                             + (
                                 f"\n\n<retrieved_knowledge>\n{knowledge_context}\n"
                                 "</retrieved_knowledge>"
@@ -964,6 +970,8 @@ class AgentEngine:
             if not self._remediation_source_current(session):
                 return self._pause_at_boundary(session, command)
             decision = result.decision
+            if decision.assessment and decision.assessment.analysis is not None:
+                session.task_analysis = decision.assessment.analysis.model_copy(deep=True)
             if budget_closure_requested:
                 if decision.status == AgentStatus.QUERY_REQUIRED:
                     decision = AgentDecision(

@@ -166,6 +166,15 @@ class BoundedSearchGuard:
         if len(pattern) > 500:
             return self._violation(tool_name, "Grep pattern 过长")
 
+        target = self._resolved_path(path_value) if path_value else self.workspace
+        # 显式文件不存在时，不把它误报成缺少目录过滤器；也不猜测替代目录。
+        if path_value and target.suffix and not target.exists():
+            return self._violation(
+                tool_name,
+                f"Grep 指定文件不存在：{path_value[:300]}；请在原候选范围核实准确文件名",
+                retryable=True,
+            )
+        exact_file = target.is_file()
         head_limit = raw_input.get("head_limit")
         if (
             isinstance(head_limit, bool)
@@ -174,11 +183,11 @@ class BoundedSearchGuard:
         ):
             return self._violation(
                 tool_name,
-                f"Grep 必须设置 1..{MAX_GREP_RESULTS} 的 head_limit",
+                f"Grep 必须设置 1..{MAX_GREP_RESULTS} 的 head_limit"
+                + ("；保留当前精确文件和 pattern，仅将 head_limit 设为 50" if exact_file else ""),
                 retryable=True,
             )
 
-        exact_file = self._resolved_path(path_value).is_file() if path_value else False
         has_file_filter = bool(str(raw_input.get("glob") or "").strip()) or bool(
             str(raw_input.get("type") or "").strip()
         )
@@ -232,7 +241,8 @@ def search_policy_repair_prompt(operation: str, reason: str) -> str:
         "user to search. Keep the verified page/file evidence and do not widen the scope. For a "
         "directory Grep, include a language-appropriate glob or type plus head_limit 1..100; "
         "prefer an exact known file whenever possible. Continue the same investigation after the "
-        "corrected read-only search."
+        "corrected read-only search. For a missing file, verify its name inside the original "
+        "candidate scope; never guess a replacement directory or broaden the search."
     )
 
 

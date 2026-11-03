@@ -71,6 +71,11 @@ def main() -> None:
             with st.chat_message(role):
                 st.markdown(item.content)
 
+        if session.task_analysis:
+            st.text(session.task_analysis.display_text(compact=True))
+            with st.expander("任务理解与调查计划", expanded=False):
+                st.text(session.task_analysis.display_text())
+
         decision = session.last_decision
         if decision and decision.assessment:
             assessment = decision.assessment

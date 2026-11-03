@@ -32,7 +32,7 @@ from autocoding_agent.core.progress import (
 )
 from autocoding_agent.core.recovery.models import RecoveryAction
 from autocoding_agent.core.state_machine.models import TaskState
-from autocoding_agent.core.workflow import ResultKind, WorkflowAssessment
+from autocoding_agent.core.workflow import ResultKind, TaskAnalysis, WorkflowAssessment
 from autocoding_agent.database_models import QueryObservation, QueryObservationStatus
 from autocoding_agent.embedding_setup import (
     EmbeddingConnectionConfig,
@@ -996,6 +996,27 @@ def test_history_restores_result_and_missing_evidence_without_loading(root: tk.T
     assert "推进依据" in client.transcript.get("1.0", "end")
     assert not client._progress_event.active
     assert client.activity_dot.itemcget(client.activity_spinner, "state") == "hidden"
+
+
+def test_paused_task_shows_saved_analysis_without_last_assessment(root: tk.Toplevel) -> None:
+    session = _session(AgentStatus.NEEDS_INPUT)
+    session.task_state = TaskState.PAUSED
+    session.task_analysis = TaskAnalysis(
+        goal="核对扫码事件", constraints=["不修改其他接口"],
+        investigation=[{"question": "写入前校验在哪里？", "scope": "Page.cs",
+                        "done_when": "确认对应写入链", "status": "active"}],
+    )
+    session.last_decision = AgentDecision(status=AgentStatus.NEEDS_INPUT, message="已暂停")
+    client = DesktopClient(root, FakeApplication([session]))  # type: ignore[arg-type]
+    client.session_id = session.id
+    client._render_session(session)
+    assert "核对扫码事件" in client.workflow_detail_var.get()
+    assert "写入前校验在哪里" in client.workflow_detail_var.get()
+    assert "收束条件" not in client.transcript.get("1.0", "end")
+    client._chat_renderer.expand_all()
+    assert "不修改其他接口" in client.transcript.get("1.0", "end")
+    assert "收束条件" in client.transcript.get("1.0", "end")
+    assert not client._progress_event.active
 
 
 def test_long_evidence_summary_keeps_compact_window_composer_visible(root: tk.Toplevel) -> None:

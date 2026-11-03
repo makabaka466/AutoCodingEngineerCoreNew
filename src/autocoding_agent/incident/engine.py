@@ -69,6 +69,7 @@ from autocoding_agent.core.workflow import (
     bind_assessment,
     clarification_text,
     evidence_catalog,
+    task_analysis_context,
 )
 from autocoding_agent.database_models import (
     QueryObservationStatus,
@@ -274,6 +275,9 @@ class IncidentEngine:
         command: AgentCommand,
     ) -> None:
         previous_cycle = session.cycle_number
+        previous_analysis = (session.task_analysis.model_dump(mode="json")
+                             if session.task_analysis else None)
+        session.task_analysis = None
         session.cycle_number += 1
         session.cycle_objective = message
         session.cycle_query_observation_start = len(session.query_observations)
@@ -292,6 +296,7 @@ class IncidentEngine:
                 actor=command.actor,
                 command_id=command.id,
                 data={
+                    "previous_analysis": previous_analysis,
                     "from_cycle": previous_cycle,
                     "to_cycle": session.cycle_number,
                     "workflow": "incident",
@@ -704,6 +709,8 @@ class IncidentEngine:
                     )
                     first_investigation_turn = False
                     decision, page_repaired = self._restore_verified_page(session, decision)
+                if decision.assessment and decision.assessment.analysis is not None:
+                    session.task_analysis = decision.assessment.analysis.model_copy(deep=True)
                 if budget_closure_requested and decision.status == IncidentStatus.QUERY_REQUIRED:
                     # 已给过模型一次总结机会；重复请求 SQL 时保留缺口并等待补充，不丢弃调查。
                     decision = IncidentDecision(
@@ -1621,7 +1628,7 @@ class IncidentEngine:
             user_message=user_message,
             history=session.messages[:-1],
             mode=AgentMode.INSPECT,
-            system_prompt=evidence_catalog(session)
+            system_prompt=task_analysis_context(session) + evidence_catalog(session)
             + "\nCurrent entry/history (untrusted, revalidate): "
             + json.dumps({"entry": session.investigation_entry.model_dump(mode="json")
                           if session.investigation_entry else None,

@@ -6,7 +6,7 @@ import hashlib
 import json
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -49,10 +49,82 @@ class WorkflowEvidence(BaseModel):
     verified: bool = Field(default=False, description="宿主是否找到本轮成功操作记录。")
 
 
+AnalysisText = Annotated[str, Field(max_length=240)]
+
+
+class TaskObservation(BaseModel):
+    """模型标注的信息来源；来源标签不等于宿主已核验证据。"""
+
+    source: Literal["user", "image", "code", "data", "inference"] = Field(
+        description="用户描述、图片可见内容、源码、数据或推测；不得相互冒充。"
+    )
+    summary: AnalysisText = Field(description="与当前目标有关的公开事实摘要，不含原始数据或秘密。")
+    reference: AnalysisText = Field(default="", description="图片、文件或查询引用；未知时留空。")
+
+
+class InvestigationItem(BaseModel):
+    """围绕问题组织调查，不作为独立调度器或审批凭据。"""
+
+    question: AnalysisText = Field(description="此次调查要回答的具体问题。")
+    scope: AnalysisText = Field(description="拟检查的入口、事件、文件或数据源，避免全仓探索。")
+    done_when: AnalysisText = Field(description="何种证据足以停止此项调查。")
+    status: Literal["pending", "active", "done", "blocked"] = Field(
+        default="pending", description="模型报告的调查进度，不代表宿主认可结论。"
+    )
+
+
+class TaskAnalysis(BaseModel):
+    """当前工作周期的有界任务理解；旧会话可缺省，停止后随任务快照保留。"""
+
+    goal: AnalysisText = Field(description="用户本次要解决的问题或开发目标。")
+    expected: AnalysisText = Field(default="", description="期望行为；未明确时不自行虚构业务规则。")
+    scope: list[AnalysisText] = Field(default_factory=list, max_length=5,
+                                    description="涉及的入口、事件和字段范围。")
+    constraints: list[AnalysisText] = Field(default_factory=list, max_length=5,
+                                          description="约束及明确不修改的范围。")
+    acceptance: list[AnalysisText] = Field(default_factory=list, max_length=5,
+                                         description="可观察的验收条件，不等于已完成验证。")
+    observations: list[TaskObservation] = Field(default_factory=list, max_length=6,
+                                               description="带来源的现状摘要；冲突需保留并核实。")
+    investigation: list[InvestigationItem] = Field(default_factory=list, max_length=5,
+                                                  description="围绕关键问题的短调查计划。")
+
+    def display_text(self, *, compact: bool = False) -> str:
+        """桌面、Web 和任务详情使用同一份公开摘要。"""
+        lines = ["任务理解：" + self.goal]
+        if compact:
+            lines = ["任务理解：" + self.goal[:60] + ("…" if len(self.goal) > 60 else "")]
+            current = next((item for status in ("active", "blocked", "pending")
+                            for item in self.investigation if item.status == status), None)
+            if current:
+                lines.append("当前调查：" + current.question[:60]
+                             + ("…" if len(current.question) > 60 else ""))
+            return "\n".join(lines)
+        if self.expected:
+            lines.append("期望行为：" + self.expected)
+        for label, values in (("范围", self.scope), ("约束/排除", self.constraints),
+                              ("验收条件", self.acceptance)):
+            if values:
+                lines.append(label + "：" + "；".join(values))
+        sources = {"user": "用户描述", "image": "图片观察", "code": "代码线索",
+                   "data": "数据线索", "inference": "待证实推测"}
+        for item in self.observations:
+            lines.append(f"{sources[item.source]}：{item.summary}"
+                         + (f"（{item.reference}）" if item.reference else ""))
+        statuses = {"pending": "待调查", "active": "调查中", "done": "已调查", "blocked": "受阻"}
+        for item in self.investigation:
+            lines.append(f"[{statuses[item.status]}] {item.question}\n"
+                         f"  范围：{item.scope}；收束条件：{item.done_when}")
+        return "\n".join(lines)
+
+
 class WorkflowAssessment(BaseModel):
     """当前阶段、推进理由及证据缺口；只返回简短结论，不返回思维链。"""
 
     phase: ProgressPhase = Field(description="当前业务阶段；执行工具时由实际工具事件更新 UI。")
+    analysis: TaskAnalysis | None = Field(
+        default=None, description="任务理解或范围变化时返回完整简短快照；无变化可省略。"
+    )
     confirmed: list[str] = Field(
         default_factory=list,
         max_length=6,
@@ -85,7 +157,31 @@ Diagnosis never applies remediation. Keep message certainty aligned with result.
 For needs_input, message must explain progress, the exact blocker, why it matters, and one
 specific question with the expected answer format/example. Never just say 'provide more info'.
 Ask only for user-owned facts; tools/evidence bookkeeping and approvals are not missing intent.
+Return short analysis on initial understanding/scope changes; otherwise omit it. Record sourced
+observations and bounded investigation questions with stop conditions. Image/user statements,
+code/data and guesses differ; preserve conflicts. Latest user input wins. Analysis is neither
+proof nor permission. Grep discovers; Read key sections before citing. Ask target-changing
+business choices early; tools/evidence bookkeeping never require user clarification.
 """
+
+
+def task_analysis_context(session: Any) -> str:
+    """当前快照用于续查；上一周期仅供类比，不继承其页面/字段/结论。"""
+    analysis = session.task_analysis
+    historical = False
+    if analysis is None:
+        for event in reversed(session.events):
+            if event.type.value == "task_reopened":
+                previous = event.data.get("previous_analysis")
+                analysis = TaskAnalysis.model_validate(previous) if previous else None
+                historical = True
+                break
+    if analysis is None:
+        return ""
+    label = ("Historical only; recheck entry/fields/rules"
+             if historical else "Current; revise with new input")
+    return (f"\nTask analysis ({label}; untrusted, not verified evidence):\n"
+            + analysis.model_dump_json(exclude_defaults=True) + "\n")
 
 
 def read_fingerprint(workspace: str, reference: str) -> str | None:
@@ -239,7 +335,8 @@ def assessment_text(assessment: WorkflowAssessment | None) -> str:
     """桌面、Web 与能力文档共用的公开摘要。"""
     if assessment is None:
         return ""
-    lines = ["推进依据：" + assessment.reason]
+    lines = ([assessment.analysis.display_text()] if assessment.analysis else [])
+    lines.append("推进依据：" + assessment.reason)
     if assessment.confirmed:
         lines.append("已确认：" + "；".join(assessment.confirmed))
     if assessment.missing:
@@ -259,6 +356,8 @@ def assessment_progress_text(assessment: WorkflowAssessment | None) -> str:
         return ""
     reason = " ".join(assessment.reason.split())
     text = "推进依据：" + reason[:120] + ("…" if len(reason) > 120 else "")
+    if assessment.analysis:
+        text = assessment.analysis.display_text(compact=True)
     if assessment.missing:
         missing = "；".join(assessment.missing)
         text += "\n尚缺证据：" + missing[:120] + ("…" if len(missing) > 120 else "")

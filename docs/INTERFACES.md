@@ -1463,3 +1463,16 @@ Session 新增 investigation_entry、entry_history；异常 session 新增 entry
 - source_paths 的漏填 code 引用由宿主关联真实读取，实际来源继续使用 evidence.event_id/verified 审计。
 - POLICY_REPAIR_REQUESTED 使用 policy=investigation_entry、repair_round=1 和 missing 列表记录内部补查。
   每条用户命令至多一次，结果仍过入口/审批门禁；失败后复用 PAUSED/resume，不让用户替宿主补工具记录。
+
+## 0.20.0 可选任务分析快照
+
+AgentDecision / IncidentDecision 共用的 assessment.analysis 可选，省略表示本轮不更新。
+分析变更时返回完整快照，而非字段补丁：goal、expected、scope、constraints、acceptance、
+observations（source: user/image/code/data/inference，summary、reference）、
+investigation（question、scope、done_when、status: pending/active/done/blocked）。
+文本上限240字符，范围/约束/验收/调查各至多5项，观察至多6项。
+
+任务详情的 session.task_analysis 保存最近有效快照；暂停仍可查看，旧会话默认 null。
+新周期清空当前值，上一份记录在 task_reopened 事件 previous_analysis 中。无新增端点或必填参数，
+现有审批、查询和恢复协议不变。来源标签不是验证结果，不得用它代替 assessment.evidence。
+桌面状态区展示目标和当前调查，详情显示来源、范围与收束条件；Web 提供折叠详情。

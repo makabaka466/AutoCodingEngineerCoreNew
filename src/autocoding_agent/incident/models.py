@@ -15,7 +15,7 @@ from autocoding_agent.core.investigation import InvestigationEntry
 from autocoding_agent.core.models import AgentEvent, AgentUsage, ChatMessage, utc_now
 from autocoding_agent.core.runtime.models import RuntimeRunRecord
 from autocoding_agent.core.state_machine.models import CommandReceipt, TaskState
-from autocoding_agent.core.workflow import WorkflowAssessment
+from autocoding_agent.core.workflow import TaskAnalysis, WorkflowAssessment
 from autocoding_agent.database_models import (
     DataQuery,
     QueryObservation,
@@ -277,6 +277,9 @@ class IncidentSession(BaseModel):
     query_repair_rounds: int = Field(default=0, ge=0)
     cycle_number: int = Field(default=1, ge=1)
     cycle_objective: str | None = None
+    task_analysis: TaskAnalysis | None = Field(
+        default=None, description="本周期任务理解与调查计划；随快照保存，不作为审批依据。"
+    )
     cycle_query_observation_start: int = Field(default=0, ge=0)
     cycle_hermes_observation_start: int = Field(default=0, ge=0)
     capability_document: str | None = None

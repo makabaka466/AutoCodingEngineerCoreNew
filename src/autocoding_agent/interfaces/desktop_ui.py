@@ -2027,6 +2027,8 @@ class DesktopClient:
         decision = session.last_decision
         if decision is not None:
             details: list[str] = []
+            if session.task_analysis and not (decision.assessment and decision.assessment.analysis):
+                details.append(session.task_analysis.display_text())
             if decision.assessment:
                 details.append(assessment_text(decision.assessment))
             if session.investigation_entry:
@@ -2114,6 +2116,8 @@ class DesktopClient:
             entries.append(("assistant", format_incident_summary(decision)))
         if decision is not None and self._show_incident_details:
             details: list[str] = []
+            if session.task_analysis and not (decision.assessment and decision.assessment.analysis):
+                details.append(session.task_analysis.display_text())
             if decision.assessment:
                 details.append(assessment_text(decision.assessment))
             if decision.entry:
@@ -2230,7 +2234,12 @@ class DesktopClient:
         elif session.task_state == TaskState.WAITING_VERIFY_APPROVAL:
             event.label = "等待验证命令授权"
         self._present_progress(event, immediate=True)
-        if assessment:
+        if session.task_analysis and not (assessment and assessment.analysis):
+            self.workflow_detail_var.set(
+                session.task_analysis.display_text(compact=True)
+                + ("\n" + assessment_progress_text(assessment) if assessment else "")
+            )
+        elif assessment:
             self.workflow_detail_var.set(assessment_progress_text(assessment))
         else:
             self.workflow_detail_var.set("历史会话未声明证据等级，可继续对话补充调查。")

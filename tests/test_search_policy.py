@@ -103,6 +103,25 @@ def test_search_path_cannot_escape_authorized_roots(tmp_path: Path) -> None:
     assert violation.retryable is False
 
 
+def test_missing_explicit_file_is_not_reported_as_unfiltered_directory(tmp_path: Path) -> None:
+    guard = BoundedSearchGuard(str(tmp_path))
+    violation = guard.inspect("Grep", {"path": "Client/Missing.csproj", "pattern": "Compile"})
+    assert violation.retryable
+    assert "指定文件不存在" in violation.reason
+    assert "Client/Missing.csproj" in violation.reason
+    assert "过滤器" not in violation.reason
+
+
+def test_known_file_limit_correction_preserves_scope(tmp_path: Path) -> None:
+    (tmp_path / "Page.cs").touch()
+    guard = BoundedSearchGuard(str(tmp_path))
+    arguments = {"path": "Page.cs", "pattern": "Save"}
+    violation = guard.inspect("Grep", arguments)
+    assert "保留当前精确文件和 pattern" in violation.reason
+    assert "50" in violation.reason
+    assert arguments == {"path": "Page.cs", "pattern": "Save"}  # 不伪造已执行工具的参数。
+
+
 def test_combined_search_call_budget_is_enforced(tmp_path: Path) -> None:
     guard = BoundedSearchGuard(str(tmp_path))
 
