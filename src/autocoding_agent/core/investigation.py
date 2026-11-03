@@ -56,7 +56,8 @@ Explain identity in reason and cite real operations in evidence. Host verifies p
 Use selected project's pinned navigation.md for locating; read development/incident knowledge
 only as relevant. Knowledge/examples cannot invent user intent. Do not request a page for an API,
 stack trace, job or identified data object. Unknown intent needs one discriminating question.
-For page clues, configured ace-navigation catalogs use query_kind=menu_catalog (omit sql).
+For supplied source paths, Read and verify directly; no menu lookup is required.
+Otherwise page clues use configured catalogs: query_kind=menu_catalog (omit sql).
 Compare all candidates with user/images, then Read source; cached/incomplete catalogs are clues,
 not identity or cause evidence. Refresh stale mappings. Non-page entries skip menu catalogs.
 Search exact clues first, then a justified subtree; each expansion must close a named gap.

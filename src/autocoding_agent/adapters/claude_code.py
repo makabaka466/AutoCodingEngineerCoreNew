@@ -41,13 +41,17 @@ class ClaudeCodeSearchPolicyError(ClaudeCodeError, RuntimePolicyBlockedError):
 
     def __init__(self, violation: SearchPolicyViolation) -> None:
         message = (
+            "本轮源码调查预算已用完，已保存读取与搜索记录。"
+            "可点击继续任务，先核对已有证据，再处理未解决的问题；无需重复提供页面路径。"
+        ) if violation.budget_exhausted else (
             "ACE 已阻止范围过大的源码搜索。"
             f"{violation.reason}。请缩小到明确文件名、类名或候选子目录后重试。"
         )
         RuntimePolicyBlockedError.__init__(
             self,
             message,
-            policy="bounded_source_search",
+            policy=("source_search_budget" if violation.budget_exhausted
+                    else "bounded_source_search"),
             operation=violation.tool_name,
             reason=violation.reason,
             retryable=violation.retryable,
@@ -337,40 +341,59 @@ class ClaudeCodeRuntime:
                 if envelope.get("type") == "result":
                     result_envelope = envelope
                     timing.result_ms = timing.elapsed(time.monotonic())
-                blocked_search = _search_policy_violation(envelope, search_guard)
-                if blocked_search is not None:
-                    violation, blocked_input = blocked_search
-                    audit_data = _safe_tool_data(
-                        violation.tool_name,
-                        blocked_input,
-                        turn.workspace,
-                    )
-                    event_sink(
-                        RuntimeActivity(
-                            run_id=run_id,
-                            kind=RuntimeEventKind.POLICY_BLOCKED,
-                            summary=f"ACE blocked an over-broad {violation.tool_name} search.",
-                            tool_name=violation.tool_name,
-                            data={**audit_data, "reason": violation.reason},
+                # 同一消息的工具逐个审计，后一个被拦截时也保留前一个的记录。
+                message = envelope.get("message")
+                content = message.get("content") if isinstance(message, dict) else None
+                parts = [envelope]
+                if envelope.get("type") == "assistant" and isinstance(content, list):
+                    parts = [
+                        {**envelope, "message": {**message, "content": [block]}}
+                        for block in content
+                    ]
+                for part in parts:
+                    blocked_search = _search_policy_violation(part, search_guard)
+                    if blocked_search is not None:
+                        violation, blocked_input = blocked_search
+                        audit_data = _safe_tool_data(
+                            violation.tool_name,
+                            blocked_input,
+                            turn.workspace,
                         )
-                    )
-                    logger.warning(
-                        "search_policy_blocked session_id=%s run_id=%s tool=%s reason=%s",
-                        turn.session_id,
-                        run_id,
-                        violation.tool_name,
-                        violation.reason,
-                    )
-                    self._terminate_process(process)
-                    raise ClaudeCodeSearchPolicyError(violation)
-                for activity in _stream_activities(
-                    envelope,
-                    run_id=run_id,
-                    workspace=turn.workspace,
-                    tool_context=tool_context,
-                ):
-                    timing.record(activity, time.monotonic())
-                    event_sink(activity)
+                        event_sink(
+                            RuntimeActivity(
+                                run_id=run_id,
+                                kind=RuntimeEventKind.POLICY_BLOCKED,
+                                summary=(
+                                    "源码调查预算已用完，已保留进展。"
+                                    if violation.budget_exhausted
+                                    else f"ACE blocked an invalid {violation.tool_name} search."
+                                ),
+                                tool_name=violation.tool_name,
+                                data={**audit_data, **search_guard.progress_data(),
+                                      "reason": violation.reason,
+                                      "budget_exhausted": violation.budget_exhausted},
+                            )
+                        )
+                        logger.warning(
+                            "search_policy_blocked session_id=%s run_id=%s tool=%s reason=%s",
+                            turn.session_id,
+                            run_id,
+                            violation.tool_name,
+                            violation.reason,
+                        )
+                        self._terminate_process(process)
+                        raise ClaudeCodeSearchPolicyError(violation)
+                    for activity in _stream_activities(
+                        part,
+                        run_id=run_id,
+                        workspace=turn.workspace,
+                        tool_context=tool_context,
+                    ):
+                        if (activity.kind == RuntimeEventKind.TOOL_STARTED
+                                and (activity.tool_name or "").casefold() in {"glob", "grep"}):
+                            activity.data.update(search_guard.progress_data())
+                        timing.record(activity, time.monotonic())
+                        event_sink(activity)
 
             returncode = process.wait(timeout=5)
             stderr_thread.join(timeout=1)
@@ -925,6 +948,7 @@ def _search_policy_violation(
         violation = guard.inspect(
             str(block.get("name") or "unknown"),
             block.get("input"),
+            tool_use_id=block.get("id"),
         )
         if violation is not None:
             return violation, block.get("input")

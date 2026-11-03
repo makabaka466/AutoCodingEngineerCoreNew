@@ -50,7 +50,7 @@ def test_runtime_projector_uses_curated_tool_phases_and_ignores_model_text() -> 
     assert read.phase == ProgressPhase.INSPECTING_CODE
     assert read.detail == "orders.py"
     assert search is not None
-    assert search.phase == ProgressPhase.LOCATING_PAGE
+    assert search.phase == ProgressPhase.INSPECTING_CODE
     assert assistant_text is None
 
 
@@ -77,3 +77,22 @@ def test_heartbeat_does_not_replace_last_observed_business_phase() -> None:
         RuntimeActivity(run_id="run-1", kind=RuntimeEventKind.HEARTBEAT, summary="Alive."),
         workflow=ProgressWorkflow.INCIDENT, task_id="task-1", mode="inspect",
     ) is None
+
+
+def test_search_budget_progress_and_pause_are_specific_and_do_not_claim_entry_confirmed():
+    progress = ProgressProjector.from_runtime(
+        RuntimeActivity(run_id="run", kind=RuntimeEventKind.TOOL_STARTED, summary="Search",
+                        tool_name="Grep", data={"path": "Business/Binding.cs",
+                        "search_calls": 18, "search_limit": 30, "review_due": True}),
+        workflow=ProgressWorkflow.INCIDENT, task_id="task", mode="inspect",
+    )
+    assert progress.phase == ProgressPhase.INSPECTING_CODE
+    assert "18/30" in progress.detail
+    assert "收敛" in progress.detail
+    paused = ProgressProjector.from_runtime(
+        RuntimeActivity(run_id="run", kind=RuntimeEventKind.POLICY_BLOCKED, summary="Budget",
+                        data={"budget_exhausted": True}),
+        workflow=ProgressWorkflow.INCIDENT, task_id="task", mode="inspect",
+    )
+    assert not paused.active
+    assert "暂停" in paused.label

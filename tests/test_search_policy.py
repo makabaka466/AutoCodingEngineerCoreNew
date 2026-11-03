@@ -113,6 +113,43 @@ def test_combined_search_call_budget_is_enforced(tmp_path: Path) -> None:
 
     assert violation is not None
     assert "调用超过" in violation.reason
+    assert violation.budget_exhausted
+    assert not violation.retryable
+
+
+def test_directories_share_total_budget_and_exact_file_reads_are_free(tmp_path):
+    guard = BoundedSearchGuard(str(tmp_path))
+    for directory in ("Business", "DAO"):
+        folder = tmp_path / directory
+        folder.mkdir()
+        (folder / "Binding.cs").touch()
+    for i in range(30):
+        directory = "Business" if i % 2 else "DAO"
+        assert guard.inspect("Read", {"file_path": f"{directory}/Binding.cs"}) is None
+        assert guard.inspect("Grep", {
+            "path": f"{directory}/Binding.cs", "pattern": "Save", "head_limit": 20,
+        }, tool_use_id=f"search-{i}") is None
+    assert guard.directory_calls == {"dao": 15, "business": 15}
+    assert guard.progress_data()["repeat_count"] == 15
+    assert guard.progress_data()["review_due"]
+    assert guard.inspect("Glob", {"pattern": "**/Other.cs"}).budget_exhausted
+
+
+def test_same_tool_event_is_not_double_counted_and_path_aliases_share_directory(tmp_path):
+    (tmp_path / "Business").mkdir()
+    guard = BoundedSearchGuard(str(tmp_path))
+    for path in ("Business", "./Business", str(tmp_path / "Business")):
+        assert guard.inspect("Glob", {"path": path, "pattern": "Binding.cs"},
+                             tool_use_id=path) is None
+    assert guard.inspect("Glob", {"path": "Business", "pattern": "Binding.cs"},
+                         tool_use_id="Business") is None
+    assert guard.calls == 3
+    assert guard.directory_calls == {"business": 3}
+    assert guard.last_repeat_count == 3
+    assert not guard.progress_data()["review_due"]
+    violation = guard.inspect("Glob", {"pattern": "**/*"}, tool_use_id="Business")
+    assert violation is not None
+    assert "禁止通配" in violation.reason
 
 
 def test_root_overview_is_not_permission_to_scan_all_business_code(tmp_path):

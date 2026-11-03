@@ -335,15 +335,16 @@ class IncidentEngine:
         return json.dumps(payload, ensure_ascii=False)
 
     def _pause_at_boundary(
-        self, session: IncidentSession, command: AgentCommand,
+        self, session: IncidentSession, command: AgentCommand, *, message: str | None = None,
     ) -> IncidentOutcome:
-        message = ("任务已暂停，已保存对话与执行记录。"
+        budget_pause = message is not None
+        message = message or ("任务已暂停，已保存对话与执行记录。"
                    "继续时先核对当前状态，不重复执行已确认完成的操作。")
         session.last_decision = IncidentDecision(status=IncidentStatus.FAILED, message=message)
         session.status = session.last_decision.status
         session.messages.append(ChatMessage(role=MessageRole.ASSISTANT, content=message))
         self.state_machine.transition(
-            session, TaskState.PAUSED, reason=message, actor="user",
+            session, TaskState.PAUSED, reason=message, actor="host" if budget_pause else "user",
             command_id=command.id, expected_version=session.version,
         )
         self._complete_command(session, command)
@@ -758,13 +759,16 @@ class IncidentEngine:
                 self._validate_decision(decision)
             except RuntimePolicyBlockedError as exc:
                 # 第 4 步：源码搜索范围过大时，最多自动进行一次有界纠正。
+                budget_exhausted = exc.policy == "source_search_budget"
                 self.runtime_lifecycle.finish(
                     session,
                     run,
-                    status=RunStatus.FAILED,
+                    status=RunStatus.INTERRUPTED if budget_exhausted else RunStatus.FAILED,
                     reason=str(exc),
                     command_id=command.id,
                 )
+                if budget_exhausted:
+                    return self._pause_at_boundary(session, command, message=str(exc))
                 if (
                     not exc.retryable
                     or consecutive_search_repair_rounds >= MAX_SEARCH_REPAIR_ROUNDS

@@ -561,7 +561,7 @@ Runner/Popen 时跳过本机路径恢复，保留可替换 Runtime 的确定性�
 
 `--safe-mode` 与显式 `--tools/--allowedTools` 组合使用：前者阻止项目或用户自定义项改变本轮
 行为，后者只开放当前状态允许的原生工具。可观测 Runtime 还会检查每个流式 `Glob/Grep`
-调用：单轮组合预算为 8 次；Glob 不接受通配整个仓库或无明确子目录的递归全扩展模式；目录级 Grep 必须设置
+调用：单轮组合预算为 30 次；Glob 不接受通配整个仓库或无明确子目录的递归全扩展模式；目录级 Grep 必须设置
 `glob/type` 和 `head_limit=1..100`；显式搜索路径必须位于 workspace、能力目录或附件目录。
 违反策略会产生 `RuntimeEventKind.POLICY_BLOCKED`，审计中只保存工具名、脱敏后的范围信息和阻断
 原因，不保存源码正文。`RuntimePolicyBlockedError` 还携带 policy、operation、脱敏 reason 和是否
@@ -1441,3 +1441,15 @@ Session 新增 investigation_entry、entry_history；异常 session 新增 entry
 项目入口 MD 支持 ace-navigation 配置。DataQuery 新增 query_kind=menu_catalog 与 refresh_catalog，SQL 请求保留原语义；目录请求不允许模型覆盖 SQL/参数。两套工作流复用只读查询、预算与停止机制。QueryResult/QueryObservation.catalog_info 保存目录来源、缓存和完整性；目录不作为已执行业务查询证据。
 
 宿主分页读取 SQL Server/Oracle 目录，完整结果按绑定快照隔离缓存。模型比较候选后仍核对源码/截图；显式路径映射只返回工作区内存在文件。详见 docs/NAVIGATION.md（仓库根目录下）。未进行真实业务库验收。
+
+
+## 0.19.1 源码调查预算与恢复
+
+- Glob/Grep 共享 30 次上限，Read 不计数；同一个 tool_use_id 的重放不重复计数。
+- 原生搜索的 tool_started 活动增加 search_calls、search_limit、search_directory、directory_calls、repeat_count、review_due；
+  review_due 从第 15 次起为 true，只作进度提示。目录计数不增加总额度，授权目录以占位符脱敏。
+- POLICY_BLOCKED 的 budget_exhausted=true 表示预算耗尽，RuntimePolicyBlockedError.policy 为 source_search_budget，
+  retryable=false。两条只读流程均暂停，不再混同范围违规或要求重给页面路径；已有 resume 接口继续只读核验。
+- 范围违规仍为 bounded_source_search，最多一次自动纠正。无新增自动续轮、模型调用、接口路由或数据库权限。
+- UI 显示源码搜索用量/目录累计次数/收敛提示，不能仅凭搜索工具推断正在找页面或页面已确认。
+- 继续任务携带已保存搜索范围、公开摘要和文件是否变化；缺失工具结果仍为 unknown，不推断执行成功。

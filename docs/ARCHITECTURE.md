@@ -188,13 +188,13 @@ Claude Code 以 `--safe-mode` 启动，并使用空 setting sources、严格空 
 项目 `CLAUDE.md` 不自动注入，模型只在任务相关时把它作为普通、不可信项目上下文主动读取。
 
 源码搜索另有共享的有界策略：模型根据页面映射、类名、路由和当前证据选择搜索目标，宿主只阻止
-确定性的越界/失控行为。生产可观测 Runtime 单轮最多接受 8 次 `Glob/Grep`，拒绝 `**/*`、
+确定性的越界/失控行为。生产可观测 Runtime 单轮最多接受 30 次 `Glob/Grep`，拒绝 `**/*`、
 `**/*.cs` 等全库模式；目录级 `Grep` 必须带 `glob/type` 和 1..100 的 `head_limit`，路径只能位于
 工作区或主机明确授权的只读目录。拦截会写入 `policy_blocked` Runtime 活动并终止本轮，避免继续
 扩大读取范围。对于缺少 `glob/type/head_limit` 或首个过宽 Glob 等可纠正的模型参数错误，开发与
 异常的 inspect 流程会把脱敏原因返回同一个 Runtime Session，自动允许一次更窄的只读搜索；原
-调用结果不会被采纳，并追加 `policy_repair_requested`。第二次仍违规、路径越界或搜索调用预算耗尽
-时直接失败，不能靠重试扩大边界。精确模式（如 `**/FCModelUpload.cs`）仍可跨工作区内的嵌套
+调用结果不会被采纳，并追加 `policy_repair_requested`。第二次仍违规或路径越界终止自动纠错；搜索预算耗尽单独转为 PAUSED，
+保存证据后等待用户继续，不能自动重试绕过总额度。精确模式（如 `**/FCModelUpload.cs`）仍可跨工作区内的嵌套
 解决方案定位源码。
 
 递归扩展名 Glob 只有在没有明确目录线索时才视为全库扫描。`**/CKClient/**/*.cs` 这类由菜单/路由
@@ -944,7 +944,7 @@ OracleDatabaseReader 使用结构化 ConnectParams，Service Name/SID 分开设�
 - IncidentDecision.entry、AgentDecision.entry 与持久化 session.investigation_entry/entry_history 分离当前结果和历史。接口/后台入口通过真实源码读取核对，数据入口通过绑定源的实际成功查询核对，可不提供源码路径。
 - 新 Claude Code 异常任务保存 entry_contract_version=1，遗漏入口不能回退旧 page 契约绕过校验。历史任务及未声明 investigation_entry_version 的旧 Runtime 保持兼容；升级 Runtime 应声明版本 1。开发中新建能力可能没有现存入口，不强制凭空造入口，但一旦使用入口契约，修改审批前须通过核验。
 - navigation/development/incident 三份项目 MD。只同步所选项目导航至开发/异常 pinned/<project>/navigation.md，索引只链接当前项目；模型按阶段读取，不把三份正文重复注入所有轮次。
-- 首轮开放有界 Read/Glob/Grep，根目录只看清单或明确文件，禁止根目录按语言全文扫描；原有 8 次搜索/100 条 Grep 上限和一次纠错保留。异常搜索无法继续时进入 WAITING_INPUT，不把预算耗尽写成诊断成功。
+- 首轮开放有界 Read/Glob/Grep，根目录只看清单或明确文件，禁止根目录按语言全文扫描；源码搜索采用 0.19.1 的 30 次上限/15 次收敛提示，保留 100 条 Grep 上限和一次范围纠错。异常搜索无法继续时进入 WAITING_INPUT，不把预算耗尽写成诊断成功。
 - 否认或冲突记录保留在 entry_history。显式重新核验须声明 reconsider_excluded，并补充新操作证据和澄清理由。曾恢复成功的入口无需反复重做同一排除审批。
 - 新诊断转修复保存来源 revision，入口作为待复核候选交接。审批及 Runtime 调度边界读取最新诊断；版本变化即清除待审批，运行中的任务在当前调用返回后暂停，保留实际文件快照与操作记录。历史修复任务无来源 revision，保持旧恢复机制。
 - 不增加独立的入口分类模型请求，不做全菜单缓存，不开放数据库写入。路径映射确定性规则由下一阶段实现。
@@ -955,3 +955,16 @@ OracleDatabaseReader 使用结构化 ConnectParams，Service Name/SID 分开设�
 项目入口 MD 支持 ace-navigation 配置。DataQuery 新增 query_kind=menu_catalog 与 refresh_catalog，SQL 请求保留原语义；目录请求不允许模型覆盖 SQL/参数。两套工作流复用只读查询、预算与停止机制。QueryResult/QueryObservation.catalog_info 保存目录来源、缓存和完整性；目录不作为已执行业务查询证据。
 
 宿主分页读取 SQL Server/Oracle 目录，完整结果按绑定快照隔离缓存。模型比较候选后仍核对源码/截图；显式路径映射只返回工作区内存在文件。详见 docs/NAVIGATION.md（仓库根目录下）。未进行真实业务库验收。
+
+
+## 0.19.1 需求驱动调查与搜索恢复
+
+共享搜索规则要求先给出公开的需求概述，再读取指定入口并梳理输入/事件/校验/业务调用/数据/反馈。
+重要依赖按未解决的问题追踪，复用方法须核对副作用，其他显示/日志类不逐个展开；相似页面只能作参考。
+15 次是模型收敛规则和 UI 提示，不是强制中断/额外模型调用，无法保证模型一定输出摘要。
+30 次由宿主硬限制。目录统计归一化相对路径、绝对路径及精确文件父目录；父子目录分别观察，均共享总预算。
+重复工具事件按 tool_use_id 去重；真实重复调用仍消耗额度并标记次数。批量工具逐个审计，保留拦截前记录。
+预算耗尽使用现有 RuntimePolicyBlockedError.policy=source_search_budget；只读运行记 INTERRUPTED、任务 PAUSED。
+不增加自动续轮；每次继续由用户显式触发。写入/验证中断保留既有 RECOVERY_REQUIRED 流程。
+恢复上下文附上最近工具范围、文件指纹核对、最后公开摘要（未经核验）及搜索用量；不保存源码正文，
+不将读取成功或模型摘要当成已确认身份。模型未输出的业务判断无法由宿主补造。

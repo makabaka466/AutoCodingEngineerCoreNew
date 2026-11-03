@@ -413,14 +413,17 @@ class AgentEngine:
         self.sessions.save(session)
         return False
 
-    def _pause_at_boundary(self, session: AgentSession, command: AgentCommand) -> AgentOutcome:
-        message = ("任务已暂停，已保存对话与执行记录。"
+    def _pause_at_boundary(
+        self, session: AgentSession, command: AgentCommand, *, message: str | None = None,
+    ) -> AgentOutcome:
+        budget_pause = message is not None
+        message = message or ("任务已暂停，已保存对话与执行记录。"
                    "继续时先核对当前状态，不重复执行已确认完成的操作。")
         session.last_decision = AgentDecision(status=AgentStatus.FAILED, message=message)
         session.status = session.last_decision.status
         session.messages.append(ChatMessage(role=MessageRole.ASSISTANT, content=message))
         self.state_machine.transition(
-            session, TaskState.PAUSED, reason=message, actor="user",
+            session, TaskState.PAUSED, reason=message, actor="host" if budget_pause else "user",
             command_id=command.id, expected_version=session.version,
         )
         self._complete_command(session, command)
@@ -815,9 +818,13 @@ class AgentEngine:
             except Exception as exc:
                 # 第 5 步：先把本次 Run 记为终态，再根据失败类型选择有界搜索纠正、
                 # 写入/验证恢复，或者普通只读调查失败。
+                budget_exhausted = (
+                    isinstance(exc, RuntimePolicyBlockedError)
+                    and exc.policy == "source_search_budget"
+                )
                 run_status = (
                     RunStatus.INTERRUPTED
-                    if isinstance(exc, RuntimeInterruptedError)
+                    if isinstance(exc, RuntimeInterruptedError) or budget_exhausted
                     else RunStatus.FAILED
                 )
                 self.runtime_lifecycle.finish(
@@ -828,6 +835,9 @@ class AgentEngine:
                     command_id=command.id,
                 )
                 self.sessions.save(session)
+                if budget_exhausted and mode == AgentMode.INSPECT:
+                    # 不自动开新轮绕过总预算；继续入口会核对已保存的证据及文件指纹。
+                    return self._pause_at_boundary(session, command, message=str(exc))
                 if (
                     isinstance(exc, RuntimePolicyBlockedError)
                     and mode == AgentMode.INSPECT

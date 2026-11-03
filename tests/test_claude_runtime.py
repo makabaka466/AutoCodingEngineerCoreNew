@@ -606,6 +606,31 @@ def test_observed_runtime_blocks_repository_wide_glob(tmp_path: Path) -> None:
     assert "禁止通配整个项目" in activities[-1].data["reason"]
 
 
+def test_observed_budget_allows_thirty_and_preserves_tools_before_block_in_same_message(tmp_path):
+    # 一次消息批量发出调用：第 31 次被拦截不应吞掉前 30 次的审计记录。
+    stream = {"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "id": f"search-{i}", "name": "Glob",
+         "input": {"pattern": f"**/Dependency{i}.cs"}} for i in range(31)
+    ]}}
+    script = f"print({json.dumps(json.dumps(stream))}, flush=True)"
+
+    def popen_factory(command, **kwargs):
+        return subprocess.Popen([sys.executable, "-c", script], **kwargs)
+
+    runtime = ClaudeCodeRuntime(_settings(tmp_path), popen_factory=popen_factory)
+    activities = []
+    with pytest.raises(RuntimePolicyBlockedError) as caught:
+        runtime.run_observed(_turn(tmp_path), "budget-run", activities.append)
+    assert caught.value.policy == "source_search_budget"
+    assert "范围过大" not in str(caught.value)
+    calls = [a for a in activities if a.kind == RuntimeEventKind.TOOL_STARTED]
+    assert len(calls) == 30
+    assert [a.data["search_calls"] for a in calls] == list(range(1, 31))
+    assert not calls[13].data["review_due"]
+    assert calls[14].data["review_due"]
+    assert activities[-1].data["budget_exhausted"]
+
+
 def test_observed_runtime_can_be_interrupted(tmp_path: Path) -> None:
     started = threading.Event()
 

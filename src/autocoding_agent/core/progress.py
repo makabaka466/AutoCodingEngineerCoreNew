@@ -146,6 +146,12 @@ class ProgressProjector:
         if activity.kind == RuntimeEventKind.HEARTBEAT:
             # 心跳仅证明进程存活，不能把最近的读代码/查数据阶段改成另一业务阶段。
             return None
+        if (activity.kind == RuntimeEventKind.POLICY_BLOCKED
+                and activity.data.get("budget_exhausted")):
+            return ProgressEvent.for_phase(
+                workflow, ProgressPhase.RECOVERING, task_id=task_id, active=False,
+                detail="源码调查预算已用完，进展已保存，可继续任务。",
+            ).model_copy(update={"label": "调查已暂停，等待继续"})
         if activity.kind != RuntimeEventKind.TOOL_STARTED:
             return None
 
@@ -158,11 +164,8 @@ class ProgressProjector:
                 else ProgressPhase.INSPECTING_CODE
             )
         elif tool in cls._SEARCH_TOOLS:
-            phase = (
-                ProgressPhase.LOCATING_PAGE
-                if workflow == ProgressWorkflow.INCIDENT
-                else ProgressPhase.INSPECTING_CODE
-            )
+            # 工具名称不能证明仍在找页面，更不能证明页面已经确认。
+            phase = ProgressPhase.INSPECTING_CODE
         elif tool in cls._WRITE_TOOLS:
             phase = ProgressPhase.MODIFYING_CODE
         elif tool == "bash":
@@ -173,11 +176,25 @@ class ProgressProjector:
             )
         else:
             return None
+        detail = _path_detail(safe_path)
+        if tool in cls._SEARCH_TOOLS and "search_calls" in activity.data:
+            detail = (f"源码搜索 {activity.data['search_calls']}/"
+                      f"{activity.data['search_limit']} 次"
+                      + (f" · {detail}" if detail else ""))
+            directory_count = activity.data.get("directory_calls", {}).get(
+                activity.data.get("search_directory"),
+            )
+            if directory_count:
+                detail += f" · 当前目录累计 {directory_count} 次"
+            if activity.data.get("review_due"):
+                detail += " · 已到收敛检查点"
+            if activity.data.get("repeat_count", 0) > 1:
+                detail += " · 存在重复搜索"
         return ProgressEvent.for_phase(
             workflow,
             phase,
             task_id=task_id,
-            detail=_path_detail(safe_path),
+            detail=detail,
         )
 
     @staticmethod
