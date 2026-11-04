@@ -112,9 +112,9 @@ class ChatTranscript:
         self.resize()
 
     def resize(self) -> None:
-        """超宽窗口限制文本行宽，用户消息向右收窄；不更改原文或选择复制。"""
+        """正文随可用区域展开，用户气泡保持右对齐；不更改原文或选择复制。"""
         width = max(300, self.widget.winfo_width())
-        margin = max(12, (width - 880) // 2)
+        margin = 12
         for tag in ("assistant_message", "assistant_name", "system_message", "system_name",
                     "metadata", "chat_heading"):
             self.widget.tag_configure(tag, lmargin1=margin, lmargin2=margin, rmargin=margin,
@@ -127,8 +127,8 @@ class ChatTranscript:
                                   spacing1=12, spacing3=12)
         self.widget.tag_configure("user_block", justify="right", rmargin=margin)
         for block in self.blocks:
-            block.configure(width=max(160, min(850 if block.code else 650,
-                                               width-margin*2-40)))
+            block_width = width - margin * 2 - 40
+            block.configure(width=max(160, block_width if block.code else min(650, block_width)))
 
     def _insert_block(self, content: str, *, code: bool = False) -> None:
         block = RoundedTextBlock(self.widget, content, code=code)

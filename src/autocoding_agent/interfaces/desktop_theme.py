@@ -6,6 +6,7 @@ from PIL import Image, ImageDraw, ImageTk
 
 COLORS = {
     "window": "#FFFFFF", "ambient": "#FFFFFF", "sidebar": "#F7F7F8",
+    "navigation": "#EAF2FB",
     "surface": "#FFFFFF", "surface_subtle": "#F7F7F8", "glass": "#FFFFFF",
     "glass_floating": "#FFFFFF", "panel": "#F0F1F3", "panel_hover": "#E9EAED",
     "input": "#FFFFFF", "border": "#E7E8EB", "border_soft": "#E7E8EB",

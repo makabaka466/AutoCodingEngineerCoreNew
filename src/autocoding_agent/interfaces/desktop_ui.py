@@ -770,7 +770,7 @@ class DesktopClient:
         self._build_conversation_area()
 
     def _build_sidebar(self) -> None:
-        rail = tk.Frame(self.root, bg=COLORS["sidebar"], width=60)
+        rail = tk.Frame(self.root, bg=COLORS["navigation"], width=60)
         rail.grid(row=0, column=0, sticky="nsew")
         rail.grid_columnconfigure(0, weight=1)
         rail.grid_rowconfigure(5, weight=1)
@@ -1706,7 +1706,7 @@ class DesktopClient:
             self.sidebar_panel.grid()
         self.root.grid_columnconfigure(1, minsize=0 if hidden else 320)
         available = width - 60 - (0 if hidden else 320)
-        inset = max(22, (available - 1000) // 2)
+        inset = 22
         self.composer_panel.grid_configure(columnspan=2, padx=inset)
         self.transcript_panel.grid_configure(padx=inset)
         self.header_panel.grid_configure(columnspan=2)
