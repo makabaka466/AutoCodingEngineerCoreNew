@@ -935,13 +935,13 @@ def test_light_theme_and_configured_workspace_keep_composer_compact(
 ) -> None:
     client = DesktopClient(root, FakeApplication())  # type: ignore[arg-type]
 
-    assert COLORS["window"] == "#EEF3FA"
+    assert COLORS["window"] == "#FFFFFF"
     assert not hasattr(client, "workspace_entry")
     assert not hasattr(client, "browse_button")
     assert isinstance(client.send_button, RoundedButton)
     assert client.send_button.cget("background") == COLORS["accent"]
     assert client.send_button.cget("foreground") == "#FFFFFF"
-    assert client.transcript.tag_cget("user_message", "background") == COLORS["accent_soft"]
+    assert client.transcript.tag_cget("user_message", "background") == COLORS["user"]
     assert client.transcript.cget("cursor") == "xterm"
     assert client.transcript.cget("exportselection") == 0
     assert client.transcript.cget("selectbackground") == COLORS["progress_accent"]
@@ -954,7 +954,7 @@ def test_light_theme_and_configured_workspace_keep_composer_compact(
     assert tags.index("sel") > tags.index("assistant_message")
     assert tags.index("sel") > tags.index("user_message")
     assert client.status_badge.cget("highlightthickness") == 1
-    assert COLORS["progress_accent"] == "#667EEA"
+    assert COLORS["progress_accent"] == "#64748B"
     assert client.activity_frame.cget("background") == COLORS["progress_accent_soft"]
 
 
@@ -974,6 +974,99 @@ def test_status_below_conversation_rotates_only_while_executing(root: tk.Topleve
     client._animate_progress_pulse()
     assert client.activity_dot.itemcget(client.activity_spinner, "state") == "hidden"
     client._set_busy(False)
+
+
+def test_workspace_layout_search_and_collapsed_project_access(root: tk.Toplevel) -> None:
+    first, second = _session(), _session()
+    second.goal = "查询物料批次"
+    app = FakeApplication([first, second])
+    client = DesktopClient(root, app)  # type: ignore[arg-type]
+    root.geometry("1440x900")
+    root.deiconify()
+    root.update()
+    assert int(client.main_frame.grid_info()["column"]) == 2
+    assert client.sidebar_panel.winfo_width() == 320
+    assert not client.overview_panel.winfo_manager()
+    client.history_search_var.set("物料")
+    assert client._session_ids == [second.id]
+    client.sessions_list.selection_set(0)
+    client._select_session(None)
+    assert client.session_id == second.id
+    client.history_search_var.set("")
+    assert set(client._session_ids) == {first.id, second.id}
+    root.geometry("980x720")
+    root.update()
+    assert not client.sidebar_panel.winfo_manager()
+    client._toggle_history()
+    root.update()
+    assert client.sidebar_panel.winfo_manager() == "grid"
+    assert client.project_combo.winfo_width() > 100
+
+
+def test_composer_grows_with_text_and_swaps_send_for_stop(root: tk.Toplevel) -> None:
+    client = DesktopClient(root, FakeApplication())  # type: ignore[arg-type]
+    client.prompt_input.insert("1.0", "需求描述\n" * 20)
+    root.update()
+    assert 2 < int(client.prompt_input.cget("height")) <= 7
+    client.prompt_input.delete("1.0", "end")
+    root.update()
+    assert int(client.prompt_input.cget("height")) == 2
+    client._task_operation = True
+    client._set_busy(True, "正在分析")
+    assert client.send_button.winfo_manager() == ""
+    assert client.stop_button.winfo_manager() == "grid"
+    client._set_busy(False)
+    assert client.send_button.winfo_manager() == "grid"
+    assert client.stop_button.winfo_manager() == ""
+
+
+def test_review_uses_available_height_and_can_switch_to_conversation(root: tk.Toplevel) -> None:
+    session = _session(AgentStatus.APPROVAL_REQUIRED)
+    session.pending_approval = ApprovalRequest(
+        scope=ApprovalScope.VERIFY, reason="验证修改", proposed_actions=["pytest"],
+    )
+    client = DesktopClient(root, FakeApplication([session]))  # type: ignore[arg-type]
+    root.geometry("1280x800")
+    root.deiconify()
+    client.session_id = session.id
+    client._render_session(session)
+    root.update()
+    assert client.approval_frame.winfo_height() > 300
+    assert client.transcript_panel.winfo_manager() == ""
+    client._toggle_review()
+    root.update()
+    assert client.transcript_panel.winfo_manager() == "grid"
+    assert client.approve_button.cget("command") == client._approve
+    root.geometry("1840x980")
+    root.update()
+    assert client.composer_panel.winfo_width() > 650
+    assert int(client.approval_frame.grid_info()["column"]) == 1
+    assert client.send_button.winfo_rootx() + client.send_button.winfo_width() < (
+        root.winfo_rootx() + root.winfo_width()
+    )
+
+
+def test_chat_preserves_reading_position_and_copies_literal_code(root: tk.Toplevel) -> None:
+    from autocoding_agent.interfaces.chat_transcript import ChatTranscript
+
+    widget = tk.Text(root, width=70, height=16)
+    widget.pack(fill="both", expand=True)
+    root.geometry("800x600")
+    renderer = ChatTranscript(widget)
+    code = 'print("**literal**")\n' + "a = 1\n" * 3
+    entries = [("user", "需要保留的用户原文"), ("assistant", f"```python\n{code}```")]
+    entries += [("assistant", f"第{i}条内容\n" * 4) for i in range(12)]
+    renderer.render(entries)
+    root.update()
+    assert "需要保留的用户原文" in widget.get("1.0", "end")
+    block = next(block for block in renderer.blocks if block.code)
+    block.copy.invoke()
+    assert root.clipboard_get() == code.rstrip("\n")
+    widget.yview_moveto(.25)
+    before = widget.yview()[0]
+    renderer.render(entries + [("assistant", "新回复")], preserve_scroll=True)
+    root.update()
+    assert abs(widget.yview()[0] - before) < .05
 
 
 def test_history_restores_result_and_missing_evidence_without_loading(root: tk.Toplevel) -> None:

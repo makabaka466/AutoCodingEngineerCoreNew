@@ -9,6 +9,7 @@ import queue
 import threading
 import time
 import tkinter as tk
+import tkinter.font as tkfont
 import webbrowser
 from collections.abc import Callable
 from datetime import datetime, timedelta
@@ -60,6 +61,7 @@ from autocoding_agent.incident_attachments import (
     IncidentAttachmentStore,
 )
 from autocoding_agent.interfaces.chat_transcript import ChatTranscript, insert_markdown
+from autocoding_agent.interfaces.desktop_theme import COLORS, IconButton, Tooltip
 from autocoding_agent.interfaces.knowledge_management_ui import KnowledgeManagementDialog
 from autocoding_agent.interfaces.system_settings_ui import SystemSettingsDialog
 from autocoding_agent.knowledge_rag.service import (
@@ -80,40 +82,7 @@ from autocoding_agent.workspace_knowledge import (
 
 logger = logging.getLogger("autocoding_agent.desktop")
 
-COLORS = {
-    "window": "#EEF3FA",
-    "ambient": "#E7EFFB",
-    "sidebar": "#F8FAFC",
-    "surface": "#FCFDFE",
-    "surface_subtle": "#F8FAFC",
-    "glass": "#F9FBFE",
-    "glass_floating": "#F5F8FC",
-    "panel": "#F1F5F9",
-    "panel_hover": "#E7EEF8",
-    "input": "#FFFFFF",
-    "border": "#FFFFFF",
-    "border_soft": "#DCE5F0",
-    "border_strong": "#CBD8E8",
-    "shadow": "#D9E3F0",
-    "shadow_soft": "#E5EBF4",
-    "text": "#111827",
-    "muted": "#475569",
-    "subtle": "#94A3B8",
-    "accent": "#2563EB",
-    "accent_hover": "#1D4ED8",
-    "accent_soft": "#EFF6FF",
-    "accent_border": "#BFDBFE",
-    "progress_accent": "#667EEA",
-    "progress_accent_soft": "#F2F3FF",
-    "progress_border": "#D9DCFF",
-    "user": "#EFF6FF",
-    "success": "#15803D",
-    "success_soft": "#F0FDF4",
-    "warning": "#B45309",
-    "warning_soft": "#FFFBEB",
-    "danger": "#DC2626",
-    "danger_soft": "#FEF2F2",
-}
+
 
 
 def _format_query_observation(item: QueryObservation) -> str:
@@ -237,7 +206,11 @@ class GlassPanel(tk.Canvas):
         width = max(self.winfo_width(), self.winfo_reqwidth(), 40)
         height = max(self.winfo_height(), self.winfo_reqheight(), 40)
         self.delete("glass_surface")
-        # Two quiet layers create depth without a hard border or heavy contrast.
+        # 主正文使用平面背景，输入区等圆角容器保留极轻边界。
+        if self._radius == 0:
+            self.itemconfigure(self._content_window, width=max(1, width-self._padding*2),
+                               height=max(1, height-self._padding*2))
+            return
         self.create_polygon(
             _rounded_points(5, 7, width - 2, height - 2, self._radius),
             smooth=True,
@@ -374,7 +347,7 @@ class FlowPill(tk.Canvas):
         super().__init__(
             parent,
             width=116,
-            height=44,
+            height=36,
             bg=parent.cget("bg"),
             highlightthickness=0,
             borderwidth=0,
@@ -489,7 +462,7 @@ class RoundedButton(tk.Canvas):
         super().__init__(
             parent,
             width=requested_width,
-            height=44,
+            height=36,
             bg=parent.cget("bg"),
             highlightthickness=0,
             borderwidth=0,
@@ -590,28 +563,17 @@ class RoundedButton(tk.Canvas):
             foreground = str(self._button_options["disabledforeground"])
         elif self._hovered:
             fill = str(self._button_options["activebackground"])
-        primary = self._button_options["background"] == COLORS["accent"]
         outline = (
-            COLORS["accent"] if self._focused else (fill if primary else COLORS["border_strong"])
+            COLORS["border_strong"] if self._focused else fill
         )
         canvas_width = max(self.winfo_width(), self.winfo_reqwidth())
-        canvas_height = max(self.winfo_height(), 44)
-        if primary and state == "normal":
-            self._rounded_rectangle(
-                4,
-                5,
-                canvas_width - 2,
-                canvas_height - 1,
-                radius=14,
-                fill="#D5E2F7",
-                outline="",
-            )
+        canvas_height = max(self.winfo_height(), 36)
         self._rounded_rectangle(
             2,
             2,
             canvas_width - 2,
             canvas_height - 2,
-            radius=14,
+            radius=10,
             fill=fill,
             outline=outline,
             width=2 if self._focused else 1,
@@ -702,7 +664,12 @@ class DesktopClient:
         self._session_ids: list[str] = []
         self._recent_sessions: list[AgentSession | IncidentSession] = []
         self._trend_counts: list[int] = [0] * 7
-        self._overview_visible = True
+        self._overview_visible = False
+        self._history_hidden: bool | None = None
+        self._review_reading = True
+        self._displayed_conversation = None
+        self._conversation_positions: dict[tuple, float] = {}
+        self.history_search_var = tk.StringVar()
         self._model_ready_cache: bool | None = None
         self._database_ready_cache: bool | None = None
         self._result_queue: queue.Queue[tuple[str, object]] = queue.Queue()
@@ -795,187 +762,142 @@ class DesktopClient:
         self.root.minsize(min(940, width), min(660, height))
 
     def _build_layout(self) -> None:
-        self.root.grid_columnconfigure(0, minsize=286)
-        self.root.grid_columnconfigure(1, weight=1)
+        self.root.grid_columnconfigure(0, minsize=60)
+        self.root.grid_columnconfigure(1, minsize=320)
+        self.root.grid_columnconfigure(2, weight=1)
         self.root.grid_rowconfigure(0, weight=1)
         self._build_sidebar()
         self._build_conversation_area()
 
     def _build_sidebar(self) -> None:
-        self.sidebar_panel = GlassPanel(
-            self.root,
-            fill=COLORS["sidebar"],
-            radius=24,
-            padding=10,
-            width=274,
-        )
-        self.sidebar_panel.grid(
-            row=0,
-            column=0,
-            sticky="nsew",
-            padx=(14, 8),
-            pady=14,
-        )
-        sidebar = self.sidebar_panel.content
-        sidebar.grid_rowconfigure(3, weight=1)
+        rail = tk.Frame(self.root, bg=COLORS["sidebar"], width=60)
+        rail.grid(row=0, column=0, sticky="nsew")
+        rail.grid_columnconfigure(0, weight=1)
+        rail.grid_rowconfigure(5, weight=1)
+        IconButton(rail, "panel", "展开或收起历史", self._toggle_history).grid(row=0, pady=(15, 20))
+        self.development_flow_button = IconButton(
+            rail, "code", "开发", lambda: self._select_flow(FlowKind.DEVELOPMENT))
+        self.development_flow_button.grid(row=1, pady=5)
+        self.incident_flow_button = IconButton(
+            rail, "incident", "异常处理", lambda: self._select_flow(FlowKind.INCIDENT))
+        self.incident_flow_button.grid(row=2, pady=5)
+        self.knowledge_database_button = IconButton(
+            rail, "book", "知识库管理", self._open_knowledge_management)
+        self.knowledge_database_button.grid(row=3, pady=5)
+        IconButton(rail, "chart", "任务概览", self._toggle_overview).grid(row=4, pady=5)
+        self.log_button = IconButton(rail, "log", "本地日志", self._open_log_directory)
+        self.log_button.grid(row=6, pady=5)
+        self.model_config_button = IconButton(
+            rail, "settings", "系统配置", lambda: self._open_system_settings("model"))
+        self.model_config_button.grid(row=7, pady=(5, 16))
+        self.sidebar_panel = tk.Frame(self.root, bg=COLORS["sidebar"], width=320)
+        self.sidebar_panel.grid(row=0, column=1, sticky="nsew")
+        self.sidebar_panel.grid_propagate(False)
+        sidebar = self.sidebar_panel
         sidebar.grid_columnconfigure(0, weight=1)
-
+        sidebar.grid_rowconfigure(5, weight=1)
         brand = tk.Frame(sidebar, bg=COLORS["sidebar"])
-        brand.grid(row=0, column=0, sticky="ew", padx=12, pady=(14, 18))
-        tk.Label(
-            brand, image=self._brand_logo, text="ACE" if self._brand_logo is None else "",
-            font=("Segoe UI", 16, "bold"), bg=COLORS["sidebar"], borderwidth=0,
-        ).pack(side="left", anchor="n")
-        brand_copy = tk.Frame(brand, bg=COLORS["sidebar"])
-        brand_copy.pack(side="left", padx=(10, 0), fill="x", expand=True)
-        tk.Label(
-            brand_copy,
-            text="AutoCoding\nEngineer",
-            font=("Segoe UI Variable Display", 11, "bold"),
-            fg=COLORS["text"],
-            bg=COLORS["sidebar"],
-            justify="left",
-        ).pack(anchor="w")
-        tk.Label(
-            brand_copy,
-            text="LOCAL AGENT WORKSPACE",
-            font=("Segoe UI", 7, "bold"),
-            fg=COLORS["subtle"],
-            bg=COLORS["sidebar"],
-        ).pack(anchor="w", pady=(2, 0))
-
+        brand.grid(row=0, column=0, sticky="ew", padx=20, pady=(22, 20))
+        tk.Label(brand, image=self._brand_logo, text="ACE" if not self._brand_logo else "",
+                 bg=COLORS["sidebar"], font=("Segoe UI", 17, "bold")).pack(side="left")
+        tk.Label(brand, text="ACE", bg=COLORS["sidebar"], fg=COLORS["text"],
+                 font=("Segoe UI", 15, "bold")).pack(side="left", padx=12)
+        self.project_row = tk.Frame(sidebar, bg=COLORS["sidebar"])
+        self.project_row.grid(row=1, column=0, sticky="ew", padx=20, pady=(0, 12))
+        self.project_row.grid_columnconfigure(0, weight=1)
+        tk.Label(self.project_row, text="项目", bg=COLORS["sidebar"], fg=COLORS["muted"],
+                 font=("Microsoft YaHei UI", 9)).grid(row=0, sticky="w", pady=(0, 6))
+        self.project_combo = ttk.Combobox(self.project_row, textvariable=self.project_var,
+                                         state="readonly", width=20,
+                                         font=("Microsoft YaHei UI", 10))
+        self.project_combo.grid(row=1, column=0, sticky="ew", ipady=4)
+        self.project_combo.bind("<<ComboboxSelected>>", self._on_project_selected)
+        Tooltip(self.project_combo, self.project_path_var)
         self.new_task_button = self._button(
-            sidebar,
-            "新建任务",
-            self._new_task,
-            background=COLORS["accent"],
-            active_background=COLORS["accent_hover"],
-            anchor="w",
-        )
-        self.new_task_button.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 22))
-
-        tk.Label(
-            sidebar,
-            text="最近任务",
-            font=("Microsoft YaHei UI", 8, "bold"),
-            fg=COLORS["muted"],
-            bg=COLORS["sidebar"],
-        ).grid(row=2, column=0, sticky="w", padx=12, pady=(2, 9))
-
+            sidebar, "新建对话", self._new_task, background=COLORS["panel"],
+            active_background=COLORS["panel_hover"], anchor="w")
+        self.new_task_button.grid(row=2, column=0, sticky="ew", padx=18, pady=(0, 12))
+        search = tk.Frame(sidebar, bg=COLORS["sidebar"])
+        search.grid(row=3, column=0, sticky="ew", padx=18, pady=(0, 18))
+        search.grid_columnconfigure(1, weight=1)
+        IconButton(search, "search", "搜索当前项目的对话",
+                   lambda: self.history_search.focus_set()).grid(row=0, column=0)
+        self.history_search = tk.Entry(search, textvariable=self.history_search_var,
+                                      bg=COLORS["sidebar"], fg=COLORS["text"], relief="flat",
+                                      font=("Microsoft YaHei UI", 10), width=1)
+        self.history_search.grid(row=0, column=1, sticky="ew", padx=5)
+        self.history_search_hint = tk.Label(
+            self.history_search, text="搜索对话", bg=COLORS["sidebar"], fg=COLORS["subtle"],
+            font=("Microsoft YaHei UI", 10), cursor="xterm")
+        self.history_search_hint.place(x=2, y=0)
+        self.history_search_hint.bind("<Button-1>", lambda _: self.history_search.focus_set())
+        self.history_search.bind("<FocusIn>", lambda _: self.history_search_hint.place_forget())
+        self.history_search.bind("<FocusOut>", lambda _: self._filter_history())
+        Tooltip(self.history_search, "搜索对话标题 · 清空后恢复全部历史")
+        self.history_search_var.trace_add("write", lambda *_: self._filter_history())
+        tk.Label(sidebar, text="最近对话", fg=COLORS["muted"], bg=COLORS["sidebar"],
+                 font=("Microsoft YaHei UI", 9)).grid(row=4, sticky="w", padx=22, pady=(0, 8))
         sessions_frame = tk.Frame(sidebar, bg=COLORS["sidebar"])
-        sessions_frame.grid(row=3, column=0, sticky="nsew", padx=(7, 3), pady=(0, 12))
-        sessions_frame.grid_rowconfigure(0, weight=1)
+        sessions_frame.grid(row=5, sticky="nsew", padx=(16, 8), pady=(0, 16))
         sessions_frame.grid_columnconfigure(0, weight=1)
+        sessions_frame.grid_rowconfigure(0, weight=1)
         self.sessions_list = tk.Listbox(
-            sessions_frame,
-            bg=COLORS["sidebar"],
-            fg=COLORS["text"],
-            selectbackground="#E3EDFF",
-            selectforeground=COLORS["text"],
-            borderwidth=0,
-            highlightthickness=0,
-            font=("Microsoft YaHei UI", 9),
-            activestyle="none",
-            exportselection=False,
-            selectborderwidth=0,
-        )
+            sessions_frame, bg=COLORS["sidebar"], fg=COLORS["text"],
+            selectbackground=COLORS["panel_hover"], selectforeground=COLORS["text"],
+            borderwidth=0, highlightthickness=0, font=("Microsoft YaHei UI", 11),
+            activestyle="none", exportselection=False, selectborderwidth=0, width=1)
         self.sessions_list.grid(row=0, column=0, sticky="nsew")
         self.sessions_list.bind("<<ListboxSelect>>", self._select_session)
-        sidebar_scroll = ttk.Scrollbar(
-            sessions_frame, orient="vertical", command=self.sessions_list.yview
-        )
-        sidebar_scroll.grid(row=0, column=1, sticky="ns")
-        self.sessions_list.configure(yscrollcommand=sidebar_scroll.set)
-
-        self.model_config_button = self._button(
-            sidebar,
-            "系统配置",
-            lambda: self._open_system_settings("model"),
-            background=COLORS["panel"],
-            active_background=COLORS["panel_hover"],
-            anchor="w",
-        )
-        self.model_config_button.grid(row=4, column=0, sticky="ew", padx=8, pady=(2, 6))
-
-        self.knowledge_database_button = self._button(
-            sidebar,
-            "知识库管理",
-            self._open_knowledge_management,
-            background=COLORS["panel"],
-            active_background=COLORS["panel_hover"],
-            anchor="w",
-        )
-        self.knowledge_database_button.grid(row=5, column=0, sticky="ew", padx=8, pady=(0, 6))
-
-        self.log_button = self._button(
-            sidebar,
-            "本地日志",
-            self._open_log_directory,
-            background=COLORS["panel"],
-            active_background=COLORS["panel_hover"],
-            anchor="w",
-        )
-        self.log_button.grid(row=6, column=0, sticky="ew", padx=8, pady=(0, 8))
-
-        tk.Label(
-            sidebar,
-            text="本地运行 · 可审计 · 可恢复",
-            font=("Microsoft YaHei UI", 8),
-            fg=COLORS["muted"],
-            bg=COLORS["sidebar"],
-        ).grid(row=7, column=0, sticky="w", padx=10, pady=(7, 8))
+        scroll = ttk.Scrollbar(sessions_frame, orient="vertical", command=self.sessions_list.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
+        self.sessions_list.configure(yscrollcommand=scroll.set)
+        tk.Label(sidebar, text="本地工作空间", fg=COLORS["subtle"], bg=COLORS["sidebar"],
+                 font=("Microsoft YaHei UI", 9)).grid(row=6, sticky="w", padx=22, pady=(0, 20))
 
     def _build_conversation_area(self) -> None:
         main = tk.Frame(self.root, bg=COLORS["window"])
-        main.grid(row=0, column=1, sticky="nsew", padx=(0, 14), pady=14)
+        main.grid(row=0, column=2, sticky="nsew", padx=0, pady=0)
         main.grid_columnconfigure(0, weight=1)
-        main.grid_columnconfigure(1, minsize=320)
+        main.grid_columnconfigure(1, minsize=0)
         main.grid_rowconfigure(1, weight=1)
         self.main_frame = main
 
         self.header_panel = GlassPanel(
             main,
             fill=COLORS["glass"],
-            radius=24,
-            padding=14,
-            height=112,
+            radius=0,
+            padding=10,
+            height=68,
         )
         self.header_panel.grid(row=0, column=0, columnspan=2, sticky="ew")
         header = self.header_panel.content
         header.grid_columnconfigure(0, weight=1)
         title_group = tk.Frame(header, bg=COLORS["glass"])
         title_group.grid(row=0, column=0, sticky="w", padx=(10, 12), pady=(6, 4))
-        tk.Label(
-            title_group,
-            textvariable=self.flow_caption_var,
-            font=("Segoe UI Variable Text", 8, "bold"),
-            fg=COLORS["muted"],
-            bg=COLORS["glass"],
-            anchor="w",
-        ).pack(anchor="w")
-        tk.Label(
-            title_group,
-            textvariable=self.task_title_var,
-            font=("Microsoft YaHei UI", 17, "bold"),
-            fg=COLORS["text"],
-            bg=COLORS["glass"],
-            anchor="w",
-        ).pack(anchor="w", pady=(2, 0))
-        flow_selector = tk.Frame(header, bg=COLORS["glass"])
-        flow_selector.grid(row=0, column=1, padx=(12, 12), pady=4)
-        self.development_flow_button = FlowPill(
-            flow_selector,
-            "开发",
-            lambda: self._select_flow(FlowKind.DEVELOPMENT),
-            selected=True,
-        )
-        self.development_flow_button.grid(row=0, column=0, padx=(0, 5))
-        self.incident_flow_button = FlowPill(
-            flow_selector,
-            "异常处理",
-            lambda: self._select_flow(FlowKind.INCIDENT),
-        )
-        self.incident_flow_button.grid(row=0, column=1)
+        title_label = tk.Label(
+            title_group, textvariable=self.task_title_var,
+            font=("Microsoft YaHei UI", 11, "bold"), fg=COLORS["text"],
+            bg=COLORS["glass"], anchor="w", width=1)
+        title_label.pack(fill="x", expand=True)
+        title_group.grid_configure(sticky="ew")
+        Tooltip(title_label, self.task_title_var)
+        title_label.configure(textvariable="")
+
+        def fit_title(_event=None):
+            title = self.task_title_var.get()
+            font = tkfont.Font(font=title_label.cget("font"))
+            limit = max(80, title_label.winfo_width()-4)
+            while font.measure(title) > limit and len(title) > 1:
+                title = title[:-2] + "…"
+            title_label.configure(text=title)
+
+        title_label.bind("<Configure>", fit_title)
+        self.task_title_var.trace_add("write", lambda *_: fit_title())
+        self.review_toggle = self._button(
+            header, "查看对话", self._toggle_review, background=COLORS["surface"],
+            active_background=COLORS["panel_hover"])
+        self.review_toggle.grid(row=0, column=1, padx=8)
+        self.review_toggle.grid_remove()
         self.status_badge = tk.Label(
             header,
             text="就绪",
@@ -992,15 +914,15 @@ class DesktopClient:
         self.transcript_panel = GlassPanel(
             main,
             fill=COLORS["glass"],
-            radius=24,
-            padding=12,
+            radius=0,
+            padding=6,
         )
         self.transcript_panel.grid(
             row=1,
             column=0,
             sticky="nsew",
-            padx=(0, 14),
-            pady=(14, 0),
+            padx=(20, 20),
+            pady=(0, 0),
         )
         transcript_frame = self.transcript_panel.content
         transcript_frame.grid_rowconfigure(1, weight=1)
@@ -1016,11 +938,14 @@ class DesktopClient:
             ("展开全部", lambda: self._chat_renderer.expand_all()),
             ("最新回应", lambda: self.transcript.yview("latest_reply")),
         ):
-            tk.Button(
+            toolbar_button = tk.Button(
                 chat_toolbar, text=label, command=action, relief="flat", borderwidth=0,
-                bg=COLORS["surface"], fg=COLORS["accent"], cursor="hand2",
+                bg=COLORS["surface"], fg=COLORS["muted"], cursor="hand2",
                 font=("Microsoft YaHei UI", 9), padx=8, pady=3,
-            ).pack(side="right")
+            )
+            toolbar_button.pack(side="right")
+            if label == "最新回应":
+                self.latest_reply_button = toolbar_button
 
         self.activity_frame = tk.Frame(
             transcript_frame,
@@ -1102,9 +1027,10 @@ class DesktopClient:
             font=("Microsoft YaHei UI", 8),
             fg=COLORS["muted"],
             bg=COLORS["progress_accent_soft"],
-            anchor="w",
+            anchor="nw",
             justify="left",
             wraplength=560,
+            height=2,
         )
         self.workflow_detail_label.grid(
             row=1,
@@ -1114,6 +1040,7 @@ class DesktopClient:
             padx=14,
             pady=(0, 8),
         )
+        Tooltip(self.workflow_detail_label, self.workflow_detail_var)
         self.activity_frame.bind(
             "<Configure>",
             lambda event: self.workflow_detail_label.configure(
@@ -1241,30 +1168,32 @@ class DesktopClient:
 
         self.approval_frame = tk.Frame(
             main,
-            bg=COLORS["warning_soft"],
+            bg=COLORS["surface"],
             highlightthickness=1,
-            highlightbackground="#FDE68A",
+            highlightbackground=COLORS["border_soft"],
         )
         self.approval_frame.grid_columnconfigure(0, weight=1)
+        self.approval_frame.grid_rowconfigure(1, weight=1)
         self.approval_title = tk.Label(
             self.approval_frame,
             text="修改方案",
             anchor="w",
             font=("Microsoft YaHei UI", 10, "bold"),
             fg=COLORS["warning"],
-            bg=COLORS["warning_soft"],
+            bg=COLORS["surface"],
         )
         self.approval_title.grid(row=0, column=0, columnspan=2, sticky="ew", padx=16, pady=(12, 5))
         self.approval_text = tk.Text(
             self.approval_frame,
             height=9,
+            width=1,
             wrap="word",
             relief="flat",
             borderwidth=0,
             highlightthickness=0,
-            font=("Microsoft YaHei UI", 9),
+            font=("Microsoft YaHei UI", 11),
             fg=COLORS["text"],
-            bg=COLORS["warning_soft"],
+            bg=COLORS["surface"],
             insertbackground=COLORS["text"],
             padx=10,
             pady=6,
@@ -1276,15 +1205,15 @@ class DesktopClient:
         approval_scroll.grid(row=1, column=1, sticky="ns", padx=(0, 8))
         self.approval_text.configure(yscrollcommand=approval_scroll.set, state="disabled")
 
-        approval_actions = tk.Frame(self.approval_frame, bg=COLORS["warning_soft"])
+        approval_actions = tk.Frame(self.approval_frame, bg=COLORS["surface"])
         approval_actions.grid(row=2, column=0, columnspan=2, sticky="ew", padx=10, pady=(7, 11))
         approval_actions.grid_columnconfigure(0, weight=1)
         self.reject_button = self._button(
             approval_actions,
             "拒绝或调整",
             self._reject,
-            background="#FEF3C7",
-            active_background="#FDE68A",
+            background=COLORS["panel"],
+            active_background=COLORS["panel_hover"],
         )
         self.reject_button.grid(row=0, column=1, padx=4)
         self.approve_button = self._button(
@@ -1307,15 +1236,15 @@ class DesktopClient:
             main,
             fill=COLORS["input"],
             radius=24,
-            padding=12,
+            padding=8,
             autosize_height=True,
         )
         self.composer_panel.grid(
             row=3,
             column=0,
             sticky="ew",
-            padx=(0, 14),
-            pady=(14, 10),
+            padx=(28, 28),
+            pady=(8, 10),
         )
         self.composer_frame = self.composer_panel.content
         self.composer_frame.grid_columnconfigure(0, weight=1)
@@ -1323,21 +1252,6 @@ class DesktopClient:
         composer_header = tk.Frame(self.composer_frame, bg=COLORS["input"])
         composer_header.grid(row=0, column=0, sticky="ew", padx=14, pady=(12, 4))
         composer_header.grid_columnconfigure(0, weight=1)
-        tk.Label(
-            composer_header,
-            text="任务上下文",
-            font=("Microsoft YaHei UI", 9, "bold"),
-            fg=COLORS["text"],
-            bg=COLORS["input"],
-        ).grid(row=0, column=0, sticky="w")
-        tk.Label(
-            composer_header,
-            text="Agent 会先调查并给出方案，再申请修改权限",
-            font=("Microsoft YaHei UI", 8),
-            fg=COLORS["muted"],
-            bg=COLORS["input"],
-        ).grid(row=0, column=1, sticky="e")
-
         incident_actions = tk.Frame(composer_header, bg=COLORS["input"])
         self.incident_actions = incident_actions
         incident_actions.grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
@@ -1354,39 +1268,9 @@ class DesktopClient:
         self.incident_details_button.grid(row=0, column=1)
         self.incident_details_button.grid_remove()
 
-        project_row = tk.Frame(self.composer_frame, bg=COLORS["input"])
-        self.project_row = project_row
-        project_row.grid(row=1, column=0, sticky="ew", padx=14, pady=(4, 4))
-        project_row.grid_columnconfigure(2, weight=1)
-        tk.Label(
-            project_row,
-            text="项目",
-            font=("Microsoft YaHei UI", 8, "bold"),
-            fg=COLORS["muted"],
-            bg=COLORS["input"],
-        ).grid(row=0, column=0, sticky="w", padx=(0, 9))
-        self.project_combo = ttk.Combobox(
-            project_row,
-            textvariable=self.project_var,
-            state="readonly",
-            width=20,
-            font=("Microsoft YaHei UI", 9),
-        )
-        self.project_combo.grid(row=0, column=1, sticky="w", ipady=5)
-        self.project_combo.bind("<<ComboboxSelected>>", self._on_project_selected)
-        tk.Label(
-            project_row,
-            textvariable=self.project_path_var,
-            width=1,
-            font=("Microsoft YaHei UI", 8),
-            fg=COLORS["muted"],
-            bg=COLORS["input"],
-            anchor="w",
-        ).grid(row=0, column=2, sticky="ew", padx=(12, 0))
-
         self.prompt_input = tk.Text(
             self.composer_frame,
-            height=4,
+            height=2,
             bg=COLORS["input"],
             fg=COLORS["text"],
             insertbackground=COLORS["text"],
@@ -1398,9 +1282,6 @@ class DesktopClient:
             padx=12,
             pady=10,
             undo=True,
-        )
-        tk.Frame(self.composer_frame, bg=COLORS["border"], height=1).grid(
-            row=2, column=0, sticky="ew", padx=14, pady=(5, 0)
         )
         self.prompt_input.grid(row=3, column=0, sticky="ew", padx=2)
         self.prompt_placeholder = tk.Label(
@@ -1419,6 +1300,12 @@ class DesktopClient:
         self.prompt_input.bind("<Return>", self._on_return)
         self.prompt_input.bind("<Control-Return>", self._on_control_return)
         self.prompt_input.bind("<<Paste>>", self._on_prompt_paste, add="+")
+        self.prompt_input.bind("<<Modified>>", self._resize_prompt, add="+")
+        self.prompt_input.bind("<Configure>", self._resize_prompt, add="+")
+        self.prompt_input.bind("<FocusIn>", lambda _: self.composer_panel.configure(
+            highlightthickness=1, highlightbackground=COLORS["border_strong"]), add="+")
+        self.prompt_input.bind("<FocusOut>", lambda _: self.composer_panel.configure(
+            highlightthickness=0), add="+")
 
         self.attachment_frame = tk.Frame(self.composer_frame, bg=COLORS["accent_soft"])
         self.attachment_frame.grid(row=4, column=0, sticky="ew", padx=14, pady=(0, 6))
@@ -1450,13 +1337,16 @@ class DesktopClient:
         action_row = tk.Frame(self.composer_frame, bg=COLORS["input"])
         action_row.grid(row=5, column=0, sticky="ew", padx=12, pady=(0, 11))
         action_row.grid_columnconfigure(0, weight=1)
-        tk.Label(
-            action_row,
-            text="Enter 发送 · Shift+Enter 换行 · 修改与验证会单独请求授权",
-            font=("Microsoft YaHei UI", 8),
-            fg=COLORS["muted"],
-            bg=COLORS["input"],
-        ).grid(row=0, column=0, sticky="w")
+        self.context_button = IconButton(
+            action_row, "more", "上下文与版本操作", self._show_context_menu)
+        self.context_button.grid(row=0, column=0, sticky="w")
+        self.model_shortcut = tk.Button(
+            action_row, text="模型设置",
+            command=lambda: self._open_system_settings("model"), bg=COLORS["input"],
+            fg=COLORS["muted"], relief="flat", bd=0, font=("Microsoft YaHei UI", 9),
+            cursor="hand2")
+        self.model_shortcut.grid(row=0, column=1, sticky="e", padx=8)
+        Tooltip(self.model_shortcut, "当前模型配置 · 点击打开设置")
         self.send_button = self._button(
             action_row,
             "发送任务",
@@ -1464,31 +1354,33 @@ class DesktopClient:
             background=COLORS["accent"],
             active_background=COLORS["accent_hover"],
         )
-        self.send_button.grid(row=0, column=1, sticky="e")
+        self.send_button.grid(row=0, column=2, sticky="e")
         self.stop_button = self._button(
             action_row, "停止", self._request_stop,
             background="#FBE8E6", active_background="#F4D4CF",
         )
-        self.stop_button.grid(row=0, column=4, padx=(8, 0))
+        self.stop_button.grid(row=0, column=2, sticky="e")
+        self.stop_button.grid_remove()
         self.stop_button.configure(state="disabled")
         self.git_sync_button = self._button(
             action_row, "更新代码", self._sync_git,
             background="#E8EEF9", active_background="#D8E4F7",
         )
-        self.git_sync_button.grid(row=0, column=2, padx=(8, 0))
+        # 版本操作保留命令与权限状态，通过上下文菜单访问。
         self.git_publish_button = self._button(
             action_row, "提交并推送", self._publish_git,
             background="#E8EEF9", active_background="#D8E4F7",
         )
-        self.git_publish_button.grid(row=0, column=3, padx=(8, 0))
+
 
         self._build_overview_panel(main)
+        self.overview_panel.grid_remove()
 
         self.footer_panel = GlassPanel(
             main,
             fill=COLORS["glass_floating"],
-            radius=18,
-            padding=8,
+            radius=0,
+            padding=0,
             autosize_height=True,
         )
         self.footer_panel.grid(
@@ -1507,14 +1399,14 @@ class DesktopClient:
             fg=COLORS["muted"],
             bg=COLORS["glass_floating"],
             anchor="w",
-        ).grid(row=0, column=0, sticky="w", padx=(12, 8), pady=7)
+        ).grid(row=0, column=0, sticky="w", padx=(12, 8), pady=2)
         tk.Label(
             footer,
             text="本地执行 · 过程可追溯 · 中断可恢复",
             font=("Microsoft YaHei UI", 8),
             fg=COLORS["muted"],
             bg=COLORS["glass_floating"],
-        ).grid(row=0, column=1, sticky="e", padx=(8, 12), pady=7)
+        ).grid(row=0, column=1, sticky="e", padx=(8, 12), pady=2)
 
     def _build_overview_panel(self, main: tk.Frame) -> None:
         """Build a real-data operational overview inspired by the visual reference."""
@@ -1714,7 +1606,9 @@ class DesktopClient:
 
         if self._model_ready_cache is None:
             try:
-                self._model_ready_cache = self.setup_service.inspect().ready
+                model_state = self.setup_service.inspect()
+                self._model_ready_cache = model_state.ready
+                self.model_shortcut.configure(text=model_state.model[:28] or "模型设置")
             except Exception:
                 self._model_ready_cache = False
         model_ready = self._model_ready_cache
@@ -1787,24 +1681,122 @@ class DesktopClient:
                 font=("Segoe UI", 7),
             )
 
-    def _update_responsive_layout(self, event: tk.Event[tk.Misc]) -> None:
-        if event.widget is not self.root or not hasattr(self, "overview_panel"):
+    def _toggle_history(self) -> None:
+        self._history_hidden = bool(self.sidebar_panel.winfo_manager())
+        self._update_responsive_layout()
+
+    def _toggle_overview(self) -> None:
+        self._overview_visible = not self._overview_visible
+        self._update_responsive_layout()
+
+    def _toggle_review(self) -> None:
+        self._review_reading = not self._review_reading
+        self._update_responsive_layout()
+
+    def _update_responsive_layout(self, event=None) -> None:
+        if event is not None and event.widget is not self.root:
             return
-        self._sync_controls()
-        should_show = event.width >= 1180
-        if should_show == self._overview_visible:
+        if not hasattr(self, "overview_panel"):
             return
-        self._overview_visible = should_show
-        if should_show:
-            self.main_frame.grid_columnconfigure(1, minsize=320)
-            self.overview_panel.grid()
-            self.header_panel.grid_configure(columnspan=2)
-            self.footer_panel.grid_configure(columnspan=2)
+        width = self.root.winfo_width()
+        hidden = self._history_hidden if self._history_hidden is not None else width < 1100
+        if hidden:
+            self.sidebar_panel.grid_remove()
         else:
-            self.overview_panel.grid_remove()
-            self.main_frame.grid_columnconfigure(1, minsize=0)
-            self.header_panel.grid_configure(columnspan=1)
-            self.footer_panel.grid_configure(columnspan=1)
+            self.sidebar_panel.grid()
+        self.root.grid_columnconfigure(1, minsize=0 if hidden else 320)
+        available = width - 60 - (0 if hidden else 320)
+        inset = max(22, (available - 1000) // 2)
+        self.composer_panel.grid_configure(columnspan=2, padx=inset)
+        self.transcript_panel.grid_configure(padx=inset)
+        self.header_panel.grid_configure(columnspan=2)
+        self.footer_panel.grid_configure(columnspan=2)
+        self.overview_panel.grid_remove()
+        self.main_frame.grid_columnconfigure(0, weight=1)
+        self.main_frame.grid_columnconfigure(1, weight=0, minsize=0)
+        if self.approval_frame.winfo_manager():
+            self.review_toggle.grid()
+            self.review_toggle.configure(text="查看对话" if self._review_reading else "查看方案")
+            if available >= 1150:
+                self.review_toggle.grid_remove()
+                self.transcript_panel.grid()
+                self.transcript_panel.grid_configure(padx=16)
+                self.main_frame.grid_columnconfigure(0, weight=4)
+                self.main_frame.grid_columnconfigure(1, weight=6)
+                self.approval_frame.grid_configure(row=1, column=1, sticky="nsew",
+                                                   padx=(8, 24), pady=8)
+            else:
+                self.approval_frame.grid_configure(row=1, column=0, sticky="nsew",
+                                                   padx=inset, pady=8)
+                if self._review_reading:
+                    self.transcript_panel.grid_remove()
+                else:
+                    self.transcript_panel.grid()
+                    tk.Misc.tkraise(self.transcript_panel)
+        else:
+            self.review_toggle.grid_remove()
+            self.transcript_panel.grid()
+            if self._overview_visible and available >= 900:
+                self.overview_panel.grid()
+                self.main_frame.grid_columnconfigure(1, minsize=320)
+        if hasattr(self, "_chat_renderer"):
+            self._chat_renderer.resize()
+
+    def _resize_prompt(self, _event=None) -> None:
+        # 只改变输入展示尺寸；保留正文、快捷键和发送协议。
+        if self.prompt_input.edit_modified():
+            self.prompt_input.edit_modified(False)
+        try:
+            rows = self.prompt_input.count("1.0", "end", "displaylines")
+            height = max(2, min(7, rows[0] if rows else 2))
+            if int(self.prompt_input.cget("height")) != height:
+                self.prompt_input.configure(height=height)
+        except tk.TclError:
+            return
+        if self.prompt_input.get("1.0", "end-1c"):
+            self.prompt_placeholder.place_forget()
+
+    def _show_context_menu(self) -> None:
+        menu = tk.Menu(self.root, tearoff=False)
+        if self.flow == FlowKind.INCIDENT:
+            menu.add_command(label="粘贴截图", command=lambda: self._on_prompt_paste(None),
+                             state="disabled" if self._busy else "normal")
+            menu.add_separator()
+        for label, button in (("更新代码", self.git_sync_button),
+                              ("提交并推送", self.git_publish_button)):
+            menu.add_command(label=label, command=button.invoke, state=button.cget("state"))
+        menu.add_separator()
+        menu.add_command(label="项目知识", command=self._open_knowledge_management,
+                         state="disabled" if self._busy else "normal")
+        try:
+            menu.tk_popup(self.context_button.winfo_rootx(), self.context_button.winfo_rooty())
+        finally:
+            menu.grab_release()
+
+    def _filter_history(self) -> None:
+        if not hasattr(self, "sessions_list"):
+            return
+        query = self.history_search_var.get().strip().casefold()
+        if not query and self.root.focus_get() != self.history_search:
+            self.history_search_hint.place(x=2, y=0)
+        else:
+            self.history_search_hint.place_forget()
+        sessions = [item for item in self._recent_sessions if not query or query in
+                    (item.goal if isinstance(item, AgentSession) else item.problem).casefold()]
+        self.sessions_list.delete(0, "end")
+        self._session_ids = [item.id for item in sessions]
+        title_font = tkfont.Font(font=self.sessions_list.cget("font"))
+        for session in sessions:
+            title = " ".join((session.goal if isinstance(session, AgentSession)
+                              else session.problem).split()) or "未命名对话"
+            label = title
+            while title_font.measure(label) > 230 and len(label) > 1:
+                label = label[:-2] + "…"
+            self.sessions_list.insert("end", label)
+        if self.session_id in self._session_ids:
+            index = self._session_ids.index(self.session_id)
+            self.sessions_list.selection_set(index)
+            self.sessions_list.see(index)
 
     @staticmethod
     def _button(
@@ -1978,20 +1970,14 @@ class DesktopClient:
         if self.flow == FlowKind.INCIDENT:
             self.task_title_var.set("新异常诊断")
             message = (
-                "你好，我会协助定位和诊断应用异常。\n\n"
-                "请描述页面标题或页面路径及异常现象，也可以直接粘贴异常截图。我会先理解你的"
-                "对话内容，再分析图片中的页面标题和异常区域；如果对话与图片都无法可靠定位，"
-                "或候选页面与图片明显不一致，我会请你确认，不会扫描全部页面。项目路径和只读"
-                "数据库连接来自系统配置；需要业务数据时会使用系统"
-                "配置中的共用只读连接；当前流程不会修改文件或数据库。"
+                "描述问题，一起找到原因。\n\n"
+                "输入异常现象、相关入口，或粘贴截图。ACE 会先理解你的对话内容，"
+                "再结合代码与数据进行只读调查。"
             )
         else:
             self.task_title_var.set("新开发任务")
-            message = (
-                "你好，我是 AutoCoding Engineer。\n\n"
-                "项目路径来自系统配置。请描述要调查、修改或验证的开发任务。"
-                "如果需求还不够清楚，我会先向你确认最关键的信息。"
-            )
+            message = ("从一个需求开始。\n\n描述你的目标和约束，ACE 会调查代码，"
+                       "并在修改前提交方案供你审阅。")
         self._replace_transcript(
             [
                 (
@@ -2053,7 +2039,10 @@ class DesktopClient:
             if details:
                 entries.append(("metadata", "\n".join(details)))
 
-        self._replace_transcript(entries)
+        self._replace_transcript(
+            entries, timestamps=[item.created_at.astimezone().strftime("%H:%M")
+                                 for item in session.messages],
+        )
         self._restore_session_project(session)
         title = " ".join(session.goal.split()) or "未命名任务"
         self.task_title_var.set(title[:64] + ("…" if len(title) > 64 else ""))
@@ -2160,7 +2149,10 @@ class DesktopClient:
             if details:
                 entries.append(("metadata", "\n".join(details)))
 
-        self._replace_transcript(entries)
+        self._replace_transcript(
+            entries, timestamps=[item.created_at.astimezone().strftime("%H:%M")
+                                 for item in session.messages],
+        )
         self._restore_session_project(session)
         title = " ".join(session.problem.split()) or "未命名异常"
         self.task_title_var.set(title[:64] + ("…" if len(title) > 64 else ""))
@@ -2253,12 +2245,28 @@ class DesktopClient:
         names = "、".join(str(item.name) for item in attachments)
         return f"{content}\n[异常截图：{names}]"
 
-    def _replace_transcript(self, entries: list[tuple[str, str]]) -> None:
+    def _replace_transcript(
+        self, entries: list[tuple[str, str]], *, timestamps: list[str] | None = None,
+    ) -> None:
         if not hasattr(self, "_chat_renderer"):
             self._chat_renderer = ChatTranscript(self.transcript)
+        self._chat_renderer.timestamps = timestamps or []
+        key = (self.flow, self.session_id)
+        previous = self._displayed_conversation
+        if previous is not None and previous != key:
+            self._conversation_positions[previous] = self.transcript.yview()[0]
+        if (previous == key and entries != self._chat_renderer.entries
+                and self.transcript.yview()[1] < .98):
+            self.latest_reply_button.configure(text="有新内容 ↓")
+        else:
+            self.latest_reply_button.configure(text="最新回应")
+        self._displayed_conversation = key
         self._chat_renderer.render(
             entries, details_open=self.flow == FlowKind.INCIDENT and self._show_incident_details,
+            preserve_scroll=previous == key or key in self._conversation_positions,
         )
+        if previous != key and key in self._conversation_positions:
+            self.transcript.yview_moveto(self._conversation_positions[key])
 
     def _load_recent_sessions(self, select_current: bool = False) -> None:
         try:
@@ -2268,22 +2276,8 @@ class DesktopClient:
             return
         project = next((p for p in self.projects if p.id == self._flow_projects[self.flow]), None)
         sessions = [s for s in sessions if project and project.owns(s.project, s.workspace)]
-        self.sessions_list.delete(0, "end")
-        self._session_ids = [item.id for item in sessions]
         self._refresh_overview(sessions)
-        for session in sessions:
-            # Listbox has no multiline row spacing, so keep one readable line per task.
-            label = (
-                session_list_label(session, max_length=14)
-                if isinstance(session, AgentSession)
-                else incident_session_list_label(session, max_length=14)
-            )
-            self.sessions_list.insert("end", label.replace("\n", "  "))
-        if select_current and self.session_id in self._session_ids:
-            index = self._session_ids.index(self.session_id)
-            self.sessions_list.selection_clear(0, "end")
-            self.sessions_list.selection_set(index)
-            self.sessions_list.see(index)
+        self._filter_history()
 
     def _select_session(self, _event: tk.Event[tk.Misc]) -> None:
         if self._busy:
@@ -2675,10 +2669,9 @@ class DesktopClient:
         attachments: list[MessageAttachment] | None = None,
     ) -> None:
         attachment_note = f"\n[已附加 {len(attachments)} 张异常截图]" if attachments else ""
-        self.transcript.configure(state="normal")
-        self.transcript.insert("end", "你\n", "user_name")
-        self.transcript.insert("end", f"{message}{attachment_note}\n\n", "message")
-        self.transcript.configure(state="disabled")
+        entries = list(self._chat_renderer.entries) if hasattr(self, "_chat_renderer") else []
+        entries.append(("user", message + attachment_note))
+        self._replace_transcript(entries)
         self.transcript.see("end")
 
     def _focus_transcript(self, _event: tk.Event[tk.Text]) -> None:
@@ -3163,16 +3156,8 @@ class DesktopClient:
             and not self._busy
             and self._current_status == AgentStatus.APPROVAL_REQUIRED
         )
-        # 审阅时上下文已固定，把空间留给方案；输入仍可用于拒绝或调整。
-        reviewing = (
-            self.flow == FlowKind.DEVELOPMENT
-            and self._current_status == AgentStatus.APPROVAL_REQUIRED
-        )
-        compact = self.root.winfo_height() < 780
-        input_height = 1 if reviewing else (2 if compact or self.session_id else 4)
-        self.prompt_input.configure(height=input_height)
-        self.approval_text.configure(height=5 if compact else 9)
-        self.project_row.grid()
+        self._resize_prompt()
+        self.approval_text.configure(height=12)
         self.new_task_button.configure(state="normal" if can_start_new else "disabled")
         self.project_combo.configure(state="readonly" if can_choose_project else "disabled")
         recovery_state = False
@@ -3204,6 +3189,15 @@ class DesktopClient:
             self.recovery_replan_button.configure(state="normal")
         else:
             self.recovery_replan_button.configure(state="disabled")
+        if self._busy and self._task_operation:
+            self.send_button.grid_remove()
+            self.stop_button.grid()
+        else:
+            self.stop_button.grid_remove()
+            self.send_button.grid()
+        self.model_shortcut.configure(state="disabled" if self._busy else "normal")
+        self.history_search.configure(state="disabled" if self._busy else "normal")
+        self._update_responsive_layout()
         self.sessions_list.configure(state="normal" if not self._busy else "disabled")
         self.model_config_button.configure(state="normal" if not self._busy else "disabled")
         self.knowledge_database_button.configure(state="normal" if not self._busy else "disabled")
@@ -3253,6 +3247,7 @@ class DesktopClient:
                 padx=(0, 14),
                 pady=(10, 0),
             )
+            self._update_responsive_layout()
             return
         if approval is None:
             self._hide_approval()
@@ -3295,6 +3290,7 @@ class DesktopClient:
             padx=(0, 14),
             pady=(10, 0),
         )
+        self._update_responsive_layout()
 
     def _show_incident_recovery(self, session: IncidentSession) -> None:
         self._approval_can_execute = True
@@ -3319,12 +3315,15 @@ class DesktopClient:
             padx=(0, 14),
             pady=(10, 0),
         )
+        self._update_responsive_layout()
 
     def _hide_approval(self) -> None:
         self._approval_can_execute = True
         self.recovery_replan_button.grid_remove()
         self.approve_button.grid_configure(column=2)
         self.approval_frame.grid_remove()
+        self._review_reading = True
+        self._update_responsive_layout()
 
     def _focus_prompt(self, _event: tk.Event[tk.Misc]) -> None:
         self.prompt_input.focus_set()
