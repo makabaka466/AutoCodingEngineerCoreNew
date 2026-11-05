@@ -65,6 +65,7 @@ from autocoding_agent.core.runtime.models import (
 from autocoding_agent.core.runtime_lifecycle import RuntimeLifecycle, merge_usage
 from autocoding_agent.core.search_policy import (
     MAX_SEARCH_REPAIR_ROUNDS,
+    search_policy_pause_message,
     search_policy_repair_prompt,
 )
 from autocoding_agent.core.state_machine.machine import AgentStateMachine
@@ -890,6 +891,11 @@ class AgentEngine:
                     session.updated_at = utc_now()
                     self.sessions.save(session)
                     continue
+                if isinstance(exc, RuntimePolicyBlockedError) and mode == AgentMode.INSPECT:
+                    return self._pause_at_boundary(
+                        session, command,
+                        message=search_policy_pause_message(exc.operation, exc.reason),
+                    )
                 if mode == AgentMode.IMPLEMENT:
                     self._try_record_post_implementation(session, command.id)
                 if mode in {AgentMode.IMPLEMENT, AgentMode.VERIFY}:

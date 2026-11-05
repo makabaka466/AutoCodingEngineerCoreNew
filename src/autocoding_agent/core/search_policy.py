@@ -242,7 +242,21 @@ def search_policy_repair_prompt(operation: str, reason: str) -> str:
         "directory Grep, include a language-appropriate glob or type plus head_limit 1..100; "
         "prefer an exact known file whenever possible. Continue the same investigation after the "
         "corrected read-only search. For a missing file, verify its name inside the original "
-        "candidate scope; never guess a replacement directory or broaden the search."
+        "candidate scope; never guess a replacement directory or broaden the search. "
+        "Read a user-supplied source file first, then follow its concrete dependencies. "
+        "For root Grep, target a known file/subdirectory, not only a language filter. "
+        "For broad Glob, use a known filename/class in its candidate subtree. "
+        "A blocked search is an internal tool issue, not a need for another path or screenshot."
+    )
+
+
+def search_policy_pause_message(operation: str, reason: str) -> str:
+    """两条只读流程共用阻塞说明，避免把工具失败伪装成用户线索缺失。"""
+    return (
+        f"ACE 内部源码搜索受阻，任务已暂停。\n受阻操作：{operation}；原因：{reason}。\n"
+        "已有对话、成功读取记录和调查进度已保存；这不表示你提供的路径或需求不清楚，"
+        "无需为此重复提供路径或补充截图。\n"
+        "可使用继续任务恢复只读调查；ACE 会核对已有记录及文件变化，继续尚未完成的步骤。"
     )
 
 

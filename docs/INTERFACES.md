@@ -1487,3 +1487,7 @@ investigation（question、scope、done_when、status: pending/active/done/block
 复制按钮、Tooltip、悬停/禁用状态属于展示层，不发送额外模型请求。
 
 0.21.1 仅调整导航底色和桌面对话宽度，不改变按钮回调、消息内容与上述接口。
+
+0.21.2：搜索纠正失败返回task_state=paused（兼容现有暂停表示，status仍为failed），
+message明确受阻操作、原因及恢复方法。客户端复用“继续任务（先核对）”，API沿用resume。
+不会再将内部搜索错误表示为needs_input；真实业务澄清仍使用needs_input。

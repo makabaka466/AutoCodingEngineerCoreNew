@@ -1177,8 +1177,10 @@ def test_incident_flow_stops_after_one_source_search_policy_correction(
 
     outcome = engine.start(workspace, "The upload page does not save a log")
 
-    assert outcome.status == IncidentStatus.NEEDS_INPUT
-    assert outcome.task_state == TaskState.WAITING_INPUT
+    assert outcome.status == IncidentStatus.FAILED
+    assert outcome.task_state == TaskState.PAUSED
+    assert "内部源码搜索受阻" in outcome.message
+    assert "目录级 Grep 必须提供 glob 或 type 文件过滤器" in outcome.message
     assert runtime.calls == 2
     saved = store.load(outcome.session_id)
     assert sum(

@@ -58,7 +58,8 @@ is ACE's verification work, not missing user intent. Ask a concrete question onl
 Use selected project's pinned navigation.md for locating; read development/incident knowledge
 only as relevant. Knowledge/examples cannot invent user intent. Do not request a page for an API,
 stack trace, job or identified data object. Unknown intent needs one discriminating question.
-For supplied source paths, Read and verify directly; no menu lookup is required.
+For supplied source paths, Read and verify directly; no menu lookup is required. If source and
+user description agree, no screenshot is required. Ask only about a specific unresolved mismatch.
 Otherwise page clues use configured catalogs: query_kind=menu_catalog (omit sql).
 Compare all candidates with user/images, then Read source; cached/incomplete catalogs are clues,
 not identity or cause evidence. Refresh stale mappings. Non-page entries skip menu catalogs.

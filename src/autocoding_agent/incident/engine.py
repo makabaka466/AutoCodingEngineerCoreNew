@@ -51,6 +51,7 @@ from autocoding_agent.core.runtime_lifecycle import RuntimeLifecycle, merge_usag
 from autocoding_agent.core.search_policy import (
     BOUNDED_SEARCH_RULES,
     MAX_SEARCH_REPAIR_ROUNDS,
+    search_policy_pause_message,
     search_policy_repair_prompt,
 )
 from autocoding_agent.core.state_machine.machine import AgentStateMachine
@@ -789,21 +790,10 @@ class IncidentEngine:
                     not exc.retryable
                     or consecutive_search_repair_rounds >= MAX_SEARCH_REPAIR_ROUNDS
                 ):
-                    decision = IncidentDecision(
-                        status=IncidentStatus.NEEDS_INPUT,
-                        entry=session.investigation_entry,
-                        message="有界搜索已停止，现有证据不足以确认入口。",
-                        question="请补充具体接口、任务、页面或数据对象等可区分线索。",
+                    return self._pause_at_boundary(
+                        session, command,
+                        message=search_policy_pause_message(exc.operation, exc.reason),
                     )
-                    session.last_decision = decision
-                    session.status = decision.status
-                    session.messages.append(ChatMessage(
-                        role=MessageRole.ASSISTANT, content=decision.message,
-                    ))
-                    self._transition_for_decision(session, decision, command.id)
-                    self._complete_command(session, command)
-                    self.sessions.save(session)
-                    return self._to_outcome(session)
                 consecutive_search_repair_rounds += 1
                 session.events.append(
                     AgentEvent(
