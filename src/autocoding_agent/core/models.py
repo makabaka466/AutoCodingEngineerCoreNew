@@ -9,6 +9,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field, StringConstraints, model_validator
 
+from autocoding_agent.core.approval_execution_models import ApprovalSnapshot, ImplementationReport
 from autocoding_agent.core.artifacts.models import ArtifactRecord
 from autocoding_agent.core.audit.models import DecisionRecord, RiskLevel
 from autocoding_agent.core.data_repair import DataRepairPlan
@@ -78,6 +79,7 @@ class EventType(StrEnum):
     TOOL_STARTED = "tool_started"
     TOOL_FINISHED = "tool_finished"
     CODE_MODIFIED = "code_modified"
+    IMPLEMENTATION_RECONCILED = "implementation_reconciled"
     TEST_EXECUTED = "test_executed"
     VERIFICATION_FAILED = "verification_failed"
     RUNTIME_COMPLETED = "runtime_completed"
@@ -122,7 +124,9 @@ class Evidence(BaseModel):
 class ProposedChange(BaseModel):
     """One concrete before/after item in a model-authored change proposal."""
 
-    path: NonEmptyText | None = None
+    path: NonEmptyText | None = Field(
+        default=None, description="修改审批必须提供确切的工作区相对文件路径，不能是目录或通配符。",
+    )
     area: NonEmptyText
     current: NonEmptyText = Field(description="当前行为，短段落或列表，一项只描述一个改动点。")
     proposed: NonEmptyText = Field(
@@ -276,6 +280,15 @@ class AgentSession(BaseModel):
     runtime_session_id: str | None = None
     status: AgentStatus | None = None
     pending_approval: ApprovalRequest | None = None
+    pending_approval_snapshot: ApprovalSnapshot | None = Field(
+        default=None, description="宿主保存的待审批方案与文件依据；旧会话为空时必须重新审阅。",
+    )
+    approved_execution: ApprovalSnapshot | None = Field(
+        default=None, description="当前实施获批的不可变快照；恢复不自动复用其写权限。",
+    )
+    implementation_report: ImplementationReport | None = Field(
+        default=None, description="最近一次实施的宿主文件核对结果，不代表业务功能验证通过。",
+    )
     last_decision: AgentDecision | None = None
     last_usage: AgentUsage = Field(default_factory=AgentUsage)
     capability_document: str | None = None
@@ -368,6 +381,9 @@ class RuntimeResult(BaseModel):
 
 
 class AgentOutcome(BaseModel):
+    version: int = Field(
+        default=0, ge=0, description="本结果对应的任务版本，供审批防止旧方案误批。",
+    )
     entry: InvestigationEntry | None = None
     session_id: str
     workspace: str

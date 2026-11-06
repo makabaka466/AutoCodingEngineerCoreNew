@@ -101,33 +101,43 @@ def main() -> None:
 
         if session.pending_approval:
             approval = session.pending_approval
+            snapshot = session.pending_approval_snapshot
             st.warning(f"需要授权：{approval.reason}")
             proposal = approval.proposal
             if proposal:
                 with st.container(border=True):
-                    st.markdown(format_approval_details(approval))
-            elif approval.proposed_actions:
-                st.markdown("\n".join(f"- {item}" for item in approval.proposed_actions))
+                    st.markdown(format_approval_details(approval, snapshot))
+            else:
+                st.markdown(format_approval_details(approval, snapshot))
             legacy_modify = approval.scope == ApprovalScope.MODIFY and proposal is None
+            needs_revision = snapshot is not None and bool(snapshot.issues)
             if legacy_modify:
                 st.info("此审批来自旧会话，缺少修改方案。请拒绝并要求 Agent 重新生成方案。")
             reason = st.text_input("希望调整的内容（可选）", key="reject_reason")
             approve_col, reject_col = st.columns(2)
             approve_label = (
                 "需要重新生成"
-                if legacy_modify
+                if legacy_modify or needs_revision
                 else "批准此方案"
                 if proposal
                 else "批准并继续"
             )
             if approve_col.button(
                 approve_label,
+                key=f"approve:{session.id}:{session.version}",
                 type="primary",
                 use_container_width=True,
-                disabled=legacy_modify,
+                disabled=legacy_modify or needs_revision,
             ):
-                with st.spinner("Claude Code 正在继续任务…"):
-                    application.approve(session.id, progress_sink=show_progress)
+                try:
+                    with st.spinner("Claude Code 正在继续任务…"):
+                        application.approve(
+                            session.id, expected_version=session.version,
+                            progress_sink=show_progress,
+                        )
+                except Exception as exc:
+                    st.error(str(exc))
+                    return
                 st.rerun()
             if reject_col.button("拒绝或要求调整", use_container_width=True):
                 with st.spinner("正在继续只读处理…"):

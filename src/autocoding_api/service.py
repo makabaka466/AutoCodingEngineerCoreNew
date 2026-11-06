@@ -209,6 +209,12 @@ class ApiService:
         if task["workflow"] == "development" and session and session.pending_approval:
             pending = {"approval_id": self.approval_id(session),
                        **session.pending_approval.model_dump(mode="json")}
+            if snapshot := session.pending_approval_snapshot:
+                pending["review"] = {
+                    "snapshot_id": snapshot.id,
+                    "planned_paths": list(snapshot.planned_paths),
+                    "requires_revision": bool(snapshot.issues),
+                }
         return {
             "task_id": task_id, "workflow": task["workflow"], "project_id": task["project_id"],
             "state": session.task_state.value if session else "created",

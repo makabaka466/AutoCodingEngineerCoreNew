@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from typing import Protocol
 
+from autocoding_agent.core.approval_execution import audit_implementation, report_text
 from autocoding_agent.core.artifacts.models import (
     ArtifactRecord,
     ArtifactType,
@@ -179,6 +180,10 @@ class ArtifactRecorder:
                             "schema_version": 1,
                             "decision_id": decision_record.id,
                             "proposal": decision.approval.proposal.model_dump(mode="json"),
+                            "approval_snapshot": (
+                                session.pending_approval_snapshot.model_dump(mode="json")
+                                if session.pending_approval_snapshot else None
+                            ),
                         },
                         ensure_ascii=False,
                         indent=2,
@@ -228,6 +233,8 @@ class ArtifactRecorder:
     ) -> ArtifactRecord:
         changed = "\n".join(f"- `{path}`" for path in decision.changed_files) or "- 无"
         tests = decision.test_summary or "未记录可由宿主确认的验证结果。"
+        implementation = (report_text(session.implementation_report)
+                          if session.implementation_report else "本轮未记录实施核对。")
         content = f"""# Task Final Report
 
 - Task ID: `{session.id}`
@@ -253,6 +260,10 @@ class ArtifactRecorder:
 
 {tests}
 
+## Host implementation check
+
+{implementation}
+
 > 本报告由宿主根据模型结构化结果生成。真实修改范围请以 host-verified baseline、context 和
 > changes patch Artifact 为准；测试事实需等待 Runtime 生命周期事件进一步核验。
 """
@@ -273,6 +284,18 @@ class ArtifactRecorder:
         run: RuntimeRunRecord,
         command_id: str,
     ) -> ArtifactRecord:
+        # 断电可能发生在工具写入后、核对记录保存前；启动恢复仅补做文件观测，不执行工具。
+        if run.mode == "implement" and session.approved_execution is not None:
+            original_command = next((event.command_id for event in session.events
+                                     if event.type == EventType.RUNTIME_STARTED
+                                     and event.correlation_id == run.id), None)
+            if original_command and (
+                session.implementation_report is None
+                or session.implementation_report.command_id != original_command
+            ):
+                session.implementation_report = audit_implementation(
+                    session, session.approved_execution, original_command, interrupted=True,
+                )
         snapshot = self.workspace_observer.capture(session.workspace)
         baseline_status = self._latest(session, ArtifactType.BASELINE_STATUS)
         baseline_patch = self._latest(session, ArtifactType.BASELINE_PATCH)
@@ -287,6 +310,14 @@ class ArtifactRecorder:
                 "baseline_status_id": baseline_status.id if baseline_status else None,
                 "baseline_patch_id": baseline_patch.id if baseline_patch else None,
                 "current_workspace": snapshot.status_payload(),
+                "approved_execution": (
+                    session.approved_execution.model_dump(mode="json")
+                    if session.approved_execution else None
+                ),
+                "implementation_report": (
+                    session.implementation_report.model_dump(mode="json")
+                    if session.implementation_report else None
+                ),
                 "current_tracked_patch": self._patch_content(snapshot),
                 "recovery_policy": (
                     "No write or verification action may be replayed automatically. "

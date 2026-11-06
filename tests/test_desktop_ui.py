@@ -11,6 +11,7 @@ import pytest
 from test_datasources import catalog as catalog
 
 from autocoding_agent.config import Settings
+from autocoding_agent.core.approval_execution import snapshot_approval
 from autocoding_agent.core.models import (
     AgentDecision,
     AgentOutcome,
@@ -158,6 +159,7 @@ class FakeApplication:
     def __init__(self, sessions: list[AgentSession] | None = None) -> None:
         self.sessions = {item.id: item for item in sessions or []}
         self.calls: list[tuple[str, ...]] = []
+        self.approval_versions: list[int | None] = []
 
     def list_sessions(self) -> list[AgentSession]:
         return list(self.sessions.values())
@@ -209,9 +211,11 @@ class FakeApplication:
         self,
         session_id: str,
         *,
+        expected_version: int | None = None,
         progress_sink: ProgressSink | None = None,
     ) -> AgentOutcome:
         self.calls.append(("approve", session_id))
+        self.approval_versions.append(expected_version)
         session = self.sessions[session_id]
         return AgentOutcome(
             session_id=session.id,
@@ -593,6 +597,32 @@ def test_legacy_modify_approval_can_be_revised_but_not_approved(
     assert client.approve_button.cget("state") == "disabled"
     assert client.reject_button.cget("state") == "normal"
     assert "缺少修改方案" in client.approval_title.cget("text")
+
+
+def test_approval_snapshot_shows_scope_gap_and_requires_revision(root: tk.Toplevel) -> None:
+    session = _session(AgentStatus.APPROVAL_REQUIRED)
+    session.pending_approval = ApprovalRequest(
+        scope=ApprovalScope.MODIFY,
+        reason="修复库存逻辑",
+        proposal=ChangeProposal(
+            summary="修复重复扣减",
+            changes=[ProposedChange(
+                area="库存扣减", current="取消后库存不正确", proposed="取消时恢复库存",
+            )],
+            expected_result="库存准确",
+        ),
+    )
+    session.pending_approval_snapshot = snapshot_approval(session, session.pending_approval)
+    client = DesktopClient(root, FakeApplication([session]))  # type: ignore[arg-type]
+    client.session_id = session.id
+
+    client._render_session(session)
+
+    displayed = client.approval_text.get("1.0", "end")
+    assert session.pending_approval_snapshot.id[:8] in displayed
+    assert "缺少明确的工作区内文件路径" in displayed
+    assert client.approve_button.cget("state") == "disabled"
+    assert client.reject_button.cget("state") == "normal"
 
 
 def test_recovery_state_shows_explicit_safe_choices(root: tk.Toplevel) -> None:
@@ -1441,6 +1471,7 @@ def test_approval_buttons_route_exact_session_and_rejection_reason(
     root: tk.Toplevel, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     session = _session(AgentStatus.APPROVAL_REQUIRED)
+    session.version = 4
     session.pending_approval = ApprovalRequest(
         scope=ApprovalScope.MODIFY,
         reason="需要修改目标文件",
@@ -1474,6 +1505,9 @@ def test_approval_buttons_route_exact_session_and_rejection_reason(
     assert client.approval_text.tag_ranges("chat_bold")
 
     client._approve()
+    # 排队期间另一个窗口更新方案，不得把批准悄悄改为新版本。
+    session.version = 5
+    client._show_approval(session)
     operations.pop(0)()
     monkeypatch.setattr(
         "autocoding_agent.interfaces.desktop_ui.simpledialog.askstring",
@@ -1486,6 +1520,7 @@ def test_approval_buttons_route_exact_session_and_rejection_reason(
         ("approve", session.id),
         ("reject", session.id, "先只给方案"),
     ]
+    assert application.approval_versions == [4]
 
 
 def test_busy_window_refuses_to_close(root: tk.Toplevel, monkeypatch: pytest.MonkeyPatch) -> None:

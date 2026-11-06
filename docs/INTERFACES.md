@@ -1499,3 +1499,12 @@ WorkflowAssessment可选字段user_questions（最多3项）、causal_chain（�
 ## 0.23.0 数据修复审阅与方案排版
 
 data_repair为可选对象：datasource_id/dialect、summary/table/scope/expected_rows、参数含义parameters、业务查询名evidence_queries、precheck_sql/repair_sql/verify_sql/rollback_sql、backup/transaction/rollback_conditions/risks。宿主回填source及review_notes。文本与SQL长度有界；只存参数含义，不请求模型保存实际业务值。预期行数未知或证据/来源缺失时明确待核对。前后检查模板使用既有只读校验，修复/回退SQL不进入查询执行链，也不授予数据库写审批。任务详情仍从现有session获取结构化内容，主消息分节展示；旧会话字段默认空。首版单目标库单表，跨库/跨表事务与真实SQL执行不在本阶段范围。
+
+
+## 0.24.0 审批快照与实施核对
+
+AgentSession新增可选pending_approval_snapshot、approved_execution、implementation_report，历史默认null。快照含id、approval_json、approval_sha256、context_sha256、cycle_number、planned_paths、files(path/state/sha256)、issues。文件state为present/missing/unverified。实施报告含snapshot_id、command_id、changed_paths、unchanged_paths、out_of_scope_paths、unverified_paths、reported_only_paths、interrupted、limitations；文件变化不代表功能验证通过。
+
+AgentApplication.approve/AgentEngine.approve增加可选keyword expected_version，保持已有调用兼容；AgentOutcome新增version。桌面捕获显示版本，Web按钮绑定task+version；CLI approve可传--expected-version。HTTP继续要求原expected_version/approval_id/scope，worker将版本传至引擎复核；pending_approval新增review摘要(snapshot_id/planned_paths/requires_revision)，不改变已有审批令牌算法或增加端点。
+
+版本过期抛StaleTaskVersion；文件/方案/上下文快照失效则返回task_state=paused、status=failed和具体原因，本次未启动修改。复用resume先只读核对再生成审批，重复command_id仍优先返回已完成回执。缺路径或不可核验文件在审批界面展示问题并禁用批准；用户可发送修订指令重新调查。历史无快照审批不会默许执行。执行核对摘要沿用消息Markdown，详细记录随session及工件持久化。

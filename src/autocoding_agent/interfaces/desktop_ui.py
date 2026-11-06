@@ -652,6 +652,7 @@ class DesktopClient:
         self._current_status: AgentStatus | IncidentStatus | None = None
         self._current_task_state: TaskState | None = None
         self._approval_can_execute = True
+        self._reviewed_approval_version: int | None = None
         self._flow_projects: dict[FlowKind, str] = {
             FlowKind.DEVELOPMENT: "",
             FlowKind.INCIDENT: "",
@@ -2737,12 +2738,16 @@ class DesktopClient:
             or self._busy
             or not self.session_id
             or not self._approval_can_execute
+            or self._reviewed_approval_version is None
         ):
             return
         session_id = self.session_id
+        # 捕获屏幕上已审阅的版本，避免后台排队时批准其他窗口刚更新的方案。
+        expected_version = self._reviewed_approval_version
         self._run_in_background(
             lambda: self.application.approve(
                 session_id,
+                expected_version=expected_version,
                 progress_sink=self._queue_progress,
             ),
             "Claude Code 正在执行已批准的操作",
@@ -3172,6 +3177,7 @@ class DesktopClient:
 
     def _show_approval(self, session: AgentSession) -> None:
         approval = session.pending_approval
+        self._reviewed_approval_version = session.version if approval is not None else None
         if approval is None and session.task_state in {
             TaskState.PAUSED,
             TaskState.RECOVERY_REQUIRED,
@@ -3221,10 +3227,16 @@ class DesktopClient:
         self.approve_button.grid_configure(column=2)
         self.recovery_replan_button.grid_remove()
         is_modify = approval.scope == ApprovalScope.MODIFY
-        self._approval_can_execute = not (is_modify and approval.proposal is None)
+        snapshot = session.pending_approval_snapshot
+        needs_revision = snapshot is not None and bool(snapshot.issues)
+        self._approval_can_execute = (
+            not (is_modify and approval.proposal is None) and not needs_revision
+        )
         self.approval_title.configure(
             text=(
-                "旧审批缺少修改方案 · 请拒绝并说明需要重新生成方案"
+                "方案范围尚未确定 · 请调整后重新审阅"
+                if needs_revision
+                else "旧审批缺少修改方案 · 请拒绝并说明需要重新生成方案"
                 if is_modify and approval.proposal is None
                 else "修改方案 · 确认后才会编辑文件"
                 if is_modify
@@ -3234,7 +3246,7 @@ class DesktopClient:
         self.approve_button.configure(
             text=(
                 "需要重新生成"
-                if is_modify and approval.proposal is None
+                if needs_revision or (is_modify and approval.proposal is None)
                 else "批准此方案"
                 if is_modify
                 else "批准并验证"
@@ -3248,7 +3260,9 @@ class DesktopClient:
                 "approval_body", lmargin1=12, lmargin2=12, rmargin=12,
                 spacing1=2, spacing2=4, spacing3=5,
             )
-        insert_markdown(self.approval_text, format_approval_details(approval), "approval_body")
+        insert_markdown(
+            self.approval_text, format_approval_details(approval, snapshot), "approval_body",
+        )
         self.approval_text.yview_moveto(0.0)
         self.approval_text.configure(state="disabled")
         self.approval_frame.grid(
@@ -3287,6 +3301,7 @@ class DesktopClient:
 
     def _hide_approval(self) -> None:
         self._approval_can_execute = True
+        self._reviewed_approval_version = None
         self.recovery_replan_button.grid_remove()
         self.approve_button.grid_configure(column=2)
         self.approval_frame.grid_remove()

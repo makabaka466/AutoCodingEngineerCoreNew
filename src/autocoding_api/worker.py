@@ -195,7 +195,10 @@ class Worker:
         if job["operation"] in {"approve", "reject"}:
             self.service.verify_approval(task, session, payload)
             if job["operation"] == "approve":
-                application.approve(domain_id, command_id=job["id"], progress_sink=sink)
+                application.approve(
+                    domain_id, command_id=job["id"],
+                    expected_version=payload["expected_version"], progress_sink=sink,
+                )
             else:
                 application.reject(
                     domain_id, payload["reason"], command_id=job["id"], progress_sink=sink,

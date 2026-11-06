@@ -75,6 +75,12 @@ def test_diagnosis_to_review_modify_verify_is_remote_and_restartable(configured)
     assert review["pending_approval"]["proposal"]["changes"][0]["proposed"]
     assert review["pending_approval"]["proposal"]["impact"]
     assert review["pending_approval"]["proposal"]["validation"]
+    snapshot = apps["development"].get_session(job["task_id"]).pending_approval_snapshot
+    assert review["pending_approval"]["review"] == {
+        "snapshot_id": snapshot.id,
+        "planned_paths": list(snapshot.planned_paths),
+        "requires_revision": False,
+    }
     assert apps["development"].get_session(job["task_id"]).source_incident_key == (
         f"{source['task_id']}:{handoff['cycle_number']}"
     )
@@ -166,6 +172,34 @@ def test_approval_is_rechecked_when_saved_proposal_changes_before_worker(configu
     worker.service.sessions["development"].save(saved)
     assert worker.run_once()
     assert worker.service.queue.job(response.json()["job_id"], "alice")["status"] == "failed"
+    assert [turn.mode for turn in runtime.turns] == [AgentMode.INSPECT]
+
+
+def test_approval_version_is_checked_inside_application_after_worker_checks(
+    configured, monkeypatch,
+):
+    apps, runtime = applications(configured, _approval(ApprovalScope.MODIFY))
+    client = TestClient(create_app(configured))
+    job = create(client)
+    worker = Worker(configured, apps)
+    worker.run_once()
+    path = f"/v1/tasks/{job['task_id']}"
+    view = client.get(path, headers=headers()).json()
+    response = client.post(path + "/approve", headers=headers("approve-race"),
+                           json=approval_payload(view))
+    assert response.status_code == 202
+    application = apps["development"]
+    original_approve = application.approve
+
+    def approve_after_other_client_updates(session_id, *args, **kwargs):
+        session = application.get_session(session_id)
+        session.version += 1
+        application._engine.sessions.save(session)
+        return original_approve(session_id, *args, **kwargs)
+
+    monkeypatch.setattr(application, "approve", approve_after_other_client_updates)
+    assert worker.run_once()
+    assert worker.service.queue.job(response.json()["job_id"], "alice")["status"] != "succeeded"
     assert [turn.mode for turn in runtime.turns] == [AgentMode.INSPECT]
 
 

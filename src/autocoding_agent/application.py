@@ -196,11 +196,13 @@ class AgentApplication:
         session_id: str,
         command_id: str | None = None,
         *,
+        expected_version: int | None = None,
         progress_sink: ProgressSink | None = None,
     ) -> AgentOutcome:
         return self._engine.approve(
             session_id,
             command_id,
+            expected_version=expected_version,
             progress_sink=progress_sink,
         )
 

@@ -11,6 +11,14 @@ from pathlib import Path, PureWindowsPath
 from uuid import uuid4
 
 from autocoding_agent.adapters.capability_store import CapabilityStore
+from autocoding_agent.core.approval_execution import (
+    approval_changes,
+    approval_file_changes,
+    audit_implementation,
+    report_text,
+    snapshot_approval,
+)
+from autocoding_agent.core.approval_execution_models import ImplementationReport
 from autocoding_agent.core.artifacts.recorder import ArtifactRecorder
 from autocoding_agent.core.audit.models import ChangeExplanation
 from autocoding_agent.core.audit.recorder import DecisionRecorder
@@ -69,7 +77,7 @@ from autocoding_agent.core.search_policy import (
     search_policy_pause_message,
     search_policy_repair_prompt,
 )
-from autocoding_agent.core.state_machine.machine import AgentStateMachine
+from autocoding_agent.core.state_machine.machine import AgentStateMachine, StaleTaskVersion
 from autocoding_agent.core.state_machine.models import (
     AgentCommand,
     AgentCommandType,
@@ -286,6 +294,7 @@ class AgentEngine:
         previous_analysis = (session.task_analysis.model_dump(mode="json")
                              if session.task_analysis else None)
         session.task_analysis = None
+        session.implementation_report = None
         session.cycle_number += 1
         session.cycle_objective = message
         session.cycle_query_observation_start = len(session.query_observations)
@@ -316,10 +325,13 @@ class AgentEngine:
         command_id: str | None = None,
         *,
         progress_sink: ProgressSink | None = None,
+        expected_version: int | None = None,
     ) -> AgentOutcome:
         session = self.sessions.load(session_id)
         if duplicate := self._duplicate_command_outcome(session, command_id):
             return duplicate
+        if expected_version is not None and session.version != expected_version:
+            raise StaleTaskVersion("方案已更新，请刷新并审阅当前方案后再批准。")
         if not self._remediation_source_current(session):
             raise ValueError("诊断依据已更新，原审批失效；请从最新诊断重新进入异常处理。")
         approval = session.pending_approval
@@ -328,12 +340,11 @@ class AgentEngine:
         if (session.last_decision and session.last_decision.assessment
                 and session.last_decision.assessment.user_questions):
             raise ValueError("仍有未澄清的业务问题，请先回答并重新生成方案，不能直接批准。")
+        entry_issues = []
         if approval.scope == ApprovalScope.MODIFY and session.investigation_entry is not None:
             entry = accept_entry(session, session.investigation_entry)
             if entry.state != "confirmed":
-                session.pending_approval = None
-                self.sessions.save(session)
-                raise ValueError("入口证据已失效，请重新分析并生成修改方案后再审批。")
+                entry_issues.append("入口证据已失效，请重新分析并生成修改方案后再审批。")
         if approval.scope == ApprovalScope.MODIFY and approval.proposal is None:
             raise ValueError(
                 "This saved approval predates change proposals. Send a revised instruction so "
@@ -356,22 +367,27 @@ class AgentEngine:
             type=AgentCommandType.GRANT_APPROVAL,
             expected_version=session.version,
         )
+        differences = entry_issues + approval_changes(
+            session, approval, session.pending_approval_snapshot,
+        )
+        if differences:
+            session.pending_approval = None
+            session.pending_approval_snapshot = None
+            return self._pause_at_boundary(session, command, message=(
+                "审批依据已失效，本次未执行修改或验证。\n"
+                + "\n".join(f"- {item}" for item in differences)
+                + "\n点击继续任务，ACE 将只读核对并重新生成待审方案，无需重复输入原需求。"
+            ))
+        session.approved_execution = session.pending_approval_snapshot
+        session.pending_approval_snapshot = None
         session.pending_approval = None
         mode = AgentMode.IMPLEMENT if approval.scope == ApprovalScope.MODIFY else AgentMode.VERIFY
-        reviewed_scope = ""
-        if approval.proposal is not None:
-            reviewed_changes = "; ".join(
-                f"{item.path or item.area}: {item.proposed}" for item in approval.proposal.changes
-            )
-            reviewed_scope = (
-                f" Reviewed proposal: {approval.proposal.summary} "
-                f"Planned changes: {reviewed_changes}. "
-                f"Expected result: {approval.proposal.expected_result}."
-            )
         message = (
             f"The user approved the requested {approval.scope.value} scope for this task. "
             "Continue from the existing investigation and execute only the exact proposal and "
-            f"actions the user reviewed.{reviewed_scope}"
+            "actions the user reviewed. If additional files or incompatible API/method changes "
+            "are needed, stop and propose them for review. Do not execute data repair SQL.\n"
+            + approval.model_dump_json(exclude_none=True)
         )
         return self._run_command(session, message, mode, command, progress_sink)
 
@@ -420,6 +436,8 @@ class AgentEngine:
         if current is not None and current(session):
             return True
         session.pending_approval = None
+        session.pending_approval_snapshot = None
+        session.approved_execution = None
         session.messages.append(ChatMessage(
             role=MessageRole.SYSTEM,
             content="诊断依据已变更，原方案及审批已失效；保留已执行记录，不自动回滚。",
@@ -709,6 +727,11 @@ class AgentEngine:
     ) -> AgentOutcome:
         """推进一次开发对话，直到得到可持久化、可向用户展示的结果。"""
 
+        if mode == AgentMode.INSPECT:
+            # 普通回复、拒绝和恢复都撤销执行授权；历史快照仍在Artifact和事件中。
+            session.pending_approval_snapshot = None
+            session.approved_execution = None
+
         # 第 1 步：先进入本轮已授权的模式，再允许 Runtime 或宿主执行任何操作。
         self._enter_mode_state(session, mode, command)
         session.messages.append(ChatMessage(role=MessageRole.USER, content=user_message))
@@ -759,6 +782,15 @@ class AgentEngine:
         while True:
             if not self._remediation_source_current(session):
                 return self._pause_at_boundary(session, command)
+            if mode in {AgentMode.IMPLEMENT, AgentMode.VERIFY} and session.approved_execution:
+                differences = approval_file_changes(session, session.approved_execution)
+                if differences:
+                    session.approved_execution = None
+                    return self._pause_at_boundary(session, command, message=(
+                        "执行前文件依据发生变化，尚未启动本轮操作。\n"
+                        + "\n".join(f"- {item}" for item in differences)
+                        + "\n请点击继续任务，先只读核对并重新审阅方案。"
+                    ))
             existing_runtime_session_id = session.runtime_session_id
             if existing_runtime_session_id is None:
                 # 启动前先保存预分配的 Claude 会话 ID，避免超时后把可能产生副作用的首轮
@@ -902,6 +934,7 @@ class AgentEngine:
                         message=search_policy_pause_message(exc.operation, exc.reason),
                     )
                 if mode == AgentMode.IMPLEMENT:
+                    self._record_implementation_check(session, command.id, interrupted=True)
                     self._try_record_post_implementation(session, command.id)
                 if mode in {AgentMode.IMPLEMENT, AgentMode.VERIFY}:
                     return self._require_recovery(
@@ -927,6 +960,17 @@ class AgentEngine:
                 runtime_session_id=result.runtime_session_id,
             )
             self.sessions.save(session)
+
+            if mode == AgentMode.IMPLEMENT:
+                self._record_implementation_check(
+                    session, command.id, reported_paths=result.decision.changed_files,
+                )
+                report = session.implementation_report
+                if report and (report.out_of_scope_paths or report.unverified_paths):
+                    self._try_record_post_implementation(session, command.id)
+                    return self._require_recovery(
+                        session, "实施结果包含范围外操作或尚未核实的文件。", run, command.id,
+                    )
 
             if mode == AgentMode.IMPLEMENT and self.artifact_recorder is not None:
                 try:
@@ -1039,6 +1083,11 @@ class AgentEngine:
                 )
             supplied_assessment = decision.assessment is not None
             decision.assessment = bind_assessment(session, decision, mode=mode.value)
+            if mode == AgentMode.IMPLEMENT and session.implementation_report:
+                report = session.implementation_report
+                decision.message += "\n\n" + report_text(report)
+                if report.unchanged_paths or report.reported_only_paths:
+                    decision.assessment.result = ResultKind.PARTIAL
             if decision.status == AgentStatus.NEEDS_INPUT:
                 decision.message = clarification_text(decision)
             if decision.data_repair is not None:
@@ -1136,6 +1185,9 @@ class AgentEngine:
             session.last_decision = decision
             session.status = decision.status
             session.pending_approval = decision.approval
+            session.pending_approval_snapshot = (
+                snapshot_approval(session, decision.approval) if decision.approval else None
+            )
             session.messages.append(
                 ChatMessage(
                     role=MessageRole.ASSISTANT,
@@ -1304,6 +1356,37 @@ class AgentEngine:
                     max(0, int((time.monotonic() - started_at) * 1000)),
                 )
         return results
+
+    def _record_implementation_check(
+        self, session: AgentSession, command_id: str, *,
+        reported_paths: list[str] | tuple[str, ...] = (), interrupted: bool = False,
+    ) -> None:
+        """以授权时的文件指纹核对实际结果，非Git项目也不依赖模型自报。"""
+        snapshot = session.approved_execution
+        if snapshot is None:
+            return
+        try:
+            session.implementation_report = audit_implementation(
+                session, snapshot, command_id,
+                reported_paths=reported_paths, interrupted=interrupted,
+            )
+        except Exception:
+            # 核对自身失败也不能盖掉原始运行异常或把写入结果当成已知。
+            session.implementation_report = ImplementationReport(
+                snapshot_id=snapshot.id, command_id=command_id,
+                unverified_paths=snapshot.planned_paths, interrupted=interrupted,
+                limitations=("宿主未能完成实施核对，继续前需要只读检查。",),
+            )
+        session.events.append(AgentEvent(
+            type=EventType.IMPLEMENTATION_RECONCILED,
+            message="宿主已对照本次审批范围核对文件结果；不代表功能验证通过。",
+            command_id=command_id,
+            data={
+                "approval_snapshot": snapshot.model_dump(mode="json"),
+                "report": session.implementation_report.model_dump(mode="json"),
+            },
+        ))
+        self.sessions.save(session)
 
     def _try_record_post_implementation(
         self,
@@ -1482,13 +1565,14 @@ class AgentEngine:
         run: RuntimeRunRecord,
         command_id: str,
     ) -> AgentOutcome:
-        detail = " ".join((message or "Unknown Runtime failure").split())
+        detail = " ".join((message or "未知运行异常").split())[:800]
         decision = AgentDecision(
             status=AgentStatus.FAILED,
             message=(
-                "The Runtime ended while side effects may have occurred. Review the recovery "
-                "report before choosing read-only inspection, replanning, or cancellation. "
-                f"Cause: {detail}"
+                f"执行需要核对：{detail}\n\n"
+                "已保存当前记录和已有修改。点击继续任务后先只读检查，不自动重放写入或回滚。"
+                + ("\n\n" + report_text(session.implementation_report)
+                   if run.mode == "implement" and session.implementation_report else "")
             ),
             reason=detail,
         )
@@ -1718,6 +1802,7 @@ class AgentEngine:
         if decision is None or session.status is None:
             raise ValueError(f"Session {session.id} has not produced an outcome yet.")
         return AgentOutcome(
+            version=session.version,
             entry=session.investigation_entry,
             session_id=session.id,
             workspace=session.workspace,

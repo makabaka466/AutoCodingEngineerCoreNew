@@ -2,6 +2,7 @@
 
 import json
 
+from autocoding_agent.core.approval_execution import report_text
 from autocoding_agent.core.models import EventType
 from autocoding_agent.core.workflow import read_fingerprint
 
@@ -45,6 +46,10 @@ def recovery_context(session) -> str:
                 read_fingerprint(session.workspace, item["path"]) == item.pop("saved_sha256")
             )
     return (
+        ("\n最近实施核对（历史记录，恢复后须再次Read确认）：\n"
+         + report_text(session.implementation_report)
+         if getattr(session, "implementation_report", None) else "")
+        +
         "\n恢复执行约束：先核对当前文件与已有结果，只继续未完成步骤。"
         "returned 仅表示工具返回，不证明业务成功；unknown 可能已产生副作用，禁止盲目重跑。"
         "文件发生变化时重新审阅受影响方案。外部写入须查询结果或使用已有幂等凭据；"

@@ -10,6 +10,7 @@ import os
 from collections.abc import Callable, Collection
 from typing import Protocol
 
+from autocoding_agent.core.approval_execution import normalized_path
 from autocoding_agent.core.models import AgentEvent, AgentUsage, EventType, utc_now
 from autocoding_agent.core.progress import (
     ProgressProjector,
@@ -25,7 +26,7 @@ from autocoding_agent.core.runtime.models import (
 )
 from autocoding_agent.core.state_machine.models import TaskState
 from autocoding_agent.core.workflow import read_fingerprint
-from autocoding_agent.ports.runtime import RuntimeInterruptedError
+from autocoding_agent.ports.runtime import RuntimeInterruptedError, RuntimePolicyBlockedError
 
 
 class RuntimeAggregate(Protocol):
@@ -151,6 +152,19 @@ class RuntimeLifecycle:
         if self.record_test_commands:
             self._record_completed_test(session, run, activity, command_id, event.id)
         self.save(session)
+
+        approval = getattr(session, "approved_execution", None)
+        if (mode == "implement" and approval is not None
+                and activity.kind == RuntimeEventKind.TOOL_STARTED
+                and (activity.tool_name or "").casefold() in {"edit", "write"}):
+            path = normalized_path(session.workspace, str(activity.data.get("path") or ""))
+            if path not in approval.planned_paths:
+                # stdout事件并非同步许可握手：可能已写入，先保留事件再停止后续执行并核对。
+                raise RuntimePolicyBlockedError(
+                    "发现审批范围外的写操作，已请求停止后续执行，需核对文件实际状态。",
+                    policy="approved_file_scope", operation=activity.tool_name or "write",
+                    reason="写入路径不属于用户审阅的方案。",
+                )
 
         # 只读运行可取消；写入/验证运行等待调用结束，避免在副作用中途强杀。
         if mode == "inspect" and self.stop_requested(session.id):

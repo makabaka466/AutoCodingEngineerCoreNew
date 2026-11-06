@@ -368,7 +368,8 @@ def test_stop_during_write_waits_for_result_without_replaying(tmp_path):
     assert session.runs[-1].status == RunStatus.COMPLETED
     assert runtime.writes == 1
     assert (workspace / "a.txt").read_text() == "saved"
-    assert any(m.content == "File saved" for m in session.messages)
+    assert any(m.content.startswith("File saved") for m in session.messages)
+    assert session.implementation_report.changed_paths == ("a.txt",)
     resumed = build_application(settings=_settings(data), runtime=CompleteRuntime())
     resumed.resume(session.id)
     assert runtime.writes == 1

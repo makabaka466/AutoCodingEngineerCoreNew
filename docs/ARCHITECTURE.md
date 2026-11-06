@@ -1023,3 +1023,14 @@ ChatTranscript 保留原始消息、按需折叠与复制，用户/代码块采�
 ## 0.23.0 数据修复审阅与方案排版
 
 独立DataRepairPlan放在AgentDecision/IncidentDecision可选data_repair中，不复用可执行DataQuery。bind_data_repair只读配置快照和本周期查询事件，不连接库：校核项目授权、方言、配置指纹与业务查询来源，覆盖模型伪造source/review_notes。缺口随草案公开，全部模板都标注未执行。方案保存在原任务快照/决策，开发分析工件及异常处理交接携带模板；交接不继承数据库写权限。无新端点、依赖或固定模型轮次。各端复用proposal_presentation，桌面仍沿用既有Text/Markdown渲染和审批回调。
+
+
+## 0.24.0 审批与实施核对
+
+approval_execution及独立模型保存宿主ApprovalSnapshot，完整审批规范JSON及SHA256、任务上下文指纹、周期、计划路径与文件指纹。仅进入AgentSession，不扩充模型输出协议。pending_approval_snapshot在方案生成时建立；批准时核对原方案、需求、文件，再把快照交给approved_execution。Runtime启动前再次检查文件，不能在approve时按当前内容重新签署旧方案。
+
+复用Read/Edit/Write的宿主指纹；上限128文件、32MiB合计、单文件4MiB，超限或不可核验明确阻止审批，不扫描源码树。新建文件记录missing，审批后被他人创建也会失效。VERIFY继承实施文件当前基线但不增加写权限。
+
+ImplementationReport对照计划与实际内容变化，并关联本命令工具事件。仅模型报告的changed_files单列；范围外写尝试、依据漂移或未知结果进入recovery_required，保留修改，不自动回滚。TOOL_STARTED观察到越界会请求终止后续执行；事件来自异步stdout，可能已发生副作用，不能称为写入前硬隔离。未观测路径及其他进程并发修改不能被此核对完整覆盖，共享目录互斥留阶段9。
+
+快照归档于proposal工件，核对结果归档事件、最终/恢复报告。断电未保存核对时，启动恢复按原命令补做文件观测，不调用模型或重放工具；resume始终inspect。旧会话可读取，但无快照的待审批需重新生成。普通回复/拒绝/恢复撤销活跃授权，新工作周期清除当前报告，历史工件保留。没有新增模型轮次、依赖或数据库写权限。

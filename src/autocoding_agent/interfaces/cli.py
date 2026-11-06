@@ -76,10 +76,15 @@ def git_publish(
 def approve(
     session_id: Annotated[str, typer.Option("--session-id", "-s")],
     command_id: Annotated[str | None, typer.Option("--command-id")] = None,
+    expected_version: Annotated[
+        int | None, typer.Option("--expected-version", min=0, help="已审阅方案的任务版本。")
+    ] = None,
 ) -> None:
     """Approve the exact modification or verification scope requested by the Agent."""
 
-    _invoke(lambda: build_application().approve(session_id, command_id))
+    _invoke(lambda: build_application().approve(
+        session_id, command_id, expected_version=expected_version,
+    ))
 
 
 @app.command()
@@ -172,6 +177,7 @@ def sessions_command() -> None:
             "session_id": item.id,
             "status": item.status,
             "task_state": item.task_state,
+            "version": item.version,
             "workspace": item.workspace,
             "goal": item.goal,
             "updated_at": item.updated_at.isoformat(),
@@ -211,6 +217,7 @@ def _print_outcome(outcome: AgentOutcome) -> None:
     typer.echo(f"session: {outcome.session_id}")
     typer.echo(f"status: {outcome.status.value}")
     typer.echo(f"task_state: {outcome.task_state.value}")
+    typer.echo(f"version: {outcome.version}")
     typer.echo(outcome.message)
     if outcome.approval:
         typer.echo(f"approval: {outcome.approval.scope.value} — {outcome.approval.reason}")
