@@ -136,6 +136,18 @@ class WorkflowAssessment(BaseModel):
         max_length=6,
         description="尚缺的关键证据或验证条件；为空不代表宿主认可因果。",
     )
+    user_questions: list[AnalysisText] = Field(
+        default_factory=list, max_length=3,
+        description="尚未澄清且影响方案的业务问题，写明影响和具体选项；不含工具故障或实施后验证。",
+    )
+    causal_chain: list[AnalysisText] = Field(
+        default_factory=list, max_length=5,
+        description="公开因果链：触发条件、执行分支、失败点和现象；依据引用在evidence，不是私有推理。",
+    )
+    verification_pending: list[AnalysisText] = Field(
+        default_factory=list, max_length=5,
+        description="实施后仍需完成的验证，不作为需求澄清问题；不代表已经验证。",
+    )
     evidence: list[WorkflowEvidence] = Field(
         default_factory=list, max_length=12, description="关键结论引用的本轮源码、查询或验证记录。"
     )
@@ -145,23 +157,21 @@ class WorkflowAssessment(BaseModel):
 
 
 WORKFLOW_RULES = """## Advancement
-Return assessment: phase, confirmed facts, public reason, missing evidence and references
-(Read relative paths, host query names, validation IDs). Host fills event_id/verified; verified
-source is not causal proof. No private reasoning, raw rows, SQL parameters or secrets.
-Judge sufficiency: close a named gap per action, skip unnecessary steps, revisit contradictions,
-ask only for facts tools cannot obtain, stop repeated actions without new evidence. Confidence
-is not a gate. Completed ends a cycle, not necessarily the problem. Use hypothesis for unproven
-causes; cause_confirmed needs cited source and no causal gaps; modified_unverified without
-successful relevant validation; partial when exhausted. Normal tool return is not test success.
-Diagnosis never applies remediation. Keep message certainty aligned with result.
-For needs_input, message must explain progress, the exact blocker, why it matters, and one
-specific question with the expected answer format/example. Never just say 'provide more info'.
-Ask only for user-owned facts; tools/evidence bookkeeping and approvals are not missing intent.
-Return short analysis on initial understanding/scope changes; otherwise omit it. Record sourced
-observations and bounded investigation questions with stop conditions. Image/user statements,
-code/data and guesses differ; preserve conflicts. Latest user input wins. Analysis is neither
-proof nor permission. Grep discovers; Read key sections before citing. Ask target-changing
-business choices early; tools/evidence bookkeeping never require user clarification.
+Return assessment with facts, public reason, gaps and evidence (Read paths, query names, test IDs).
+Host verifies provenance, not causality. No private reasoning, raw rows, parameters or secrets.
+Close a named gap per action; revisit conflicts, stop repetition. Confidence grants no permission.
+Completed ends a cycle, not proof: hypothesis if unproven, partial if exhausted,
+modified_unverified without relevant successful validation. Tool return is not test success.
+Diagnosis never applies repairs. Match message certainty to result.
+needs_input explains progress, blocker, impact and a concrete question with answer options.
+Only ask user-owned facts, never tool/bookkeeping problems. Before proposals, put unresolved
+business choices in user_questions; needs_input until answered, empty only when resolved.
+missing holds causal/evidence gaps; verification_pending holds post-change checks, not intent.
+Give causal_chain: trigger -> branch -> failure -> symptom, supported by evidence; unresolved
+alternatives remain missing. Matching symptoms alone is not a confirmed cause.
+Return short analysis initially/on scope changes: sourced observations and bounded questions
+with stop conditions. Distinguish image/user, code/data, inference; latest user input wins.
+Analysis is not proof/permission. Grep discovers; Read key sections before citing.
 """
 
 
@@ -268,6 +278,8 @@ def bind_assessment(session: Any, decision: Any, *, mode: str) -> WorkflowAssess
             elif assessment.result != ResultKind.PARTIAL:
                 if not (
                     assessment.result == ResultKind.CAUSE_CONFIRMED
+                    and bool(assessment.causal_chain)
+                    and not assessment.user_questions
                     and not assessment.missing
                     and any(item.kind == "code" and item.verified for item in assessment.evidence)
                     and all(item.verified for item in assessment.evidence)
@@ -278,6 +290,8 @@ def bind_assessment(session: Any, decision: Any, *, mode: str) -> WorkflowAssess
         elif mode == "verify":
             if not (
                 assessment.result == ResultKind.VERIFIED
+                and not assessment.verification_pending
+                and not assessment.user_questions
                 and not assessment.missing
                 and any(item.kind == "validation" and item.verified for item in assessment.evidence)
                 and all(item.verified for item in assessment.evidence)
@@ -316,17 +330,40 @@ def bind_assessment(session: Any, decision: Any, *, mode: str) -> WorkflowAssess
     return assessment
 
 
+def defer_unresolved_questions(decision: Any) -> Any:
+    """两条流程共用澄清门槛；不把有业务分歧的草案展示为可审批方案。"""
+    assessment = decision.assessment
+    if (assessment is None or not assessment.user_questions
+            or decision.status.value not in {"approval_required", "completed"}):
+        return decision
+    deferred = decision.model_copy(deep=True)
+    deferred.status = type(decision.status)("needs_input")
+    deferred.message = "还有影响方案的业务选择需要确认，澄清后再提交完整方案。"
+    deferred.assessment.phase = ProgressPhase.WAITING_INPUT
+    deferred.assessment.result = ResultKind.UNSPECIFIED
+    if hasattr(deferred, "approval"):
+        deferred.approval = None
+    if hasattr(deferred, "question"):
+        deferred.question = "；".join(assessment.user_questions)
+        deferred.diagnosis = None
+        deferred.recommended_actions = []
+    deferred.message = clarification_text(deferred)
+    return deferred
+
+
 def clarification_text(decision: Any) -> str:
     """主对话展示真实缺口和问题，不让问题只留在结构化字段或详情面板。"""
     lines = [decision.message]
     assessment = decision.assessment
     if assessment is not None:
-        for label, values in (("已完成", assessment.confirmed), ("尚缺信息", assessment.missing)):
+        for label, values in (("已完成", assessment.confirmed),
+                              ("需要你确认", assessment.user_questions),
+                              ("待补查证据", assessment.missing)):
             extra = [value for value in values[:3] if value not in decision.message]
             if extra:
                 lines.append(label + "：" + "；".join(extra))
     question = getattr(decision, "question", None)
-    if question and question not in decision.message:
+    if question and question not in "\n".join(lines):
         lines.append("需要你回答：" + question)
     return "\n\n".join(lines)
 
@@ -341,6 +378,12 @@ def assessment_text(assessment: WorkflowAssessment | None) -> str:
         lines.append("已确认：" + "；".join(assessment.confirmed))
     if assessment.missing:
         lines.append("尚缺证据：" + "；".join(assessment.missing))
+    if assessment.user_questions:
+        lines.append("待澄清：" + "；".join(assessment.user_questions))
+    if assessment.causal_chain:
+        lines.append("因果链：" + " → ".join(assessment.causal_chain))
+    if assessment.verification_pending:
+        lines.append("待验证：" + "；".join(assessment.verification_pending))
     if assessment.result != ResultKind.UNSPECIFIED:
         lines.append("本轮结果：" + RESULT_LABELS[assessment.result])
     for item in assessment.evidence:

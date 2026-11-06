@@ -82,6 +82,7 @@ from autocoding_agent.core.workflow import (
     assessment_progress_text,
     bind_assessment,
     clarification_text,
+    defer_unresolved_questions,
     evidence_catalog,
     task_analysis_context,
 )
@@ -323,6 +324,9 @@ class AgentEngine:
         approval = session.pending_approval
         if approval is None:
             raise ValueError("This session has no pending approval request.")
+        if (session.last_decision and session.last_decision.assessment
+                and session.last_decision.assessment.user_questions):
+            raise ValueError("仍有未澄清的业务问题，请先回答并重新生成方案，不能直接批准。")
         if approval.scope == ApprovalScope.MODIFY and session.investigation_entry is not None:
             entry = accept_entry(session, session.investigation_entry)
             if entry.state != "confirmed":
@@ -958,6 +962,7 @@ class AgentEngine:
                         },
                     )
                 )
+            result.decision = defer_unresolved_questions(result.decision)
             try:
                 self._validate_decision(result.decision, mode)
                 if session.source_incident_key and result.decision.approval:

@@ -146,13 +146,15 @@ def test_incident_question_is_visible_in_conversation_and_gaps_are_not_hidden():
         question="未选择仓位时应禁止所有提交，还是仅禁止扫码回车？请回复其中一种。",
         assessment=WorkflowAssessment(
             phase="waiting_input", reason="两种行为影响不同入口。",
-            confirmed=["扫码事件已定位"], missing=["非扫码提交是否也需要卡控"],
+            confirmed=["扫码事件已定位"], user_questions=["非扫码提交是否也需要卡控"],
+            missing=["现场错误日志尚未核对"],
         ),
     )
     rendered = format_incident_summary(decision)
     assert decision.question in rendered
     assert "已完成：扫码事件已定位" in rendered
-    assert "尚缺信息：非扫码提交是否也需要卡控" in rendered
+    assert "需要你确认：非扫码提交是否也需要卡控" in rendered
+    assert "待补查证据：现场错误日志尚未核对" in rendered
 
 
 @pytest.mark.parametrize("path", ["../outside.py", "C:/Windows/system.ini", "missing.py"])

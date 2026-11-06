@@ -35,6 +35,7 @@ def _assessment(result: ResultKind, *, kind: str = "code", reference: str = "pag
         phase=ProgressPhase.DIAGNOSING_CAUSE,
         reason="当前源码解释异常分支，继续按证据判断。",
         confirmed=["已读取页面源码。"],
+        causal_chain=["输入触发校验分支", "分支抛出异常并显示错误"],
         evidence=[WorkflowEvidence(kind=kind, reference=reference)],
         result=result,
     )

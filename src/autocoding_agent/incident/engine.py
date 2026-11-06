@@ -69,6 +69,7 @@ from autocoding_agent.core.workflow import (
     assessment_progress_text,
     bind_assessment,
     clarification_text,
+    defer_unresolved_questions,
     evidence_catalog,
     task_analysis_context,
 )
@@ -773,6 +774,7 @@ class IncidentEngine:
                     conflict_deferred and decision.entry is None
                     and decision.page is None and not page_correction_used
                 )
+                decision = defer_unresolved_questions(decision)
                 self._validate_decision(decision)
             except RuntimePolicyBlockedError as exc:
                 # 第 4 步：源码搜索范围过大时，最多自动进行一次有界纠正。
@@ -2150,8 +2152,14 @@ def format_incident_summary(decision: IncidentDecision) -> str:
     ]
     actions = "\n".join(f"{index}. {action}" for index, action in enumerate(recommended_actions, 1))
     summary = decision.message
-    if decision.diagnosis and decision.diagnosis.strip() != summary.strip():
+    if decision.assessment:
+        summary = RESULT_LABELS[decision.assessment.result] + "\n" + summary
+    if decision.diagnosis and decision.diagnosis.strip() != decision.message.strip():
         summary += f"\n原因：{decision.diagnosis}"
     if decision.assessment and decision.assessment.missing:
         summary += "\n待确认：" + "；".join(decision.assessment.missing)
+    if decision.assessment and decision.assessment.causal_chain:
+        summary += "\n因果链：" + " → ".join(decision.assessment.causal_chain)
+    if decision.assessment and decision.assessment.verification_pending:
+        summary += "\n待验证：" + "；".join(decision.assessment.verification_pending)
     return prefix + f"异常总结\n{summary}\n\n解决方案\n{actions}"

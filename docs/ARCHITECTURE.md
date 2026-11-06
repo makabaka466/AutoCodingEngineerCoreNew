@@ -1015,3 +1015,7 @@ ChatTranscript 保留原始消息、按需折叠与复制，用户/代码块采�
 0.21.2：开发和异常只读搜索受阻共用暂停说明；可纠正错误仍最多自动纠正一次，
 无法纠正或纠正耗尽转PAUSED，复用已有持久化、指纹核对和只读恢复，不误转WAITING_INPUT。
 失败Run仍记failed，任务保留可恢复状态；总预算耗尽、修改/验证恢复逻辑不变。
+
+## 0.22.0 因果诊断与方案澄清
+
+阶段6复用WorkflowAssessment增加user_questions、causal_chain、verification_pending，均有界且默认空，旧快照可读。两条引擎将带业务问题的审批/完成决定转needs_input，不保存草案为pending_approval；approve再次检查持久问题，异常未澄清不开放处理交接。因果链不是证据，原因确认仍要求本周期有效Read及无缺口；不新增规划器或固定模型调用。

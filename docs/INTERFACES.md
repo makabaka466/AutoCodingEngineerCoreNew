@@ -1491,3 +1491,7 @@ investigation（question、scope、done_when、status: pending/active/done/block
 0.21.2：搜索纠正失败返回task_state=paused（兼容现有暂停表示，status仍为failed），
 message明确受阻操作、原因及恢复方法。客户端复用“继续任务（先核对）”，API沿用resume。
 不会再将内部搜索错误表示为needs_input；真实业务澄清仍使用needs_input。
+
+## 0.22.0 因果诊断与方案澄清
+
+WorkflowAssessment可选字段user_questions（最多3项）、causal_chain（最多5项）、verification_pending（最多5项），每项不超过240字符。missing保留证据缺口。业务问题未清时返回needs_input，无审批payload；send回答后模型重新生成方案。待验证不挡修改审批，但不能声明verified。旧任务无字段默认空，无法自动识别历史自由文本中的隐含问题。无新增端点。
