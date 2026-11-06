@@ -12,6 +12,7 @@ import typer
 from autocoding_agent.application import build_application
 from autocoding_agent.core.models import AgentOutcome
 from autocoding_agent.core.recovery.models import RecoveryAction
+from autocoding_agent.interfaces.proposal_presentation import format_approval_details
 
 app = typer.Typer(
     name="autocoding-agent",
@@ -215,13 +216,7 @@ def _print_outcome(outcome: AgentOutcome) -> None:
         typer.echo(f"approval: {outcome.approval.scope.value} — {outcome.approval.reason}")
         proposal = outcome.approval.proposal
         if proposal:
-            typer.echo(f"proposal: {proposal.summary}")
-            for change in proposal.changes:
-                location = change.path or change.area
-                typer.echo(f"- {location}: {change.current} -> {change.proposed}")
-            typer.echo(f"expected: {proposal.expected_result}")
-            if proposal.preview_markdown:
-                typer.echo(f"preview:\n{proposal.preview_markdown}")
+            typer.echo(format_approval_details(outcome.approval))
     if outcome.capability_document:
         typer.echo(f"capability: {outcome.capability_document}")
 

@@ -10,6 +10,7 @@ from pathlib import Path, PureWindowsPath
 from uuid import uuid4
 
 from autocoding_agent.core.artifacts.recorder import ArtifactRecorder
+from autocoding_agent.core.data_repair import bind_data_repair, data_repair_text
 from autocoding_agent.core.hermes_consultation import (
     HermesConsultationCoordinator,
     hermes_followup_message,
@@ -845,6 +846,10 @@ class IncidentEngine:
             consecutive_search_repair_rounds = 0
             supplied_assessment = decision.assessment is not None
             decision.assessment = bind_assessment(session, decision, mode="inspect")
+            if decision.data_repair is not None:
+                decision.data_repair = bind_data_repair(
+                    session, decision.data_repair, self.database_access,
+                )
             session.events.append(
                 AgentEvent(
                     type=EventType.DECISION_RECORDED,
@@ -2162,4 +2167,7 @@ def format_incident_summary(decision: IncidentDecision) -> str:
         summary += "\n因果链：" + " → ".join(decision.assessment.causal_chain)
     if decision.assessment and decision.assessment.verification_pending:
         summary += "\n待验证：" + "；".join(decision.assessment.verification_pending)
-    return prefix + f"异常总结\n{summary}\n\n解决方案\n{actions}"
+    rendered = prefix + f"异常总结\n{summary}\n\n解决方案\n{actions}"
+    if decision.data_repair is not None:
+        rendered += "\n\n" + data_repair_text(decision.data_repair)
+    return rendered

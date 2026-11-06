@@ -1019,3 +1019,7 @@ ChatTranscript 保留原始消息、按需折叠与复制，用户/代码块采�
 ## 0.22.0 因果诊断与方案澄清
 
 阶段6复用WorkflowAssessment增加user_questions、causal_chain、verification_pending，均有界且默认空，旧快照可读。两条引擎将带业务问题的审批/完成决定转needs_input，不保存草案为pending_approval；approve再次检查持久问题，异常未澄清不开放处理交接。因果链不是证据，原因确认仍要求本周期有效Read及无缺口；不新增规划器或固定模型调用。
+
+## 0.23.0 数据修复审阅与方案排版
+
+独立DataRepairPlan放在AgentDecision/IncidentDecision可选data_repair中，不复用可执行DataQuery。bind_data_repair只读配置快照和本周期查询事件，不连接库：校核项目授权、方言、配置指纹与业务查询来源，覆盖模型伪造source/review_notes。缺口随草案公开，全部模板都标注未执行。方案保存在原任务快照/决策，开发分析工件及异常处理交接携带模板；交接不继承数据库写权限。无新端点、依赖或固定模型轮次。各端复用proposal_presentation，桌面仍沿用既有Text/Markdown渲染和审批回调。

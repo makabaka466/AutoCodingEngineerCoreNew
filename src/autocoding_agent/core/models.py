@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field, StringConstraints, model_validator
 
 from autocoding_agent.core.artifacts.models import ArtifactRecord
 from autocoding_agent.core.audit.models import DecisionRecord, RiskLevel
+from autocoding_agent.core.data_repair import DataRepairPlan
 from autocoding_agent.core.hermes import HermesSkillObservation, HermesSkillRequest
 from autocoding_agent.core.investigation import InvestigationEntry
 from autocoding_agent.core.runtime.models import RuntimeRunRecord
@@ -123,8 +124,10 @@ class ProposedChange(BaseModel):
 
     path: NonEmptyText | None = None
     area: NonEmptyText
-    current: NonEmptyText
-    proposed: NonEmptyText
+    current: NonEmptyText = Field(description="当前行为，短段落或列表，一项只描述一个改动点。")
+    proposed: NonEmptyText = Field(
+        description="修改后行为，分行列要点；代码用围栏块，避免挤成大段。",
+    )
 
 
 class ChangeProposal(BaseModel):
@@ -172,6 +175,10 @@ class CapabilityDraft(BaseModel):
 
 class AgentDecision(BaseModel):
     """The only machine-readable decision accepted from the model runtime."""
+
+    data_repair: DataRepairPlan | None = Field(
+        default=None, description="可选数据修复审阅模板；不是DataQuery，不授予写入权限。",
+    )
 
     entry: InvestigationEntry | None = Field(
         default=None, description="当前调查入口；旧任务兼容为空。"

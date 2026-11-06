@@ -10,6 +10,7 @@ from uuid import uuid4
 from pydantic import BaseModel, Field, StringConstraints, model_validator
 
 from autocoding_agent.core.artifacts.models import ArtifactRecord
+from autocoding_agent.core.data_repair import DataRepairPlan
 from autocoding_agent.core.hermes import HermesSkillObservation, HermesSkillRequest
 from autocoding_agent.core.investigation import InvestigationEntry
 from autocoding_agent.core.models import AgentEvent, AgentUsage, ChatMessage, utc_now
@@ -138,6 +139,9 @@ class IncidentContinuationDecision(BaseModel):
 
 
 class IncidentDecision(BaseModel):
+    data_repair: DataRepairPlan | None = Field(
+        default=None, description="可选SQL修复草案，只供审阅，不能在诊断中执行。",
+    )
     """One model decision in the incident investigation state machine."""
 
     entry: InvestigationEntry | None = Field(

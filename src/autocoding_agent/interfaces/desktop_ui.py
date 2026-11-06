@@ -23,7 +23,6 @@ from autocoding_agent.core.models import (
     AgentOutcome,
     AgentSession,
     AgentStatus,
-    ApprovalRequest,
     ApprovalScope,
     MessageAttachment,
     MessageRole,
@@ -63,6 +62,7 @@ from autocoding_agent.incident_attachments import (
 from autocoding_agent.interfaces.chat_transcript import ChatTranscript, insert_markdown
 from autocoding_agent.interfaces.desktop_theme import COLORS, IconButton, Tooltip
 from autocoding_agent.interfaces.knowledge_management_ui import KnowledgeManagementDialog
+from autocoding_agent.interfaces.proposal_presentation import format_approval_details
 from autocoding_agent.interfaces.system_settings_ui import SystemSettingsDialog
 from autocoding_agent.knowledge_rag.service import (
     KnowledgeRAGService,
@@ -295,42 +295,6 @@ def incident_session_list_label(session: IncidentSession, max_length: int = 22) 
         title = f"{title[: max_length - 1]}…"
     status = INCIDENT_STATUS_PRESENTATION[session.status][0] if session.status else "未开始"
     return f"{title}\n{status} · {session.updated_at.astimezone():%m-%d %H:%M}"
-
-
-def format_approval_details(approval: ApprovalRequest) -> str:
-    """Format the structured proposal for native-client review."""
-
-    proposal = approval.proposal
-    if proposal is None:
-        lines = [approval.reason]
-        if approval.proposed_actions:
-            lines.extend(["", "计划操作", *[f"• {item}" for item in approval.proposed_actions]])
-        return "\n".join(lines)
-
-    lines = ["方案概述", proposal.summary, "", "修改内容"]
-    for index, change in enumerate(proposal.changes, start=1):
-        location = change.path or change.area
-        if change.path and change.area != change.path:
-            location = f"{change.path} · {change.area}"
-        lines.extend(
-            [
-                f"{index}. {location}",
-                f"   现在：{change.current}",
-                f"   改成：{change.proposed}",
-            ]
-        )
-    lines.extend(["", "目标效果", proposal.expected_result])
-    preview_fallback = (
-        "暂无可在实施前可靠呈现的预览，将按下面的验证计划确认最终效果。"
-        if proposal.validation
-        else "这项修改不适合在实施前生成可信预览，实施后再确认实际效果。"
-    )
-    lines.extend(["", "预览", proposal.preview_markdown or preview_fallback])
-    if proposal.impact:
-        lines.extend(["", "影响与边界", *[f"• {item}" for item in proposal.impact]])
-    if proposal.validation:
-        lines.extend(["", "验证计划", *[f"• {item}" for item in proposal.validation]])
-    return "\n".join(lines)
 
 
 class FlowPill(tk.Canvas):
@@ -3280,6 +3244,10 @@ class DesktopClient:
         self.approval_text.delete("1.0", "end")
         if not hasattr(self, "_approval_renderer"):
             self._approval_renderer = ChatTranscript(self.approval_text)
+            self.approval_text.tag_configure(
+                "approval_body", lmargin1=12, lmargin2=12, rmargin=12,
+                spacing1=2, spacing2=4, spacing3=5,
+            )
         insert_markdown(self.approval_text, format_approval_details(approval), "approval_body")
         self.approval_text.yview_moveto(0.0)
         self.approval_text.configure(state="disabled")

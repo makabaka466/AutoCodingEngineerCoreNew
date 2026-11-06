@@ -124,6 +124,9 @@ class AgentApplication:
                 "summary": decision.message,
                 "diagnosis": decision.diagnosis,
                 "solutions": decision.recommended_actions,
+                "data_repair": (
+                    decision.data_repair.model_dump(mode="json") if decision.data_repair else None
+                ),
                 "findings": [item.model_dump(mode="json") for item in decision.findings],
                 "assessment": (
                     decision.assessment.model_dump(mode="json") if decision.assessment else None
@@ -136,6 +139,7 @@ class AgentApplication:
                 "修改审批 proposal 必须逐项列明工作区相对文件路径、涉及功能、现在行为、修改后行为，"
                 "并列明目标效果、影响范围与兼容性/数据/风险、验证计划。"
                 "不涉及的影响也请明确说明。不得在用户批准前写文件或执行修复命令；"
+                "数据修复SQL仅供审阅，代码修改审批不允许执行数据库写入。"
                 "批准后只实施已审阅方案，新增修改需重新申请。实施后按现有流程申请验证。\n\n"
                 + json.dumps(context, ensure_ascii=False)
             )

@@ -14,6 +14,7 @@ from autocoding_agent.adapters.capability_store import CapabilityStore
 from autocoding_agent.core.artifacts.recorder import ArtifactRecorder
 from autocoding_agent.core.audit.models import ChangeExplanation
 from autocoding_agent.core.audit.recorder import DecisionRecorder
+from autocoding_agent.core.data_repair import bind_data_repair, data_repair_text
 from autocoding_agent.core.handlers import (
     HandlerContext,
     HandlerRegistry,
@@ -1040,6 +1041,12 @@ class AgentEngine:
             decision.assessment = bind_assessment(session, decision, mode=mode.value)
             if decision.status == AgentStatus.NEEDS_INPUT:
                 decision.message = clarification_text(decision)
+            if decision.data_repair is not None:
+                decision.data_repair = bind_data_repair(
+                    session, decision.data_repair, self.database_access,
+                )
+                if decision.status != AgentStatus.NEEDS_INPUT:
+                    decision.message += "\n\n" + data_repair_text(decision.data_repair)
             if supplied_assessment and decision.status in {
                 AgentStatus.QUERY_REQUIRED, AgentStatus.HERMES_SKILL_REQUIRED
             }:

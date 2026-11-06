@@ -1495,3 +1495,7 @@ message明确受阻操作、原因及恢复方法。客户端复用“继续任�
 ## 0.22.0 因果诊断与方案澄清
 
 WorkflowAssessment可选字段user_questions（最多3项）、causal_chain（最多5项）、verification_pending（最多5项），每项不超过240字符。missing保留证据缺口。业务问题未清时返回needs_input，无审批payload；send回答后模型重新生成方案。待验证不挡修改审批，但不能声明verified。旧任务无字段默认空，无法自动识别历史自由文本中的隐含问题。无新增端点。
+
+## 0.23.0 数据修复审阅与方案排版
+
+data_repair为可选对象：datasource_id/dialect、summary/table/scope/expected_rows、参数含义parameters、业务查询名evidence_queries、precheck_sql/repair_sql/verify_sql/rollback_sql、backup/transaction/rollback_conditions/risks。宿主回填source及review_notes。文本与SQL长度有界；只存参数含义，不请求模型保存实际业务值。预期行数未知或证据/来源缺失时明确待核对。前后检查模板使用既有只读校验，修复/回退SQL不进入查询执行链，也不授予数据库写审批。任务详情仍从现有session获取结构化内容，主消息分节展示；旧会话字段默认空。首版单目标库单表，跨库/跨表事务与真实SQL执行不在本阶段范围。

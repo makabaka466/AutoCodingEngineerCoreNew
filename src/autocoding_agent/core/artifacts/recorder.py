@@ -150,6 +150,10 @@ class ArtifactRecorder:
                                 item.model_dump(mode="json") for item in decision.evidence
                             ],
                             "next_actions": decision.next_actions,
+                            "data_repair": (
+                                decision.data_repair.model_dump(mode="json")
+                                if decision.data_repair else None
+                            ),
                         },
                         ensure_ascii=False,
                         indent=2,

@@ -542,9 +542,9 @@ def test_approval_details_show_before_after_plan_and_preview() -> None:
 
     for expected in (
         "Show a reviewable plan",
-        "src/ui.py · approval card",
-        "现在：Only a one-line reason is shown.",
-        "改成：Show current state",
+        "### 1. approval card\n\n文件：`src/ui.py`",
+        "**修改前**\n\nOnly a one-line reason is shown.",
+        "**修改后**\n\nShow current state",
         "The user can review the exact change",
         "No repository edit",
         "Render the approval card",
@@ -1467,6 +1467,11 @@ def test_approval_buttons_route_exact_session_and_rejection_reason(
     operations = _capture_operation(client)
 
     assert client.approval_text.yview()[0] == 0.0
+    displayed = client.approval_text.get("1.0", "end")
+    assert "1. 库存扣减\n\n文件：src/order.py\n\n修改前\n\n取消流程" in displayed
+    assert client.approval_text.tag_ranges("chat_subheading")
+    assert client.approval_text.tag_ranges("chat_inline_code")
+    assert client.approval_text.tag_ranges("chat_bold")
 
     client._approve()
     operations.pop(0)()

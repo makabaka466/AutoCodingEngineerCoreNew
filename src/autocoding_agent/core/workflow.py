@@ -157,7 +157,7 @@ class WorkflowAssessment(BaseModel):
 
 
 WORKFLOW_RULES = """## Advancement
-Return assessment with facts, public reason, gaps and evidence (Read paths, query names, test IDs).
+Return assessment: facts, reason, gaps, evidence (Read paths, query names, test IDs).
 Host verifies provenance, not causality. No private reasoning, raw rows, parameters or secrets.
 Close a named gap per action; revisit conflicts, stop repetition. Confidence grants no permission.
 Completed ends a cycle, not proof: hypothesis if unproven, partial if exhausted,
@@ -172,6 +172,8 @@ alternatives remain missing. Matching symptoms alone is not a confirmed cause.
 Return short analysis initially/on scope changes: sourced observations and bounded questions
 with stop conditions. Distinguish image/user, code/data, inference; latest user input wins.
 Analysis is not proof/permission. Grep discovers; Read key sections before citing.
+data_repair is review-only, never queries/Bash or DB write permission. Bind business DB;
+parameterize keys/old values, check rows, plan rollback. SQL Server: XACT_ABORT; Oracle: no DDL.
 """
 
 
@@ -333,6 +335,8 @@ def bind_assessment(session: Any, decision: Any, *, mode: str) -> WorkflowAssess
 def defer_unresolved_questions(decision: Any) -> Any:
     """两条流程共用澄清门槛；不把有业务分歧的草案展示为可审批方案。"""
     assessment = decision.assessment
+    if assessment and assessment.user_questions and decision.status.value == "needs_input":
+        decision.data_repair = None
     if (assessment is None or not assessment.user_questions
             or decision.status.value not in {"approval_required", "completed"}):
         return decision
@@ -343,6 +347,7 @@ def defer_unresolved_questions(decision: Any) -> Any:
     deferred.assessment.result = ResultKind.UNSPECIFIED
     if hasattr(deferred, "approval"):
         deferred.approval = None
+    deferred.data_repair = None
     if hasattr(deferred, "question"):
         deferred.question = "；".join(assessment.user_questions)
         deferred.diagnosis = None

@@ -63,10 +63,10 @@ def insert_markdown(widget: tk.Text, content: str, base: str, render_code=None) 
         if not line.strip():
             widget.insert("end", "\n", "chat_gap")
             continue
-        heading = re.match(r"^\s{0,3}#{1,6}\s+(.+)$", line)
+        heading = re.match(r"^\s{0,3}(#{1,6})\s+(.+)$", line)
         if heading or line.strip() in _SECTION_TITLES:
-            widget.insert("end", (heading.group(1) if heading else line) + "\n",
-                          (base, "chat_heading"))
+            style = "chat_subheading" if heading and len(heading.group(1)) >= 3 else "chat_heading"
+            widget.insert("end", (heading.group(2) if heading else line) + "\n", (base, style))
             continue
         if re.fullmatch(r"\s*([-*_])\1{2,}\s*", line):
             widget.insert("end", "────────────────────────\n", "chat_muted")
@@ -97,6 +97,8 @@ class ChatTranscript:
         for name, options in {
             "chat_heading": {"font": ("Microsoft YaHei UI", 12, "bold"),
                              "spacing1": 8, "spacing3": 4},
+            "chat_subheading": {"font": ("Microsoft YaHei UI", 11, "bold"),
+                                "spacing1": 10, "spacing3": 4},
             "chat_bold": {"font": ("Microsoft YaHei UI", 10, "bold")},
             "chat_code": {"font": ("Consolas", 10), "background": "#F2F4F7",
                           "lmargin1": 28, "lmargin2": 28, "spacing1": 1, "spacing3": 1},
@@ -116,7 +118,7 @@ class ChatTranscript:
         width = max(300, self.widget.winfo_width())
         margin = 12
         for tag in ("assistant_message", "assistant_name", "system_message", "system_name",
-                    "metadata", "chat_heading"):
+                    "metadata", "chat_heading", "chat_subheading"):
             self.widget.tag_configure(tag, lmargin1=margin, lmargin2=margin, rmargin=margin,
                                       background=COLORS["surface"], foreground=COLORS["text"])
         for tag in ("user_message", "user_name"):
