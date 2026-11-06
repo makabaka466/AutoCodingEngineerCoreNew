@@ -6,11 +6,14 @@ import hashlib
 import json
 import re
 import shutil
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from pydantic import BaseModel
 
+from autocoding_agent.adapters.resource_lock import resource_lock
 from autocoding_agent.core.investigation import entry_text
 from autocoding_agent.core.models import AgentDecision, AgentSession, CapabilityDraft
 from autocoding_agent.core.workflow import assessment_text
@@ -22,6 +25,52 @@ class CapabilityReceipt(BaseModel):
     created: bool
 
 
+@contextmanager
+def capability_directory_lock(directory: Path):
+    """仅串行同一归档目录的短读写事务；OS锁在异常退出后自动释放，支持多个进程。"""
+    lock_path = directory.parent / f".{directory.name}.capabilities.lock"
+    with resource_lock(lock_path, timeout_seconds=30):
+        yield
+
+
+def atomic_capability_text(path: Path, content: str) -> None:
+    """各调用使用独立临时文件，读取方只看到替换前或替换后的完整正文。"""
+    # 不重复目标长文件名，避免旧Windows路径上限下仅临时文件超长。
+    temporary = path.with_name(f".{uuid4().hex[:16]}.tmp")
+    try:
+        temporary.write_text(content, encoding="utf-8")
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def project_capability_view(archive: Path, project: str | None) -> Path:
+    """归档及RAG路径保持不变；模型只挂载所选项目的知识和经验副本，避免同目录串项目。"""
+    if not project:
+        return archive
+    identity = str(archive).casefold() + "\0" + project
+    project_key = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
+    view = archive.parents[2] / "views" / project_key / archive.name
+    for name in ("capabilities", "tasks"):
+        (view / name).mkdir(parents=True, exist_ok=True)
+    for record in session_index_records(archive):
+        if record.get("project") != project:
+            continue
+        source = capability_document_path(archive, record)
+        if source is None:
+            continue
+        content = source.read_text(encoding="utf-8")
+        target = view / "capabilities" / source.name
+        if not target.is_file() or target.read_text(encoding="utf-8") != content:
+            atomic_capability_text(target, content)
+        copied = {**record, "document": f"capabilities/{source.name}"}
+        metadata = json.dumps(copied, ensure_ascii=False, indent=2)
+        target_record = view / "tasks" / f"{source.stem}.json"
+        if not target_record.is_file() or target_record.read_text(encoding="utf-8") != metadata:
+            atomic_capability_text(target_record, metadata)
+    return view
+
+
 class CapabilityStore:
     """Persist human-readable learning without touching the user's repository."""
 
@@ -31,17 +80,16 @@ class CapabilityStore:
         self.knowledge_root = knowledge_root.resolve() if knowledge_root else None
 
     def prepare(self, workspace: str | Path, project: str | None = None) -> Path:
-        directory = self._workspace_dir(workspace)
-        self._migrate_legacy(directory)
-        (directory / "capabilities").mkdir(parents=True, exist_ok=True)
-        (directory / "pinned").mkdir(parents=True, exist_ok=True)
-        (directory / "tasks").mkdir(parents=True, exist_ok=True)
-        if self.knowledge_root is not None:
-            sync_knowledge_documents(
-                self.knowledge_root, directory / "pinned", project
-            )
-        self._rebuild_index(directory, project)
-        return directory
+        archive = self._workspace_dir(workspace)
+        with capability_directory_lock(archive):
+            self._migrate_legacy(archive)
+            directory = project_capability_view(archive, project)
+            for name in ("capabilities", "pinned", "tasks"):
+                (directory / name).mkdir(parents=True, exist_ok=True)
+            if self.knowledge_root is not None:
+                sync_knowledge_documents(self.knowledge_root, directory / "pinned", project)
+            self._rebuild_index(directory, project)
+            return directory
 
     def record(
         self,
@@ -49,123 +97,127 @@ class CapabilityStore:
         decision: AgentDecision,
         model: str,
     ) -> CapabilityReceipt:
-        directory = self.prepare(session.workspace, session.project)
-        draft = decision.capability or self._fallback_draft(session, decision)
-        # One stable UUID-derived file belongs to one conversation and cannot leak a model title.
-        document = directory / "capabilities" / f"{session.id}.md"
-        task_record = directory / "tasks" / f"{session.id}.json"
-        index_file = directory / "CAPABILITIES.md"
+        directory = self._workspace_dir(session.workspace)
+        with capability_directory_lock(directory):
+            self._migrate_legacy(directory)
+            for name in ("capabilities", "pinned", "tasks"):
+                (directory / name).mkdir(parents=True, exist_ok=True)
+            draft = decision.capability or self._fallback_draft(session, decision)
+            # Stable UUID filenames belong to one conversation and do not leak model titles.
+            document = directory / "capabilities" / f"{session.id}.md"
+            task_record = directory / "tasks" / f"{session.id}.json"
+            index_file = directory / "CAPABILITIES.md"
 
-        workspace = str(Path(session.workspace).resolve())
-        safe = lambda value: sanitize_text(value, workspace)  # noqa: E731 - renderer helper
-        relative_document = document.relative_to(directory).as_posix()
-        cycle = self._cycle_record(session, decision, model, safe)
+            workspace = str(Path(session.workspace).resolve())
+            safe = lambda value: sanitize_text(value, workspace)  # noqa: E731 - renderer helper
+            relative_document = document.relative_to(directory).as_posix()
+            cycle = self._cycle_record(session, decision, model, safe)
 
-        if task_record.exists():
-            stored = json.loads(task_record.read_text(encoding="utf-8"))
-            cycles = merge_cycle_entries(cycle_entries_from_record(stored))
-            recorded = {int(item["cycle_number"]) for item in cycles}
-            appendices: list[str] = []
+            if task_record.exists():
+                stored = json.loads(task_record.read_text(encoding="utf-8"))
+                cycles = merge_cycle_entries(cycle_entries_from_record(stored))
+                recorded = {int(item["cycle_number"]) for item in cycles}
+                appendices: list[str] = []
 
-            # v0.5.3 briefly wrote one file per cycle. Preserve those files, but fold their
-            # content and metadata into the stable session document when it is next touched.
-            for legacy in legacy_cycle_records(directory, session.id):
-                for legacy_cycle in cycle_entries_from_record(legacy):
-                    number = int(legacy_cycle["cycle_number"])
-                    if number in recorded:
-                        continue
-                    cycles.append(legacy_cycle)
-                    recorded.add(number)
-                    appendices.append(render_legacy_cycle_appendix(directory, legacy, number))
+                # v0.5.3 briefly wrote one file per cycle. Preserve those files, but fold their
+                # content and metadata into the stable session document when it is next touched.
+                for legacy in legacy_cycle_records(directory, session.id):
+                    for legacy_cycle in cycle_entries_from_record(legacy):
+                        number = int(legacy_cycle["cycle_number"])
+                        if number in recorded:
+                            continue
+                        cycles.append(legacy_cycle)
+                        recorded.add(number)
+                        appendices.append(render_legacy_cycle_appendix(directory, legacy, number))
 
-            if session.cycle_number not in recorded:
-                cycles.append(cycle)
-                recorded.add(session.cycle_number)
-                appendices.append(
-                    self._render_cycle_appendix(session, decision, draft, safe)
+                if session.cycle_number not in recorded:
+                    cycles.append(cycle)
+                    recorded.add(session.cycle_number)
+                    appendices.append(
+                        self._render_cycle_appendix(session, decision, draft, safe)
+                    )
+
+                cycles = merge_cycle_entries(cycles)
+                if appendices:
+                    created_at = str(
+                        stored.get("created_at")
+                        or stored.get("completed_at")
+                        or cycles[0].get("completed_at")
+                        or session.updated_at.isoformat()
+                    )
+                    body = markdown_body(
+                        document.read_text(encoding="utf-8")
+                        if document.is_file()
+                        else "# Recovered development capability\n"
+                    )
+                    header = capability_frontmatter(
+                        workflow="development",
+                        session_id=session.id,
+                        cycle_count=len(cycles),
+                        last_cycle_number=max(recorded),
+                        model=model,
+                        created_at=created_at,
+                        updated_at=session.updated_at.isoformat(),
+                    )
+                    markdown = header + body.rstrip() + "\n\n" + "\n\n".join(appendices) + "\n"
+                    self._atomic_text(document, markdown)
+                    stored.update(
+                        {
+                            "schema_version": 2,
+                            "cycle_number": session.cycle_number,
+                            "cycle_count": len(cycles),
+                            "last_cycle_number": max(recorded),
+                            "cycle_objective": cycle["cycle_objective"],
+                            "outcome": cycle["outcome"],
+                            "changed_files": cycle["changed_files"],
+                            "test_summary": cycle["test_summary"],
+                            "model": model,
+                            "completed_at": session.updated_at.isoformat(),
+                            "updated_at": session.updated_at.isoformat(),
+                            "created_at": created_at,
+                            "document": relative_document,
+                            "cycles": cycles,
+                        }
+                    )
+                    self._atomic_text(task_record, json.dumps(stored, ensure_ascii=False, indent=2))
+
+                self._rebuild_index(directory, session.project)
+                return CapabilityReceipt(
+                    document_path=str(document),
+                    index_path=str(index_file),
+                    created=False,
                 )
 
-            cycles = merge_cycle_entries(cycles)
-            if appendices:
-                created_at = str(
-                    stored.get("created_at")
-                    or stored.get("completed_at")
-                    or cycles[0].get("completed_at")
-                    or session.updated_at.isoformat()
-                )
-                body = markdown_body(
-                    document.read_text(encoding="utf-8")
-                    if document.is_file()
-                    else "# Recovered development capability\n"
-                )
-                header = capability_frontmatter(
-                    workflow="development",
-                    session_id=session.id,
-                    cycle_count=len(cycles),
-                    last_cycle_number=max(recorded),
-                    model=model,
-                    created_at=created_at,
-                    updated_at=session.updated_at.isoformat(),
-                )
-                markdown = header + body.rstrip() + "\n\n" + "\n\n".join(appendices) + "\n"
-                self._atomic_text(document, markdown)
-                stored.update(
-                    {
-                        "schema_version": 2,
-                        "cycle_number": session.cycle_number,
-                        "cycle_count": len(cycles),
-                        "last_cycle_number": max(recorded),
-                        "cycle_objective": cycle["cycle_objective"],
-                        "outcome": cycle["outcome"],
-                        "changed_files": cycle["changed_files"],
-                        "test_summary": cycle["test_summary"],
-                        "model": model,
-                        "completed_at": session.updated_at.isoformat(),
-                        "updated_at": session.updated_at.isoformat(),
-                        "created_at": created_at,
-                        "document": relative_document,
-                        "cycles": cycles,
-                    }
-                )
-                self._atomic_text(task_record, json.dumps(stored, ensure_ascii=False, indent=2))
-
+            markdown = self._render_markdown(session, decision, draft, model, safe)
+            self._atomic_text(document, markdown)
+            record: dict[str, Any] = {
+                "schema_version": 2,
+                "task_id": session.id,
+                "session_id": session.id,
+                "cycle_number": session.cycle_number,
+                "cycle_count": 1,
+                "last_cycle_number": session.cycle_number,
+                "workspace_id": directory.parent.name,
+                "project": session.project,
+                "goal": safe(session.goal),
+                "cycle_objective": safe(session.cycle_objective or session.goal),
+                "outcome": safe(decision.message),
+                "changed_files": [safe(path) for path in decision.changed_files],
+                "test_summary": safe(decision.test_summary or ""),
+                "document": relative_document,
+                "model": model,
+                "completed_at": session.updated_at.isoformat(),
+                "created_at": session.updated_at.isoformat(),
+                "updated_at": session.updated_at.isoformat(),
+                "cycles": [cycle],
+            }
+            self._atomic_text(task_record, json.dumps(record, ensure_ascii=False, indent=2))
             self._rebuild_index(directory, session.project)
             return CapabilityReceipt(
                 document_path=str(document),
                 index_path=str(index_file),
-                created=False,
+                created=True,
             )
-
-        markdown = self._render_markdown(session, decision, draft, model, safe)
-        self._atomic_text(document, markdown)
-        record: dict[str, Any] = {
-            "schema_version": 2,
-            "task_id": session.id,
-            "session_id": session.id,
-            "cycle_number": session.cycle_number,
-            "cycle_count": 1,
-            "last_cycle_number": session.cycle_number,
-            "workspace_id": directory.parent.name,
-            "project": session.project,
-            "goal": safe(session.goal),
-            "cycle_objective": safe(session.cycle_objective or session.goal),
-            "outcome": safe(decision.message),
-            "changed_files": [safe(path) for path in decision.changed_files],
-            "test_summary": safe(decision.test_summary or ""),
-            "document": relative_document,
-            "model": model,
-            "completed_at": session.updated_at.isoformat(),
-            "created_at": session.updated_at.isoformat(),
-            "updated_at": session.updated_at.isoformat(),
-            "cycles": [cycle],
-        }
-        self._atomic_text(task_record, json.dumps(record, ensure_ascii=False, indent=2))
-        self._rebuild_index(directory, session.project)
-        return CapabilityReceipt(
-            document_path=str(document),
-            index_path=str(index_file),
-            created=True,
-        )
 
     @staticmethod
     def _cycle_record(
@@ -374,9 +426,7 @@ only entries relevant to the current task and verify them against current reposi
 
     @staticmethod
     def _atomic_text(path: Path, content: str) -> None:
-        temporary = path.with_suffix(path.suffix + ".tmp")
-        temporary.write_text(content, encoding="utf-8")
-        temporary.replace(path)
+        atomic_capability_text(path, content)
 
 
 def capability_frontmatter(
@@ -596,9 +646,7 @@ def sync_knowledge_documents(
             target.parent.mkdir(parents=True, exist_ok=True)
             content = navigation.read_text(encoding="utf-8")
             if not target.is_file() or target.read_text(encoding="utf-8") != content:
-                temporary = target.with_suffix(".tmp")
-                temporary.write_text(content, encoding="utf-8")
-                temporary.replace(target)
+                atomic_capability_text(target, content)
         elif target.is_file():
             target.unlink()  # 删除已移除规则的缓存，避免继续使用过期入口说明。
     for source in sources:
@@ -607,9 +655,7 @@ def sync_knowledge_documents(
         content = source.read_text(encoding="utf-8")
         if target.is_file() and target.read_text(encoding="utf-8") == content:
             continue
-        temporary = target.with_suffix(target.suffix + ".tmp")
-        temporary.write_text(content, encoding="utf-8")
-        temporary.replace(target)
+        atomic_capability_text(target, content)
 
 
 def sanitize_text(value: str, workspace: str) -> str:

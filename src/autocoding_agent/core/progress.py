@@ -25,6 +25,7 @@ class ProgressWorkflow(StrEnum):
 
 
 class ProgressPhase(StrEnum):
+    QUEUED = "queued"
     PREPARING_CONTEXT = "preparing_context"
     RETRIEVING_KNOWLEDGE = "retrieving_knowledge"
     CONSULTING_ENGINEERING_EXPERIENCE = "consulting_engineering_experience"
@@ -47,6 +48,7 @@ class ProgressPhase(StrEnum):
 
 
 PROGRESS_LABELS: dict[ProgressPhase, str] = {
+    ProgressPhase.QUEUED: "任务排队中",
     ProgressPhase.PREPARING_CONTEXT: "正在准备任务上下文",
     ProgressPhase.RETRIEVING_KNOWLEDGE: "正在检索项目知识",
     ProgressPhase.CONSULTING_ENGINEERING_EXPERIENCE: "正在咨询工程经验",

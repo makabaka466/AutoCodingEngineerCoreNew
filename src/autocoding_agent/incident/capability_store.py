@@ -9,6 +9,8 @@ from typing import Any
 
 from autocoding_agent.adapters.capability_store import (
     CapabilityReceipt,
+    atomic_capability_text,
+    capability_directory_lock,
     capability_document_path,
     capability_frontmatter,
     cycle_entries_from_record,
@@ -16,6 +18,7 @@ from autocoding_agent.adapters.capability_store import (
     markdown_body,
     merge_cycle_entries,
     pinned_markdown_entries,
+    project_capability_view,
     render_legacy_cycle_appendix,
     sanitize_text,
     session_index_records,
@@ -53,16 +56,15 @@ class IncidentCapabilityStore:
         self.knowledge_root = knowledge_root.resolve() if knowledge_root else None
 
     def prepare(self, workspace: str | Path, project: str | None = None) -> Path:
-        directory = self._workspace_dir(workspace)
-        (directory / "capabilities").mkdir(parents=True, exist_ok=True)
-        (directory / "pinned").mkdir(parents=True, exist_ok=True)
-        (directory / "tasks").mkdir(parents=True, exist_ok=True)
-        if self.knowledge_root is not None:
-            sync_knowledge_documents(
-                self.knowledge_root, directory / "pinned", project
-            )
-        self._rebuild_index(directory, project)
-        return directory
+        archive = self._workspace_dir(workspace)
+        with capability_directory_lock(archive):
+            directory = project_capability_view(archive, project)
+            for name in ("capabilities", "pinned", "tasks"):
+                (directory / name).mkdir(parents=True, exist_ok=True)
+            if self.knowledge_root is not None:
+                sync_knowledge_documents(self.knowledge_root, directory / "pinned", project)
+            self._rebuild_index(directory, project)
+            return directory
 
     def record(
         self,
@@ -70,115 +72,118 @@ class IncidentCapabilityStore:
         decision: IncidentDecision,
         model: str,
     ) -> CapabilityReceipt:
-        directory = self.prepare(session.workspace, session.project)
-        document = directory / "capabilities" / f"{session.id}.md"
-        task_record = directory / "tasks" / f"{session.id}.json"
-        index_file = directory / "CAPABILITIES.md"
+        directory = self._workspace_dir(session.workspace)
+        with capability_directory_lock(directory):
+            for name in ("capabilities", "pinned", "tasks"):
+                (directory / name).mkdir(parents=True, exist_ok=True)
+            document = directory / "capabilities" / f"{session.id}.md"
+            task_record = directory / "tasks" / f"{session.id}.json"
+            index_file = directory / "CAPABILITIES.md"
 
-        workspace = str(Path(session.workspace).resolve())
-        safe = lambda value: sanitize_text(value, workspace)  # noqa: E731
-        relative_document = document.relative_to(directory).as_posix()
-        cycle = self._cycle_record(session, decision, model, safe)
+            workspace = str(Path(session.workspace).resolve())
+            safe = lambda value: sanitize_text(value, workspace)  # noqa: E731
+            relative_document = document.relative_to(directory).as_posix()
+            cycle = self._cycle_record(session, decision, model, safe)
 
-        if task_record.exists():
-            stored = json.loads(task_record.read_text(encoding="utf-8"))
-            cycles = merge_cycle_entries(cycle_entries_from_record(stored))
-            recorded = {int(item["cycle_number"]) for item in cycles}
-            appendices: list[str] = []
+            if task_record.exists():
+                stored = json.loads(task_record.read_text(encoding="utf-8"))
+                cycles = merge_cycle_entries(cycle_entries_from_record(stored))
+                recorded = {int(item["cycle_number"]) for item in cycles}
+                appendices: list[str] = []
 
-            for legacy in legacy_cycle_records(directory, session.id):
-                for legacy_cycle in cycle_entries_from_record(legacy):
-                    number = int(legacy_cycle["cycle_number"])
-                    if number in recorded:
-                        continue
-                    cycles.append(legacy_cycle)
-                    recorded.add(number)
-                    appendices.append(render_legacy_cycle_appendix(directory, legacy, number))
+                for legacy in legacy_cycle_records(directory, session.id):
+                    for legacy_cycle in cycle_entries_from_record(legacy):
+                        number = int(legacy_cycle["cycle_number"])
+                        if number in recorded:
+                            continue
+                        cycles.append(legacy_cycle)
+                        recorded.add(number)
+                        appendices.append(render_legacy_cycle_appendix(directory, legacy, number))
 
-            if session.cycle_number not in recorded:
-                cycles.append(cycle)
-                recorded.add(session.cycle_number)
-                appendices.append(self._render_cycle_appendix(session, decision, safe))
+                if session.cycle_number not in recorded:
+                    cycles.append(cycle)
+                    recorded.add(session.cycle_number)
+                    appendices.append(self._render_cycle_appendix(session, decision, safe))
 
-            cycles = merge_cycle_entries(cycles)
-            if appendices:
-                created_at = str(
-                    stored.get("created_at")
-                    or stored.get("completed_at")
-                    or cycles[0].get("completed_at")
-                    or session.updated_at.isoformat()
+                cycles = merge_cycle_entries(cycles)
+                if appendices:
+                    created_at = str(
+                        stored.get("created_at")
+                        or stored.get("completed_at")
+                        or cycles[0].get("completed_at")
+                        or session.updated_at.isoformat()
+                    )
+                    body = markdown_body(
+                        document.read_text(encoding="utf-8")
+                        if document.is_file()
+                        else "# Recovered incident capability\n"
+                    )
+                    header = capability_frontmatter(
+                        workflow="incident",
+                        session_id=session.id,
+                        cycle_count=len(cycles),
+                        last_cycle_number=max(recorded),
+                        model=model,
+                        created_at=created_at,
+                        updated_at=session.updated_at.isoformat(),
+                    )
+                    markdown = header + body.rstrip() + "\n\n" + "\n\n".join(appendices) + "\n"
+                    self._atomic_text(document, markdown)
+                    stored.update(
+                        {
+                            "schema_version": 2,
+                            "cycle_number": session.cycle_number,
+                            "cycle_count": len(cycles),
+                            "last_cycle_number": max(recorded),
+                            "cycle_objective": cycle["cycle_objective"],
+                            "outcome": cycle["outcome"],
+                            "completion_kind": cycle["completion_kind"],
+                            "model": model,
+                            "completed_at": session.updated_at.isoformat(),
+                            "updated_at": session.updated_at.isoformat(),
+                            "created_at": created_at,
+                            "document": relative_document,
+                            "cycles": cycles,
+                        }
+                    )
+                    self._atomic_text(task_record, json.dumps(stored, ensure_ascii=False, indent=2))
+
+                self._rebuild_index(directory, session.project)
+                return CapabilityReceipt(
+                    document_path=str(document),
+                    index_path=str(index_file),
+                    created=False,
                 )
-                body = markdown_body(
-                    document.read_text(encoding="utf-8")
-                    if document.is_file()
-                    else "# Recovered incident capability\n"
-                )
-                header = capability_frontmatter(
-                    workflow="incident",
-                    session_id=session.id,
-                    cycle_count=len(cycles),
-                    last_cycle_number=max(recorded),
-                    model=model,
-                    created_at=created_at,
-                    updated_at=session.updated_at.isoformat(),
-                )
-                markdown = header + body.rstrip() + "\n\n" + "\n\n".join(appendices) + "\n"
-                self._atomic_text(document, markdown)
-                stored.update(
-                    {
-                        "schema_version": 2,
-                        "cycle_number": session.cycle_number,
-                        "cycle_count": len(cycles),
-                        "last_cycle_number": max(recorded),
-                        "cycle_objective": cycle["cycle_objective"],
-                        "outcome": cycle["outcome"],
-                        "completion_kind": cycle["completion_kind"],
-                        "model": model,
-                        "completed_at": session.updated_at.isoformat(),
-                        "updated_at": session.updated_at.isoformat(),
-                        "created_at": created_at,
-                        "document": relative_document,
-                        "cycles": cycles,
-                    }
-                )
-                self._atomic_text(task_record, json.dumps(stored, ensure_ascii=False, indent=2))
 
+            self._atomic_text(document, self._render(session, decision, model, safe))
+            record: dict[str, Any] = {
+                "schema_version": 2,
+                "domain": "incident",
+                "task_id": session.id,
+                "session_id": session.id,
+                "cycle_number": session.cycle_number,
+                "cycle_count": 1,
+                "last_cycle_number": session.cycle_number,
+                "workspace_id": directory.parent.name,
+                "project": session.project,
+                "problem": safe(session.problem),
+                "cycle_objective": safe(session.cycle_objective or session.problem),
+                "outcome": safe(decision.message),
+                "completion_kind": decision.completion_kind.value,
+                "document": relative_document,
+                "model": model,
+                "completed_at": session.updated_at.isoformat(),
+                "created_at": session.updated_at.isoformat(),
+                "updated_at": session.updated_at.isoformat(),
+                "cycles": [cycle],
+            }
+            self._atomic_text(task_record, json.dumps(record, ensure_ascii=False, indent=2))
             self._rebuild_index(directory, session.project)
             return CapabilityReceipt(
                 document_path=str(document),
                 index_path=str(index_file),
-                created=False,
+                created=True,
             )
-
-        self._atomic_text(document, self._render(session, decision, model, safe))
-        record: dict[str, Any] = {
-            "schema_version": 2,
-            "domain": "incident",
-            "task_id": session.id,
-            "session_id": session.id,
-            "cycle_number": session.cycle_number,
-            "cycle_count": 1,
-            "last_cycle_number": session.cycle_number,
-            "workspace_id": directory.parent.name,
-            "project": session.project,
-            "problem": safe(session.problem),
-            "cycle_objective": safe(session.cycle_objective or session.problem),
-            "outcome": safe(decision.message),
-            "completion_kind": decision.completion_kind.value,
-            "document": relative_document,
-            "model": model,
-            "completed_at": session.updated_at.isoformat(),
-            "created_at": session.updated_at.isoformat(),
-            "updated_at": session.updated_at.isoformat(),
-            "cycles": [cycle],
-        }
-        self._atomic_text(task_record, json.dumps(record, ensure_ascii=False, indent=2))
-        self._rebuild_index(directory, session.project)
-        return CapabilityReceipt(
-            document_path=str(document),
-            index_path=str(index_file),
-            created=True,
-        )
 
     @staticmethod
     def _cycle_record(
@@ -402,6 +407,4 @@ entries relevant to the current incident and verify them against current code an
 
     @staticmethod
     def _atomic_text(path: Path, content: str) -> None:
-        temporary = path.with_suffix(path.suffix + ".tmp")
-        temporary.write_text(content, encoding="utf-8")
-        temporary.replace(path)
+        atomic_capability_text(path, content)

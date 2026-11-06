@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
-from uuid import NAMESPACE_URL, uuid5
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
+from autocoding_agent.adapters.execution_scheduler import ExecutionScheduler
 from autocoding_agent.adapters.sqlite_incident_store import SQLiteIncidentStore
 from autocoding_agent.adapters.sqlite_task_store import SQLiteTaskStore
 from autocoding_agent.core.models import MessageRole
@@ -20,6 +21,7 @@ class ApiService:
     def __init__(self, config: ServerConfig) -> None:
         self.config = config
         self.queue = QueueStore(config.data_dir)
+        self.scheduler = ExecutionScheduler(config.data_dir)
         # 查询服务不构建应用、不执行模型、不运行孤儿恢复扫描。
         self.sessions = {
             "development": SQLiteTaskStore(config.data_dir, migrate_legacy_json=False),
@@ -66,7 +68,8 @@ class ApiService:
         if self.queue.latest_job(task_id)["status"] in {"queued", "running"}:
             raise ApiError(409, "请等待当前操作完成")
         try:
-            return self.git(owner, task).preview()
+            with self.scheduler.acquire("git", str(uuid4()), task["workspace"], write=True):
+                return self.git(owner, task).preview()
         except GitVersionError as exc:
             raise ApiError(409, str(exc)) from exc
 
@@ -157,7 +160,7 @@ class ApiService:
             recovery_state = session and session.task_state in {
                 TaskState.PAUSED, TaskState.RECOVERY_REQUIRED
             }
-            if latest["status"] != "recovery_required" and not recovery_state:
+            if latest["status"] not in {"recovery_required", "cancelled"} and not recovery_state:
                 raise ApiError(409, "此任务不需要恢复")
         elif operation == "git_sync":
             self.git(owner, task)
@@ -184,6 +187,15 @@ class ApiService:
         self.task(owner, job["task_id"])
         return job
 
+    def stop(self, owner: str, task_id: str, job_id: str) -> dict:
+        """HTTP进程只持久化控制意图，工作线程负责在安全边界保存暂停状态。"""
+        task = self.task(owner, task_id)
+        database = self.sessions[task["workflow"]].database
+        domain_id = self.queue.domain_id(task_id)
+        return self.queue.stop(
+            task_id, owner, job_id, lambda: database.request_stop(domain_id),
+        )
+
     def events(self, owner: str, task_id: str, after: int, limit: int) -> dict:
         self.task(owner, task_id)
         return self.queue.events(task_id, after, limit)
@@ -192,6 +204,13 @@ class ApiService:
         task = self.task(owner, task_id)
         job = self.queue.latest_job(task_id)
         session = self.session(task)
+        execution = self.scheduler.status(task["workflow"], self.queue.domain_id(task_id))
+        if execution is not None:
+            execution = {key: execution[key] for key in (
+                "state", "queued_at", "started_at", "queue_seconds", "execution_seconds",
+            ) if key in execution}
+            if execution["state"] == "reserved":
+                execution["state"] = "queued"
         decision = session.last_decision if session else None
         summary = None
         if decision:
@@ -219,6 +238,7 @@ class ApiService:
             "task_id": task_id, "workflow": task["workflow"], "project_id": task["project_id"],
             "state": session.task_state.value if session else "created",
             "version": session.version if session else None,
+            "execution": execution,
             "cycle_number": session.cycle_number if session else None,
             "job": job, "recovery_required": job["status"] == "recovery_required" or bool(
                 session and session.task_state in {TaskState.PAUSED, TaskState.RECOVERY_REQUIRED}

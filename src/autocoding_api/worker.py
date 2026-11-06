@@ -1,12 +1,14 @@
-"""单执行进程：调用已有应用服务，保守恢复，绝不自动重放领取后的操作。"""
+"""单进程有界并发执行：调用已有应用服务，领取后中断的操作绝不自动重放。"""
 
 from __future__ import annotations
 
 import logging
 import os
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from threading import Event, Thread
 
+from autocoding_agent.adapters.execution_scheduler import QueuedTaskStopped
 from autocoding_agent.application import build_application
 from autocoding_agent.config import Settings
 from autocoding_agent.core.state_machine.models import TaskState
@@ -96,6 +98,11 @@ class Worker:
             return False
         try:
             self._execute(job)
+        except QueuedTaskStopped:
+            database = self.service.sessions[job["task"]["workflow"]].database
+            queue.finish(job["id"], "cancelled", on_finish=lambda: database.clear_stop(
+                self.service.queue.domain_id(job["task_id"]),
+            ))
         except ApiError as exc:
             queue.finish(job["id"], "failed", exc.detail)
         except GitVersionError as exc:
@@ -110,8 +117,45 @@ class Worker:
             logger.error("job_interrupted job_id=%s type=%s", job["id"], type(exc).__name__)
             queue.finish(job["id"], "recovery_required", "执行异常，请查询任务并选择只读恢复")
         else:
-            queue.finish(job["id"], "succeeded")
+            def clear_finished_stop():
+                session = self.service.session(job["task"])
+                if session and session.task_state not in {
+                    TaskState.PAUSED, TaskState.RECOVERY_REQUIRED,
+                }:
+                    # 停止可能迟于领域结果、早于队列确认；不能把旧操作的信号带到下一轮。
+                    self.service.sessions[job["task"]["workflow"]].database.clear_stop(session.id)
+
+            queue.finish(job["id"], "succeeded", on_finish=clear_finished_stop)
         return True
+
+    def run(self, stopped: Event, max_workers: int) -> None:
+        """每个执行槽独立领任务；停止服务时先保存停止意图，再等待安全边界。"""
+        if max_workers < 1:
+            raise ValueError("并发执行数必须大于零")
+
+        def consume():
+            while not stopped.is_set():
+                if not self.run_once():
+                    stopped.wait(0.5)
+
+        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="api-job") as pool:
+            futures = [pool.submit(consume) for _ in range(max_workers)]
+            try:
+                while not stopped.is_set():
+                    finished, _ = wait(futures, timeout=0.2, return_when=FIRST_COMPLETED)
+                    for future in finished:
+                        future.result()  # 领取队列等基础设施异常不能静默丢失执行线程。
+            finally:
+                stopped.set()
+                while not all(future.done() for future in futures):
+                    for job in self.service.queue.running():
+                        try:
+                            self.service.stop(job["owner"], job["task_id"], job["id"])
+                        except Exception:
+                            logger.warning("worker_stop_failed job_id=%s", job["id"], exc_info=True)
+                    wait(futures, timeout=0.2)
+            for future in futures:
+                future.result()
 
     def reconcile_finished_commands(self) -> None:
         """领域命令回执已提交时，仅补齐队列确认，不重新执行代码或模型。"""
@@ -177,7 +221,10 @@ class Worker:
             target = self.applications["development"].git(task["workspace"])
             if target is None:
                 raise ApiError(409, "当前项目未配置 Git 远端")
-            head = target.sync()
+            head = application.sync_git(
+                task["workspace"], session_id=self.service.queue.domain_id(task["id"]),
+                progress_sink=sink,
+            )
             self.service.queue.progress(job["id"], {"label": "代码已更新", "commit": head})
             return
         if job["operation"] == "git_publish":
@@ -279,9 +326,7 @@ def run_worker(config: ServerConfig, stop: Event | None = None) -> None:
         heartbeat = Thread(target=pulse, name="api-worker-heartbeat", daemon=True)
         heartbeat.start()
         try:
-            while not stopped.is_set():
-                if not worker.run_once():
-                    stopped.wait(0.5)
+            worker.run(stopped, Settings(data_dir=config.data_dir).max_concurrent_tasks)
         finally:
             heartbeats_done.set()
             heartbeat.join(timeout=10)

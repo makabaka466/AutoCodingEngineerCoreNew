@@ -11,6 +11,7 @@ from pathlib import Path, PureWindowsPath
 from uuid import uuid4
 
 from autocoding_agent.adapters.capability_store import CapabilityStore
+from autocoding_agent.adapters.execution_scheduler import exclusive_task, scheduled_turn
 from autocoding_agent.core.approval_execution import (
     approval_changes,
     approval_file_changes,
@@ -198,6 +199,7 @@ class AgentEngine:
         self.max_hermes_skill_rounds = max_hermes_skill_rounds
         self.source_incident_current = source_incident_current
 
+    @exclusive_task
     def start(
         self,
         workspace: str | Path,
@@ -255,6 +257,7 @@ class AgentEngine:
             session, message.strip(), AgentMode.INSPECT, command, progress_sink
         )
 
+    @exclusive_task
     def send(
         self,
         session_id: str,
@@ -319,6 +322,7 @@ class AgentEngine:
             )
         )
 
+    @exclusive_task
     def approve(
         self,
         session_id: str,
@@ -391,6 +395,7 @@ class AgentEngine:
         )
         return self._run_command(session, message, mode, command, progress_sink)
 
+    @exclusive_task
     def reject(
         self,
         session_id: str,
@@ -476,6 +481,7 @@ class AgentEngine:
         database = getattr(self.sessions, "database", None)
         return database is not None and database.stop_requested(session_id)
 
+    @exclusive_task
     def resume(
         self,
         session_id: str,
@@ -535,6 +541,7 @@ class AgentEngine:
         )
         return self._run_command(session, message, AgentMode.INSPECT, command, progress_sink)
 
+    @exclusive_task
     def pause(self, session_id: str) -> AgentOutcome:
         session = self.sessions.load(session_id)
         if self.state_machine.is_terminal(session.task_state):
@@ -559,6 +566,7 @@ class AgentEngine:
         self.sessions.save(session)
         return self._to_outcome(session)
 
+    @exclusive_task
     def cancel(
         self,
         session_id: str,
@@ -626,6 +634,7 @@ class AgentEngine:
     def explain_change(self, session_id: str, path: str) -> ChangeExplanation:
         return self.decision_recorder.explain_change(self.sessions.load(session_id), path)
 
+    @scheduled_turn
     def _run_command(
         self,
         session: AgentSession,
@@ -734,15 +743,17 @@ class AgentEngine:
 
         # 第 1 步：先进入本轮已授权的模式，再允许 Runtime 或宿主执行任何操作。
         self._enter_mode_state(session, mode, command)
-        session.messages.append(ChatMessage(role=MessageRole.USER, content=user_message))
-        session.events.append(
-            AgentEvent(
-                type=EventType.TURN_STARTED,
-                message=f"Started {mode.value} turn.",
-                data={"mode": mode.value, "owner_id": self.runtime_lifecycle.owner_id,
-                      "owner_pid": os.getpid()},
+        if not any(event.command_id == command.id and event.data.get("scheduled")
+                   for event in session.events[-4:]):
+            session.messages.append(ChatMessage(role=MessageRole.USER, content=user_message))
+            session.events.append(
+                AgentEvent(
+                    type=EventType.TURN_STARTED,
+                    message=f"Started {mode.value} turn.",
+                    data={"mode": mode.value, "owner_id": self.runtime_lifecycle.owner_id,
+                          "owner_pid": os.getpid()},
+                )
             )
-        )
         session.updated_at = utc_now()
         self.sessions.save(session)
 

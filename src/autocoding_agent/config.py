@@ -120,6 +120,9 @@ class Settings(BaseSettings):
     incident_max_query_repair_rounds: int = Field(default=1, ge=0, le=3)
     agent_max_replan_rounds: int = Field(default=2, ge=1, le=10)
     runtime_lease_seconds: int = Field(default=30, ge=5, le=3600)
+    max_concurrent_tasks: int = Field(
+        default=3, ge=1, le=16, description="共享数据目录内的全局执行上限，超出后排队。",
+    )
 
     model_config = SettingsConfigDict(
         env_prefix="AUTO_CODING_",

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from collections.abc import Callable
 from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -258,13 +259,51 @@ class QueueStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def finish(self, job_id: str, status: str, error: str | None = None) -> None:
+    def stop(
+        self, task_id: str, owner: str, job_id: str, request_running_stop: Callable[[], None],
+    ) -> dict:
+        """停止绑定具体操作；与领取/追加操作互斥，迟到请求不能影响下一轮。"""
+        with self.transaction() as db:
+            self._task(db, task_id, owner)
+            row = db.execute(
+                "SELECT * FROM jobs WHERE id=? AND task_id=? AND owner=?",
+                (job_id, task_id, owner),
+            ).fetchone()
+            if row is None:
+                raise ApiError(404, "操作不存在")
+            if row["status"] == "queued":
+                db.execute(
+                    "UPDATE jobs SET status='cancelled', updated_at=? WHERE id=?",
+                    (now(), job_id),
+                )
+                self._event(db, task_id, job_id, "job_finished", {"status": "cancelled"})
+            elif row["status"] == "running":
+                requested = db.execute(
+                    "SELECT 1 FROM api_events WHERE task_id=? AND job_id=? "
+                    "AND kind='stop_requested' LIMIT 1", (task_id, job_id),
+                ).fetchone()
+                if requested is None:
+                    # 在队列事务内落盘停止意图，防止完成旧操作后才误停新操作。
+                    request_running_stop()
+                    self._event(db, task_id, job_id, "stop_requested", {"requested": True})
+            result = self.public_job(dict(db.execute(
+                "SELECT * FROM jobs WHERE id=?", (job_id,),
+            ).fetchone()))
+            result["stop_requested"] = result["status"] == "running"
+            return result
+
+    def finish(
+        self, job_id: str, status: str, error: str | None = None,
+        *, on_finish: Callable[[], None] | None = None,
+    ) -> None:
         with self.transaction() as db:
             row = db.execute(
                 "SELECT task_id FROM jobs WHERE id=? AND status='running'", (job_id,)
             ).fetchone()
             if not row:
                 return
+            if on_finish is not None:
+                on_finish()
             db.execute(
                 "UPDATE jobs SET status=?, error=?, updated_at=? WHERE id=? AND status='running'",
                 (status, error, now(), job_id),

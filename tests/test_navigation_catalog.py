@@ -50,7 +50,7 @@ def setup(tmp_path, rows, *, database_type="sqlserver", project="ace-one"):
             self.failure = None
             self.truncated = False
 
-        def execute(self, active_session, query, stage):
+        def execute(self, active_session, query, stage, *, stop_requested=None):
             assert active_session is session
             assert stage == "page_lookup"
             assert query.datasource_id == "ds-menu"

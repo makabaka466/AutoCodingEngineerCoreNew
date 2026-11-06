@@ -201,7 +201,9 @@ class MenuCatalogService:
                 max_rows=page_size,
             )
             try:
-                result = access.execute(session, query, "page_lookup")
+                result = access.execute(
+                    session, query, "page_lookup", stop_requested=stop_requested,
+                )
             except RuntimeInterruptedError:
                 raise
             except Exception:

@@ -6,6 +6,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from autocoding_agent.adapters.claude_code import ClaudeCodeRuntime
+from autocoding_agent.adapters.execution_scheduler import ExecutionScheduler, QueuedTaskStopped
 from autocoding_agent.adapters.hermes_skills import build_configured_hermes_service
 from autocoding_agent.adapters.sqlite_database import SQLiteDatabaseReader
 from autocoding_agent.adapters.sqlite_incident_store import SQLiteIncidentStore
@@ -51,8 +52,11 @@ class IncidentApplication:
         self.recovery_scan = recovery_scan or RecoveryScanResult()
         self._data_dir = data_dir
         self._git_targets = git_targets or {}
+        if data_dir is not None and getattr(engine, "scheduler", None) is None:
+            engine.scheduler = ExecutionScheduler(data_dir)
 
-    def sync_git(self, workspace: str | Path) -> str:
+    def sync_git(self, workspace: str | Path, *, session_id: str | None = None,
+                 progress_sink: ProgressSink | None = None) -> str:
         root = str(Path(workspace).resolve())
         target = self._git_targets.get(root)
         if target is None and self._data_dir is not None:
@@ -62,7 +66,14 @@ class IncidentApplication:
                 target = GitTarget(Path(root), config.git_remote, config.git_branch or "")
         if target is None:
             raise ValueError("请先在项目配置中填写 Git 远端地址和目标分支。")
-        return GitVersionService(target).sync()
+        with self._engine.scheduler.acquire(
+            "incident", session_id or str(uuid4()), workspace, write=True,
+            progress_sink=progress_sink,
+            stop_requested=(
+                (lambda: self._engine._stop_requested(session_id)) if session_id else None
+            ),
+        ):
+            return GitVersionService(target).sync()
 
     def start(
         self,
@@ -77,6 +88,7 @@ class IncidentApplication:
         attachments: list[MessageAttachment] | None = None,
         progress_sink: ProgressSink | None = None,
     ) -> IncidentOutcome:
+        session_id = session_id or str(uuid4())
         root = str(Path(workspace).resolve())
         configured = root in self._git_targets
         if not configured and self._data_dir is not None:
@@ -85,7 +97,10 @@ class IncidentApplication:
                 for item in WorkspaceConfigStore(self._data_dir).list_projects()
             )
         if configured:
-            self.sync_git(workspace)
+            try:
+                self.sync_git(workspace, session_id=session_id, progress_sink=progress_sink)
+            except QueuedTaskStopped:
+                pass  # 保存任务与附件后由调度入口暂停，不丢失排队输入。
         return self._engine.start(
             workspace,
             problem,
@@ -219,6 +234,7 @@ def build_incident_application(
         artifact_recorder=artifact_recorder,
         max_hermes_skill_rounds=configured.hermes_skill_max_rounds,
     )
+    engine.scheduler = ExecutionScheduler(configured.data_dir, configured.max_concurrent_tasks)
     engine.database_access = TaskDatabaseAccess(
         DataSourceService(configured), selected_database, selected_reference,
     )

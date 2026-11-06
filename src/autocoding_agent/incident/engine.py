@@ -9,6 +9,7 @@ import time
 from pathlib import Path, PureWindowsPath
 from uuid import uuid4
 
+from autocoding_agent.adapters.execution_scheduler import exclusive_task, scheduled_turn
 from autocoding_agent.core.artifacts.recorder import ArtifactRecorder
 from autocoding_agent.core.data_repair import bind_data_repair, data_repair_text
 from autocoding_agent.core.hermes_consultation import (
@@ -174,6 +175,7 @@ class IncidentEngine:
         self.max_hermes_skill_rounds = max_hermes_skill_rounds
         self.compact_phase_prompts = compact_phase_prompts
 
+    @exclusive_task
     def start(
         self,
         workspace: str | Path,
@@ -234,6 +236,7 @@ class IncidentEngine:
             progress_sink,
         )
 
+    @exclusive_task
     def send(
         self,
         session_id: str,
@@ -376,6 +379,7 @@ class IncidentEngine:
         database = getattr(self.sessions, "database", None)
         return database is not None and database.stop_requested(session_id)
 
+    @exclusive_task
     def resume(
         self,
         session_id: str,
@@ -430,6 +434,7 @@ class IncidentEngine:
         )
         return self._execute(session, message, command, progress_sink=progress_sink)
 
+    @exclusive_task
     def cancel(
         self,
         session_id: str,
@@ -492,6 +497,7 @@ class IncidentEngine:
     def list_sessions(self) -> list[IncidentSession]:
         return self.sessions.list()
 
+    @scheduled_turn
     def _execute(
         self,
         session: IncidentSession,
@@ -539,29 +545,31 @@ class IncidentEngine:
             command_id=command.id,
             expected_version=command.expected_version,
         )
-        session.messages.append(
-            ChatMessage(
-                role=MessageRole.USER,
-                content=user_message,
-                attachments=attachments,
+        if not any(event.command_id == command.id and event.data.get("scheduled")
+                   for event in session.events[-4:]):
+            session.messages.append(
+                ChatMessage(
+                    role=MessageRole.USER,
+                    content=user_message,
+                    attachments=attachments,
+                )
             )
-        )
-        session.events.append(
-            AgentEvent(
-                type=EventType.TURN_STARTED,
-                message="Started incident inspect turn.",
-                actor="host",
-                command_id=command.id,
-                data={
-                    "mode": AgentMode.INSPECT.value,
-                    "owner_id": self.runtime_lifecycle.owner_id,
-                    "owner_pid": os.getpid(),
-                    "workflow": "incident",
-                    "attachment_count": len(attachments),
-                    "attachment_names": [item.name for item in attachments],
-                },
+            session.events.append(
+                AgentEvent(
+                    type=EventType.TURN_STARTED,
+                    message="Started incident inspect turn.",
+                    actor="host",
+                    command_id=command.id,
+                    data={
+                        "mode": AgentMode.INSPECT.value,
+                        "owner_id": self.runtime_lifecycle.owner_id,
+                        "owner_pid": os.getpid(),
+                        "workflow": "incident",
+                        "attachment_count": len(attachments),
+                        "attachment_names": [item.name for item in attachments],
+                    },
+                )
             )
-        )
         pending_message = self._message_with_attachments(user_message, attachments)
         attachment_dirs = list(dict.fromkeys(str(Path(item.path).parent) for item in attachments))
         # 第 2 步：简单续聊使用紧凑路由；新的调查会获得有界 RAG 上下文，

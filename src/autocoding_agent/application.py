@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from threading import Lock
 from uuid import uuid4
 
 from autocoding_agent.adapters.capability_store import CapabilityStore
 from autocoding_agent.adapters.claude_code import ClaudeCodeRuntime
+from autocoding_agent.adapters.execution_scheduler import ExecutionScheduler, QueuedTaskStopped
 from autocoding_agent.adapters.hermes_skills import build_configured_hermes_service
 from autocoding_agent.adapters.sqlite_incident_store import SQLiteIncidentStore
 from autocoding_agent.adapters.sqlite_task_store import SQLiteTaskStore
@@ -54,9 +54,10 @@ class AgentApplication:
         self._engine = engine
         self.log_path = log_path
         self.recovery_scan = recovery_scan or RecoveryScanResult()
-        self._remediation_lock = Lock()
         self._data_dir = data_dir
         self._git_targets = git_targets or {}
+        if data_dir is not None and getattr(engine, "scheduler", None) is None:
+            engine.scheduler = ExecutionScheduler(data_dir)
 
     def git(self, workspace: str | Path) -> GitVersionService | None:
         root = str(Path(workspace).resolve())
@@ -68,27 +69,40 @@ class AgentApplication:
                 target = GitTarget(Path(root), config.git_remote, config.git_branch or "")
         return GitVersionService(target) if target else None
 
-    def sync_git(self, workspace: str | Path) -> str:
+    def sync_git(self, workspace: str | Path, *, session_id: str | None = None,
+                 progress_sink: ProgressSink | None = None) -> str:
         service = self.git(workspace)
         if service is None:
             raise ValueError("请先在项目配置中填写 Git 远端地址和目标分支。")
-        return service.sync()
+        with self._engine.scheduler.acquire(
+            "development", session_id or str(uuid4()), workspace, write=True,
+            progress_sink=progress_sink,
+            stop_requested=(
+                (lambda: self._engine._stop_requested(session_id)) if session_id else None
+            ),
+        ):
+            return service.sync()
 
     def git_preview(self, session_id: str) -> dict:
         session = self.get_session(session_id)
         service = self.git(session.workspace)
         if service is None:
             raise ValueError("当前项目未配置 Git 远端。")
-        return service.preview()
+        with self._engine.scheduler.acquire("git", str(uuid4()), session.workspace, write=True):
+            return service.preview()
 
     def git_publish(self, session_id: str, summary: str, fingerprint: str) -> dict:
-        session = self.get_session(session_id)
-        if session.task_state.value != "completed":
-            raise ValueError("开发任务完成后才能提交和推送。")
-        service = self.git(session.workspace)
-        if service is None:
-            raise ValueError("当前项目未配置 Git 远端。")
-        return service.publish(summary, fingerprint)
+        with self._engine.scheduler.reserve("development", session_id):
+            session = self.get_session(session_id)
+            if session.task_state.value != "completed":
+                raise ValueError("开发任务完成后才能提交和推送。")
+            service = self.git(session.workspace)
+            if service is None:
+                raise ValueError("当前项目未配置 Git 远端。")
+            with self._engine.scheduler.acquire(
+                "development", session_id, session.workspace, write=True,
+            ):
+                return service.publish(summary, fingerprint)
 
     def start_incident_remediation(
         self,
@@ -104,10 +118,10 @@ class AgentApplication:
         assert decision is not None
         git = self.git(incident.workspace)
         if git is not None:
-            git.sync()
+            self.sync_git(incident.workspace)
         key = f"{incident.id}:{incident.cycle_number}"
         # 同一诊断轮次重复点击/重启后都回到已有任务，不重复创建或自动批准。
-        with self._remediation_lock:
+        with self._engine.scheduler.reserve("remediation", key):
             for session in self.list_sessions():
                 if session.source_incident_key == key:
                     return self.outcome(session.id)
@@ -165,9 +179,14 @@ class AgentApplication:
         session_id: str | None = None,
         progress_sink: ProgressSink | None = None,
     ) -> AgentOutcome:
+        session_id = session_id or str(uuid4())
         git = self.git(workspace)
         if git is not None:
-            git.sync()
+            try:
+                self.sync_git(workspace, session_id=session_id, progress_sink=progress_sink)
+            except QueuedTaskStopped:
+                # 仍创建原任务并保存输入；调度入口会消费停止意图，模型不会执行。
+                pass
         return self._engine.start(
             workspace,
             message,
@@ -336,6 +355,7 @@ def build_application(
         ),
         max_hermes_skill_rounds=configured.hermes_skill_max_rounds,
     )
+    engine.scheduler = ExecutionScheduler(configured.data_dir, configured.max_concurrent_tasks)
     engine.database_access = TaskDatabaseAccess(
         DataSourceService(configured), database, database_reference,
     )

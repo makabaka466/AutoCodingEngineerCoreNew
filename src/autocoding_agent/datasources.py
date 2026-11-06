@@ -5,9 +5,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from collections.abc import Callable
 from pathlib import Path
 from uuid import uuid4
 
+from autocoding_agent.adapters.resource_lock import resource_lock
 from autocoding_agent.config import Settings
 from autocoding_agent.database_models import DataQuery, QueryResult, QuerySource
 from autocoding_agent.database_prompt import compact_database_context
@@ -34,6 +36,17 @@ def query_source(session, query: DataQuery) -> QuerySource | None:
     snapshot = session.database_binding
     source = snapshot.sources.get(query.datasource_id) if snapshot is not None else None
     return QuerySource.model_validate(source.model_dump()) if source is not None else None
+
+
+def database_resource_key(
+    database_type: str, config: SQLServerConnectionConfig | OracleConnectionConfig,
+) -> str:
+    """按实际配置目标合并数据源别名，不把来源ID、账号、凭据或业务值写入锁文件。"""
+    target = (
+        database_type.casefold(), config.server.strip().rstrip(".").casefold(), config.port,
+        config.database.strip().casefold(), getattr(config, "identifier_type", "database"),
+    )
+    return hashlib.sha256(json.dumps(target, ensure_ascii=False).encode()).hexdigest()
 
 
 class DataSourceService:
@@ -141,6 +154,7 @@ class DataSourceService:
 
     def execute(
         self, snapshot: TaskDataSources, query: DataQuery, stage: str | None,
+        *, stop_requested: Callable[[], bool] | None = None,
     ) -> QueryResult:
         catalog = self.load()
         current = catalog.projects.get(snapshot.project, ProjectDataSources())
@@ -167,13 +181,19 @@ class DataSourceService:
         if fingerprint != snapshot.fingerprints.get(source_id):
             raise ValueError("任务绑定的数据源配置已变化，请核对环境后新建任务")
         query.datasource_id = source_id
-        connection = self.connection(source_id, source.database_type)
-        password = connection.store.password_for(config)
-        if config.authentication == SQLServerAuthentication.SQL_PASSWORD and not password:
-            raise ValueError("数据源凭据不可用，请检查当前运行账户的连接配置")
-        # 使用刚刚核验过的配置对象，不能重新读取文件后意外连接到另一个目标。
-        reader = connection._reader(config, password)
-        result = reader.execute(query)
+        lock_path = (self.settings.data_dir / "runtime" / "datasource-locks"
+                     / f"{database_resource_key(source.database_type, config)}.lock")
+        with resource_lock(lock_path, stop_requested=stop_requested):
+            # 排队期间配置也可能变更；先复核快照，再创建本次独立连接和启动查询超时。
+            if self.snapshot(snapshot.project) != snapshot:
+                raise ValueError("等待期间数据源授权或配置已变化，请核对后新建任务")
+            connection = self.connection(source_id, source.database_type)
+            password = connection.store.password_for(config)
+            if config.authentication == SQLServerAuthentication.SQL_PASSWORD and not password:
+                raise ValueError("数据源凭据不可用，请检查当前运行账户的连接配置")
+            # 使用刚刚核验过的配置对象，不能重新读取文件后意外连接到另一个目标。
+            reader = connection._reader(config, password)
+            result = reader.execute(query)
         result.source = QuerySource.model_validate(source.model_dump())
         return result
 
@@ -233,7 +253,9 @@ class TaskDatabaseAccess:
         if session.database_binding is not None:
             if self.service is None:
                 raise ValueError("项目数据源服务不可用")
-            return self.service.execute(session.database_binding, query, stage)
+            return self.service.execute(
+                session.database_binding, query, stage, stop_requested=stop_requested,
+            )
         if self.legacy is None:
             raise ValueError("当前任务未配置只读数据源")
         if query.datasource_id is not None:

@@ -285,10 +285,18 @@ def test_connection_is_not_reloaded_between_validation_and_execution(catalog, mo
     service, calls, _ = catalog
     snapshot = service.snapshot("project-a")
     original = service._configuration
+    business_reads = 0
 
     def change_after_read(source, expected):
+        nonlocal business_reads
         result = original(source, expected)
-        service.save_source(source, SQLServerConnectionConfig(server="new", database="new-db"))
+        if source.datasource_id == "ds-business":
+            business_reads += 1
+            # 阶段9获得查询额度后会再次复核；这里模拟最后一次复核刚完成即被外部改配置。
+            if business_reads == 2:
+                service.save_source(
+                    source, SQLServerConnectionConfig(server="new", database="new-db"),
+                )
         return result
 
     monkeypatch.setattr(service, "_configuration", change_after_read)

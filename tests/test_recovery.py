@@ -409,9 +409,9 @@ def test_recovery_context_marks_changed_files_and_unknown_operations(tmp_path):
 
 def test_simultaneous_resume_only_starts_one_runtime(tmp_path, monkeypatch):
     from concurrent.futures import ThreadPoolExecutor
-    from threading import Barrier
+    from threading import Event
 
-    from autocoding_agent.adapters.sqlite_task_store import ConcurrentSessionUpdate
+    from autocoding_agent.adapters.execution_scheduler import TaskAlreadyRunning
 
     workspace = tmp_path / "work"
     workspace.mkdir()
@@ -420,17 +420,24 @@ def test_simultaneous_resume_only_starts_one_runtime(tmp_path, monkeypatch):
     runtime = CompleteRuntime()
     app = build_application(settings=_settings(tmp_path / "data"), runtime=runtime)
     load = app._engine.sessions.load
-    barrier = Barrier(2)
+    entered, release = Event(), Event()
 
     def simultaneous_load(task_id):
         snapshot = load(task_id)
-        barrier.wait(timeout=5)
+        entered.set()
+        assert release.wait(timeout=5)
         return snapshot
 
     monkeypatch.setattr(app._engine.sessions, "load", simultaneous_load)
     with ThreadPoolExecutor(max_workers=2) as pool:
-        futures = [pool.submit(app.resume, session.id) for _ in range(2)]
-        errors = [future.exception(timeout=10) for future in futures]
-    assert sum(isinstance(error, ConcurrentSessionUpdate) for error in errors) == 1
+        first = pool.submit(app.resume, session.id)
+        assert entered.wait(timeout=5)
+        second = pool.submit(app.resume, session.id)
+        try:
+            error = second.exception(timeout=5)
+        finally:
+            release.set()
+        errors = [first.exception(timeout=10), error]
+    assert sum(isinstance(error, TaskAlreadyRunning) for error in errors) == 1
     assert sum(error is None for error in errors) == 1
     assert len(runtime.turns) == 1

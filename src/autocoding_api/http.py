@@ -46,6 +46,11 @@ class ResumeTask(BaseModel):
     expected_version: int | None = Field(description="当前版本；尚未建立领域会话时为 null。", ge=0)
 
 
+class StopTask(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    job_id: UUID = Field(description="要停止的操作ID，来自任务详情；旧请求不能停止后续操作。")
+
+
 class RemediateTask(BaseModel):
     model_config = ConfigDict(extra="forbid")
     expected_version: int = Field(ge=0, description="已审阅的诊断任务版本。")
@@ -130,6 +135,10 @@ def create_app(config: ServerConfig) -> FastAPI:
     @app.get("/v1/jobs/{job_id}")
     def job(job_id: UUID, owner: User):
         return service.get_job(owner, str(job_id))
+
+    @app.post("/v1/tasks/{task_id}/stop", status_code=202)
+    def stop(task_id: UUID, body: StopTask, owner: User):
+        return service.stop(owner, str(task_id), str(body.job_id))
 
     @app.post("/v1/tasks/{task_id}/messages", status_code=202)
     def message(task_id: UUID, body: SendMessage, owner: User, key: Key):

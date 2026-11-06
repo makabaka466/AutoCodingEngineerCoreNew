@@ -575,7 +575,7 @@ class DesktopClient:
 
     def __init__(
         self,
-        root: tk.Tk,
+        root: tk.Tk | tk.Toplevel,
         application: AgentApplication | None = None,
         incident_application: IncidentApplication | None = None,
         setup_service: ClaudeModelSetupService | None = None,
@@ -585,8 +585,13 @@ class DesktopClient:
         attachment_store: IncidentAttachmentStore | None = None,
         embedding_service: EmbeddingSetupService | None = None,
         rag_service: KnowledgeRAGService | None = None,
+        window_group: list[DesktopClient] | None = None,
     ) -> None:
         self.root = root
+        self._primary_window = window_group is None
+        self._window_group = window_group if window_group is not None else []
+        self._closed = False
+        self._stop_when_ready = False
         self.setup_service = setup_service or ClaudeModelSetupService()
         self.sqlserver_service = sqlserver_service or SQLServerConnectionService()
         self.knowledge_service = knowledge_service or MarkdownKnowledgeService()
@@ -689,6 +694,7 @@ class DesktopClient:
         self._animate_progress_pulse()
         self.root.after(100, self._drain_results)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._window_group.append(self)
 
     def _configure_window(self) -> None:
         self.root.title("ACE · AutoCoding Engineer")
@@ -767,6 +773,12 @@ class DesktopClient:
                  bg=COLORS["sidebar"], font=("Segoe UI", 17, "bold")).pack(side="left")
         tk.Label(brand, text="ACE", bg=COLORS["sidebar"], fg=COLORS["text"],
                  font=("Segoe UI", 15, "bold")).pack(side="left", padx=12)
+        self.new_window_button = self._button(
+            brand, "新窗口", self._open_task_window, background=COLORS["sidebar"],
+            active_background=COLORS["panel_hover"],
+        )
+        self.new_window_button.pack(side="right")
+        Tooltip(self.new_window_button, "打开独立会话窗口，可并行处理其他任务")
         self.project_row = tk.Frame(sidebar, bg=COLORS["sidebar"])
         self.project_row.grid(row=1, column=0, sticky="ew", padx=20, pady=(0, 12))
         self.project_row.grid_columnconfigure(0, weight=1)
@@ -1790,6 +1802,9 @@ class DesktopClient:
     def _select_flow(self, flow: FlowKind) -> None:
         if self._busy or flow == self.flow:
             return
+        if not self._primary_window and self.session_id:
+            self._open_task_window(flow=flow)
+            return
         if flow == FlowKind.INCIDENT and self.incident_application is None:
             messagebox.showerror(
                 "异常流程不可用",
@@ -1872,6 +1887,9 @@ class DesktopClient:
     def _on_project_selected(self, _event: tk.Event[tk.Misc]) -> None:
         if self._busy:
             return
+        if not self._primary_window and self.session_id:
+            self._restore_session_project(self._active_application().get_session(self.session_id))
+            return
         project = next((p for p in self.projects if p.name == self.project_var.get()), None)
         if project is None or project.id == self._flow_projects[self.flow]:
             return
@@ -1914,6 +1932,8 @@ class DesktopClient:
         return self.incident_application
 
     def _render_active_session(self, session: AgentSession | IncidentSession) -> None:
+        title = session.goal if isinstance(session, AgentSession) else session.problem
+        self.root.title(f"ACE · {title[:42]}")
         if self.flow == FlowKind.DEVELOPMENT:
             if not isinstance(session, AgentSession):
                 raise TypeError("Development flow returned an invalid session.")
@@ -2256,12 +2276,27 @@ class DesktopClient:
         except Exception as exc:
             messagebox.showerror("无法打开任务", str(exc), parent=self.root)
             return
+        if not self._primary_window and self.session_id and self.session_id != session_id:
+            self._open_task_window(session=session)
+            return
+        for client in self._window_group:
+            if client is not self and client.flow == self.flow and (
+                client.session_id == session_id
+                or (client._busy and client._active_task_id == session_id)
+            ):
+                client.root.deiconify()
+                client.root.lift()
+                client.root.focus_force()
+                return
         self.session_id = session_id
         self._show_incident_details = False
         self._flow_session_ids[self.flow] = session_id
         self._render_active_session(session)
 
     def _new_task(self) -> None:
+        if not self._primary_window and self.session_id:
+            self._open_task_window()
+            return
         if self._busy:
             return
         self.session_id = None
@@ -2280,6 +2315,53 @@ class DesktopClient:
         self._reset_progress_display()
         self._sync_controls()
         self.prompt_input.focus_set()
+
+    def _open_task_window(
+        self, *, session: AgentSession | IncidentSession | None = None,
+        flow: FlowKind | None = None,
+    ) -> DesktopClient | None:
+        """每个子窗独立持有任务、Runtime和结果队列，只共享配置服务与持久化目录。"""
+        if self._window_group[0]._close_after_stop:
+            return None
+        selected_flow = flow or self.flow
+        if session is not None:
+            for client in self._window_group:
+                if client.flow == selected_flow and (
+                    client.session_id == session.id
+                    or (client._busy and client._active_task_id == session.id)
+                ):
+                    client.root.deiconify()
+                    client.root.lift()
+                    client.root.focus_force()
+                    return client
+        window = tk.Toplevel(self._window_group[0].root)
+        try:
+            child = DesktopClient(
+                window,
+                application=self.application if self._applications_injected else None,
+                incident_application=(self.incident_application
+                                      if self._incident_application_injected else None),
+                setup_service=self.setup_service, sqlserver_service=self.sqlserver_service,
+                knowledge_service=self.knowledge_service, workspace_service=self.workspace_service,
+                attachment_store=self.attachment_store, embedding_service=self.embedding_service,
+                rag_service=self.rag_service, window_group=self._window_group,
+            )
+        except Exception:
+            window.destroy()
+            raise
+        child.flow = selected_flow
+        child._flow_projects = dict(self._flow_projects)
+        child._refresh_flow_presentation()
+        if session is not None:
+            child.session_id = session.id
+            child._flow_session_ids[selected_flow] = session.id
+            child._render_active_session(session)
+        else:
+            child._render_welcome()
+        child._load_recent_sessions(select_current=session is not None)
+        child._sync_controls()
+        child.prompt_input.focus_set()
+        return child
 
     def _open_system_settings(self, section: str = "model") -> None:
         if self._busy:
@@ -2589,13 +2671,21 @@ class DesktopClient:
 
         threading.Thread(target=run, name="git-sync", daemon=True).start()
 
-    def _publish_git(self) -> None:
+    def _publish_git(self, preview: dict | None = None) -> None:
         if self._busy or self.flow != FlowKind.DEVELOPMENT or not self.session_id:
             return
-        try:
-            preview = self.application.git_preview(self.session_id)
-        except Exception as exc:
-            messagebox.showerror("无法推送", str(exc), parent=self.root)
+        if preview is None:
+            session_id = self.session_id
+            self._set_busy(True, "正在准备提交预览")
+
+            def prepare() -> None:
+                try:
+                    result = self.application.git_preview(session_id)
+                    self._result_queue.put(("git_preview", result))
+                except Exception as exc:
+                    self._result_queue.put(("git_error", exc))
+
+            threading.Thread(target=prepare, name="git-preview", daemon=True).start()
             return
         files = "\n".join(preview["files"][:30])
         if len(preview["files"]) > 30:
@@ -2717,17 +2807,23 @@ class DesktopClient:
         incident = self.incident_application.get_session(self.session_id)
         if not incident.can_remediate:
             return
-        self._select_flow(FlowKind.DEVELOPMENT)
-        self.session_id = None
-        self._flow_session_ids[FlowKind.DEVELOPMENT] = None
-        self._restore_session_project(incident)
-        self._load_recent_sessions()
-        self._render_welcome()
-        self.flow_caption_var.set("异常处理 · 正在核对诊断并准备修复方案")
-        self.task_title_var.set("异常处理：" + incident.problem[:48])
-        self._run_in_background(
-            lambda: self.application.start_incident_remediation(
-                incident, progress_sink=self._queue_progress
+        target = self
+        if not self._primary_window:
+            target = self._open_task_window(flow=FlowKind.DEVELOPMENT)
+            if target is None:
+                return
+        else:
+            self._select_flow(FlowKind.DEVELOPMENT)
+        target.session_id = None
+        target._flow_session_ids[FlowKind.DEVELOPMENT] = None
+        target._restore_session_project(incident)
+        target._load_recent_sessions()
+        target._render_welcome()
+        target.flow_caption_var.set("异常处理 · 正在核对诊断并准备修复方案")
+        target.task_title_var.set("异常处理：" + incident.problem[:48])
+        target._run_in_background(
+            lambda: target.application.start_incident_remediation(
+                incident, progress_sink=target._queue_progress
             ),
             "正在生成异常处理方案",
         )
@@ -2828,7 +2924,8 @@ class DesktopClient:
         if not self._busy or not self._task_operation or self._stop_pending:
             return
         if not self._active_task_id:
-            self.status_var.set("任务正在初始化，保存任务后即可停止。")
+            self._stop_when_ready = True
+            self.status_var.set("正在初始化，任务保存后将立即请求停止。")
             return
         try:
             self._active_application().request_stop(self._active_task_id)
@@ -2845,9 +2942,12 @@ class DesktopClient:
         operation: Callable[[], AgentOutcome | IncidentOutcome],
         label: str,
     ) -> None:
+        if self._closed or self._close_after_stop:
+            return
         self._task_operation = True
         self._active_task_id = self.session_id
         self._stop_pending = False
+        self._stop_when_ready = False
         self._set_busy(True, label)
 
         def worker() -> None:
@@ -2867,12 +2967,19 @@ class DesktopClient:
         self._result_queue.put(("progress", event))
 
     def _drain_results(self) -> None:
+        if self._closed:
+            return
         try:
             while True:
                 kind, payload = self._result_queue.get_nowait()
                 if kind == "progress":
                     if isinstance(payload, ProgressEvent):
                         self._present_progress(payload)
+                    continue
+                if kind == "git_preview":
+                    self._set_busy(False)
+                    if not self._close_after_stop:
+                        self._publish_git(payload)
                     continue
                 if kind in {"git_result", "git_error"}:
                     self._set_busy(False)
@@ -2909,7 +3016,10 @@ class DesktopClient:
             pass
         finally:
             if self._close_after_stop and not self._busy:
-                self.root.destroy()
+                if not self._primary_window or len(self._window_group) == 1:
+                    self._destroy_window()
+                else:
+                    self.root.after(100, self._drain_results)
             else:
                 self.root.after(100, self._drain_results)
 
@@ -2963,7 +3073,8 @@ class DesktopClient:
                 "正在停止：等待安全边界" if self._stop_pending else self._busy_label
             )
         self.status_badge.configure(
-            text="处理中",
+            text=("排队中" if self._progress_event
+                  and self._progress_event.phase.value == "queued" else "处理中"),
             fg=COLORS["progress_accent"],
             bg=COLORS["progress_accent_soft"],
             highlightbackground=COLORS["progress_border"],
@@ -2977,7 +3088,12 @@ class DesktopClient:
         immediate: bool = False,
     ) -> None:
         if self._task_operation and event.task_id:
+            if self._active_task_id and self._active_task_id != event.task_id:
+                return  # 窗口只能接收本次任务的进度，不能改变停止或审批目标。
             self._active_task_id = event.task_id
+            if self._stop_when_ready:
+                self._stop_when_ready = False
+                self._request_stop()
         if self._stop_pending and event.active:
             self.status_var.set("正在停止：等待当前操作安全结束并保存状态。")
             return
@@ -3114,7 +3230,7 @@ class DesktopClient:
         self.remediation_button.configure(state="disabled" if self._busy else "normal")
         self.incident_details_button.configure(state="disabled" if self._busy else "normal")
         can_start_new = not self._busy
-        can_choose_project = not self._busy
+        can_choose_project = not self._busy and (self._primary_window or not self.session_id)
         can_send = not self._busy and self._current_task_state not in {
             TaskState.CANCELLED,
             TaskState.PAUSED,
@@ -3330,16 +3446,32 @@ class DesktopClient:
         return "break"
 
     def _on_close(self) -> None:
+        if self._primary_window and len(self._window_group) > 1:
+            self._close_after_stop = True
+            for child in list(self._window_group)[1:]:
+                child._on_close()
         if self._busy:
-            if self._task_operation and self._active_task_id:
-                self._close_after_stop = True
+            self._close_after_stop = True
+            if self._task_operation:
                 self._request_stop()
             else:
-                messagebox.showwarning(
-                    "任务仍在运行", "当前操作仍在处理，尚未到可停止阶段，请稍后关闭。",
-                    parent=self.root,
-                )
+                self.status_var.set("正在等待当前操作结束并保存，完成后关闭窗口。")
             return
+        if self._primary_window and len(self._window_group) > 1:
+            self.status_var.set("正在等待各会话停止并保存，完成后退出。")
+            return
+        self._destroy_window()
+
+    def _destroy_window(self) -> None:
+        """仅清理本窗口的定时回调，避免销毁子窗影响其他会话的消息循环。"""
+        self._closed = True
+        commands = set(self.root._tclCommands or ())
+        for timer in self.root.tk.call("after", "info"):
+            callback = self.root.tk.call("after", "info", timer)[0]
+            if callback in commands:
+                self.root.after_cancel(timer)
+        if self in self._window_group:
+            self._window_group.remove(self)
         self.root.destroy()
 
 
@@ -3356,7 +3488,7 @@ def _enable_windows_dpi_awareness() -> None:
 
 
 def _acquire_single_instance() -> bool:
-    """Prevent two desktop windows from writing the same session store concurrently."""
+    """保留一个桌面进程；同进程内可创建多个独立会话窗口。"""
 
     global _instance_mutex
     if not hasattr(ctypes, "windll"):

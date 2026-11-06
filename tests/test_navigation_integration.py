@@ -32,8 +32,8 @@ def configured(tmp_path):
         "```ace-navigation\n" + json.dumps(payload) + "\n```", encoding="utf-8"
     )
 
-    def execute(snapshot, query, stage):
-        return fake.execute(session, query, stage)
+    def execute(snapshot, query, stage, *, stop_requested=None):
+        return fake.execute(session, query, stage, stop_requested=stop_requested)
 
     service = SimpleNamespace(
         settings=SimpleNamespace(data_dir=tmp_path / "state"),

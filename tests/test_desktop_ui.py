@@ -1523,19 +1523,15 @@ def test_approval_buttons_route_exact_session_and_rejection_reason(
     assert application.approval_versions == [4]
 
 
-def test_busy_window_refuses_to_close(root: tk.Toplevel, monkeypatch: pytest.MonkeyPatch) -> None:
-    warnings: list[str] = []
+def test_busy_window_waits_for_safe_close(root: tk.Toplevel) -> None:
     client = DesktopClient(root, FakeApplication())  # type: ignore[arg-type]
     client._busy = True
-    monkeypatch.setattr(
-        "autocoding_agent.interfaces.desktop_ui.messagebox.showwarning",
-        lambda _title, message, **_kwargs: warnings.append(message),
-    )
 
     client._on_close()
 
     assert root.winfo_exists()
-    assert warnings and "仍在处理" in warnings[0]
+    assert client._close_after_stop
+    assert "等待当前操作" in client.status_var.get()
 
 
 def test_incident_summary_details_and_manual_repair_entry(root: tk.Toplevel, tmp_path: Path):
@@ -1647,3 +1643,149 @@ def test_stop_button_records_once_and_waits_for_worker(root, monkeypatch):
     assert client.stop_button.cget("state") == "disabled"
     client._set_busy(False)
     assert client.stop_button.cget("state") == "disabled"
+
+
+
+def test_new_window_is_available_while_parent_runs_and_keeps_queues_separate(root, tmp_path):
+    first, second = _session(), _session()
+    app = FakeApplication([first, second])
+    client = DesktopClient(root, app, workspace_service=FakeWorkspaceService(tmp_path))
+    client.session_id = first.id
+    client._task_operation = True
+    client._active_task_id = first.id
+    client._set_busy(True, "任务一")
+    child = client._open_task_window(session=second)
+    assert child is not None and child is not client
+    assert child.session_id == second.id
+    assert child._result_queue is not client._result_queue
+    assert not child._busy and client._busy
+    assert str(child.project_combo.cget("state")) == "disabled"
+    assert client.new_window_button.cget("state") == "normal"
+    assert child._open_task_window(session=second) is child
+    assert len(client._window_group) == 2
+    child._on_close()
+    assert client._busy and root.winfo_exists()
+    assert len(client._window_group) == 1
+
+
+def test_bound_window_opens_new_task_without_replacing_its_session(root, tmp_path):
+    session = _session()
+    client = DesktopClient(root, FakeApplication([session]),
+                           workspace_service=FakeWorkspaceService(tmp_path))
+    child = client._open_task_window(session=session)
+    child._new_task()
+    assert child.session_id == session.id
+    assert len(client._window_group) == 3
+    assert client._window_group[-1].session_id is None
+    assert str(client._window_group[-1].project_combo.cget("state")) == "readonly"
+
+
+def test_two_windows_run_concurrently_and_child_stop_does_not_stop_parent(root, tmp_path):
+    import threading
+    import time
+
+    sessions = [_session(), _session()]
+    app = FakeApplication(sessions)
+    stopped = []
+    app.request_stop = stopped.append
+    client = DesktopClient(root, app, workspace_service=FakeWorkspaceService(tmp_path))
+    client.session_id = sessions[0].id
+    child = client._open_task_window(session=sessions[1])
+    ready = [threading.Event(), threading.Event()]
+    release = threading.Event()
+    completed = [threading.Event(), threading.Event()]
+
+    def operation(index):
+        ready[index].set()
+        release.wait(timeout=3)
+        session = sessions[index]
+        completed[index].set()
+        return AgentOutcome(session_id=session.id, workspace=session.workspace,
+                            status=AgentStatus.NEEDS_INPUT, message="已完成调查")
+
+    try:
+        client._run_in_background(lambda: operation(0), "任务一")
+        child._run_in_background(lambda: operation(1), "任务二")
+        assert all(event.wait(timeout=1) for event in ready)
+        child._on_close()
+        assert stopped == [sessions[1].id]
+        assert child._close_after_stop and client._busy
+        release.set()
+        assert all(event.wait(timeout=1) for event in completed)
+        deadline = time.monotonic() + 3
+        while (client._busy or not child._closed) and time.monotonic() < deadline:
+            root.update()
+            time.sleep(.01)
+        assert child._closed
+        assert client.session_id == sessions[0].id
+        assert client.root.winfo_exists()
+    finally:
+        release.set()
+
+
+def test_primary_close_coordinates_children_and_cancels_only_their_callbacks(root, tmp_path):
+    sessions = [_session(), _session()]
+    app = FakeApplication(sessions)
+    stopped = []
+    app.request_stop = stopped.append
+    client = DesktopClient(root, app, workspace_service=FakeWorkspaceService(tmp_path))
+    child = client._open_task_window(session=sessions[1])
+    child._task_operation = True
+    child._active_task_id = sessions[1].id
+    child._set_busy(True, "任务二")
+    client._on_close()
+    assert stopped == [sessions[1].id]
+    assert root.winfo_exists() and client._close_after_stop
+    child._set_busy(False)
+    child._drain_results()
+    assert child._closed
+    client._drain_results()
+    assert client._closed
+
+
+def test_stop_before_task_id_waits_for_first_progress_and_ignores_other_task(root, tmp_path):
+    app = FakeApplication()
+    stopped = []
+    app.request_stop = stopped.append
+    client = DesktopClient(root, app, workspace_service=FakeWorkspaceService(tmp_path))
+    client._task_operation = True
+    client._set_busy(True, "准备")
+    client._request_stop()
+    assert client._stop_when_ready and not stopped
+    client._present_progress(ProgressEvent.for_phase(
+        ProgressWorkflow.DEVELOPMENT, ProgressPhase.PREPARING_CONTEXT, task_id="task-a",
+    ), immediate=True)
+    assert stopped == ["task-a"]
+    client._present_progress(ProgressEvent.for_phase(
+        ProgressWorkflow.DEVELOPMENT, ProgressPhase.MODIFYING_CODE, task_id="task-b",
+    ), immediate=True)
+    assert client._active_task_id == "task-a"
+    assert stopped == ["task-a"]
+
+
+
+def test_bound_incident_window_starts_remediation_in_separate_development_window(
+    root, tmp_path, monkeypatch,
+):
+    incident = IncidentSession(
+        workspace=str(tmp_path), problem="订单异常", status=IncidentStatus.COMPLETED,
+        last_decision=IncidentDecision(
+            status=IncidentStatus.COMPLETED, message="诊断完成", diagnosis="需要修改重试逻辑",
+            recommended_actions=["修复重试分支"],
+        ),
+    )
+    app = FakeApplication()
+    client = DesktopClient(root, app, FakeIncidentApplication([incident]),
+                           workspace_service=FakeWorkspaceService(tmp_path))
+    child = client._open_task_window(session=incident, flow=FlowKind.INCIDENT)
+    operations = []
+    monkeypatch.setattr(DesktopClient, "_run_in_background",
+                        lambda window, operation, label: operations.append((window, operation)))
+    child._start_incident_remediation()
+    assert child.flow == FlowKind.INCIDENT and child.session_id == incident.id
+    assert len(operations) == 1
+    repair_window = operations[0][0]
+    assert repair_window is not child
+    assert repair_window.flow == FlowKind.DEVELOPMENT
+    assert repair_window.session_id is None
+    assert not app.calls

@@ -24,7 +24,7 @@ def test_application_git_uses_each_project_target(repositories, tmp_path, monkey
     store.save_project("second", second, "origin", "main")
     calls = []
     monkeypatch.setattr(GitVersionService, "sync", lambda self: calls.append(self) or "head")
-    engine = SimpleNamespace(start=lambda *args, **kwargs: args)
+    engine = SimpleNamespace(start=lambda *args, **kwargs: args, _stop_requested=lambda task: False)
     development = AgentApplication(engine, data_dir=state)
     incident = IncidentApplication(engine, data_dir=state)
     development.start(second, "inspect")

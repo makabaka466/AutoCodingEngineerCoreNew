@@ -27,7 +27,7 @@ def test_bound_query_to_repair_plan_persists_without_writes_or_implicit_approval
     _, metadata = repair_context(workspace)
     calls = []
 
-    def read_query(snapshot, query, stage):
+    def read_query(snapshot, query, stage, *, stop_requested=None):
         validate_read_only_sql(query.sql)  # 任何意外的修复/回退执行都会使测试失败。
         query.datasource_id = query.datasource_id or snapshot.binding.business_default
         calls.append(query.model_copy(deep=True))

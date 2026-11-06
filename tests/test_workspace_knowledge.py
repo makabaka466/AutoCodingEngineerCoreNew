@@ -64,10 +64,12 @@ def test_project_knowledge_is_synced_into_each_workspace_memory(tmp_path: Path) 
         encoding="utf-8"
     )
 
-    CapabilityStore(
+    switched = CapabilityStore(
         state, knowledge_root=service.knowledge_root / "development"
     ).prepare(workspace, "组装")
-    switched_index = (development / "CAPABILITIES.md").read_text(encoding="utf-8")
+    assert switched != development
+    assert "pinned/生物/生物.md" in (development / "CAPABILITIES.md").read_text(encoding="utf-8")
+    switched_index = (switched / "CAPABILITIES.md").read_text(encoding="utf-8")
     assert "pinned/组装/组装.md" in switched_index
     assert "pinned/生物/生物.md" not in switched_index
 

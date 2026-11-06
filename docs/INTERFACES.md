@@ -1508,3 +1508,14 @@ AgentSession新增可选pending_approval_snapshot、approved_execution、impleme
 AgentApplication.approve/AgentEngine.approve增加可选keyword expected_version，保持已有调用兼容；AgentOutcome新增version。桌面捕获显示版本，Web按钮绑定task+version；CLI approve可传--expected-version。HTTP继续要求原expected_version/approval_id/scope，worker将版本传至引擎复核；pending_approval新增review摘要(snapshot_id/planned_paths/requires_revision)，不改变已有审批令牌算法或增加端点。
 
 版本过期抛StaleTaskVersion；文件/方案/上下文快照失效则返回task_state=paused、status=failed和具体原因，本次未启动修改。复用resume先只读核对再生成审批，重复command_id仍优先返回已完成回执。缺路径或不可核验文件在审批界面展示问题并禁用批准；用户可发送修订指令重新调查。历史无快照审批不会默许执行。执行核对摘要沿用消息Markdown，详细记录随session及工件持久化。
+
+
+## 0.25.0 并发与停止
+
+新增Settings.max_concurrent_tasks，环境变量AUTO_CODING_MAX_CONCURRENT_TASKS，默认3、范围1至16。ProgressPhase新增queued，包含真实task_id。Agent/Incident任务状态协议保持兼容；排队的领域状态已开始当前命令，但尚未创建Runtime Run，以execution槽位状态区分排队和执行。TaskAlreadyRunning拒绝重复命令；已完成command_id仍沿用幂等回执。
+
+GET任务详情增加execution：state、queued_at/started_at（Unix秒）、queue_seconds、execution_seconds；未调度为null，结束后保留最后一次记录。不向外返回实际资源路径或PID。
+
+POST /v1/tasks/{task_id}/stop，JSON请求为{"job_id":"当前显示的操作ID"}，沿用用户与项目鉴权，返回202及操作状态。queued转cancelled并记事件；running保存停止意图，具体Run由既有安全边界停止。job_id防止旧停止误伤下一操作，重复请求幂等。已取消且尚未开始的任务需显式resume才能重新开始；进程中断操作仍显式恢复。API首次输入/轮次、审批令牌与expected_version均保持原校验。
+
+AgentApplication/IncidentApplication.sync_git增加可选session_id和progress_sink用于初次同步排队控制，原调用兼容。DataSourceService.execute增加可选stop_requested，等待同库短锁可取消。未增加数据库写接口或权限。
