@@ -1519,3 +1519,9 @@ GET任务详情增加execution：state、queued_at/started_at（Unix秒）、que
 POST /v1/tasks/{task_id}/stop，JSON请求为{"job_id":"当前显示的操作ID"}，沿用用户与项目鉴权，返回202及操作状态。queued转cancelled并记事件；running保存停止意图，具体Run由既有安全边界停止。job_id防止旧停止误伤下一操作，重复请求幂等。已取消且尚未开始的任务需显式resume才能重新开始；进程中断操作仍显式恢复。API首次输入/轮次、审批令牌与expected_version均保持原校验。
 
 AgentApplication/IncidentApplication.sync_git增加可选session_id和progress_sink用于初次同步排队控制，原调用兼容。DataSourceService.execute增加可选stop_requested，等待同库短锁可取消。未增加数据库写接口或权限。
+
+## 0.25.1 审批前置校验
+
+沿用现有任务和审批接口。新输出approval_required对应已通过文件范围与指纹校验的方案。候选校验失败时inspect最多补查一次，仍失败返回paused、approval=null及明确原因，resume沿用只读恢复。历史审批的issues通过重新调查生成新快照消解，客户端不能直接清空issues来批准。
+
+桌面提供历史方案“重新核对”操作，以及分隔条调宽和折叠入口。折叠不改变任务版本、授权状态或执行进度。

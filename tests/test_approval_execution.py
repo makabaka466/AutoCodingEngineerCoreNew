@@ -95,6 +95,18 @@ def test_stale_read_dependency_prevents_approval(tmp_path: Path) -> None:
     assert not snapshot_approval(session, _approval()).issues
 
 
+@pytest.mark.parametrize("marker", ["<OUTSIDE_WORKSPACE>", "<outside_workspace>", "<USER_HOME>/a"])
+def test_redacted_read_is_not_a_file_or_a_writable_target(tmp_path: Path, marker: str) -> None:
+    session = AgentSession(workspace=str(tmp_path), goal="修改校验")
+    session.events.append(_event(session, marker))
+    snapshot = snapshot_approval(session, _approval())
+    assert not snapshot.issues
+    assert [item.path for item in snapshot.files] == ["source.py"]
+    rejected = snapshot_approval(session, _approval(marker))
+    assert rejected.issues
+    assert not rejected.planned_paths
+
+
 def test_changed_goal_and_user_input_invalidate_approval(tmp_path: Path) -> None:
     session = AgentSession(workspace=str(tmp_path), goal="修改校验")
     approval = _approval()

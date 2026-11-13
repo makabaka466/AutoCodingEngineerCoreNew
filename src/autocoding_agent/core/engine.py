@@ -786,6 +786,7 @@ class AgentEngine:
         hermes_skill_rounds = 0
         consecutive_search_repair_rounds = 0
         entry_repair_used = False
+        approval_repair_used = False
         budget_closure_requested = False
 
         # 第 4 步：每次循环只对应一次可审计的 Runtime 调用。宿主服务可以返回证据并触发
@@ -1130,6 +1131,45 @@ class AgentEngine:
                     data={"status": decision.status.value},
                 )
             )
+            # 先核对候选方案，只有可执行的范围才进入公开审批与方案归档。
+            approval_snapshot = (
+                snapshot_approval(session, decision.approval) if decision.approval else None
+            )
+            if approval_snapshot is not None and approval_snapshot.issues:
+                gaps = "\n".join(f"- {item}" for item in approval_snapshot.issues)
+                session.pending_approval = None
+                session.pending_approval_snapshot = None
+                session.events.append(AgentEvent(
+                    type=EventType.POLICY_REPAIR_REQUESTED,
+                    message="候选方案未通过执行前提校验，尚未提交用户审批。",
+                    command_id=command.id, correlation_id=run.id,
+                    data={
+                        "policy": "approval_readiness", "missing": list(approval_snapshot.issues),
+                    },
+                ))
+                if mode != AgentMode.INSPECT or approval_repair_used:
+                    return self._pause_at_boundary(session, command, message=(
+                        "方案尚未满足执行前提，已保存调查进展：\n" + gaps
+                        + "\n可点击继续任务，让 ACE 只读核对上述问题后再提交方案。"
+                    ))
+                approval_repair_used = True
+                pending_message = (
+                    "ACE 的候选方案校验未通过：\n" + gaps
+                    + "\n请在当前只读范围内补齐明确的目标文件路径，或重新读取变化的依据文件。"
+                    "仅核对列出的缺口，不扩大源码搜索范围，不编辑文件或运行验证命令。"
+                    "解决后重新提交完整方案。若需要用户决定，请提出具体问题并返回 needs_input。"
+                )
+                session.messages.append(ChatMessage(
+                    role=MessageRole.SYSTEM, content=pending_message,
+                ))
+                session.last_decision = None
+                session.status = None
+                self.sessions.save(session)
+                emit_progress(progress_sink, ProgressEvent.for_phase(
+                    ProgressWorkflow.DEVELOPMENT, ProgressPhase.PLANNING_CHANGE,
+                    task_id=session.id, detail="正在补齐方案执行依据，核对通过后提交审批。",
+                ))
+                continue
             decision_record = self.decision_recorder.record(
                 session,
                 decision,
@@ -1196,9 +1236,7 @@ class AgentEngine:
             session.last_decision = decision
             session.status = decision.status
             session.pending_approval = decision.approval
-            session.pending_approval_snapshot = (
-                snapshot_approval(session, decision.approval) if decision.approval else None
-            )
+            session.pending_approval_snapshot = approval_snapshot
             session.messages.append(
                 ChatMessage(
                     role=MessageRole.ASSISTANT,

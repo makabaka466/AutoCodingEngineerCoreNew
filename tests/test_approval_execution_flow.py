@@ -168,6 +168,83 @@ def test_verification_approval_rechecks_just_implemented_files(tmp_path):
     assert len(runtime.turns) == 2
 
 
+class CandidateRuntime(EditingRuntime):
+    """覆盖真实只读事件、候选方案补查及实施后的验证申请。"""
+
+    def __init__(self, *, repair=False, redacted=False, stale_verify=False):
+        super().__init__(verify=stale_verify)
+        self.repair = repair
+        self.redacted = redacted
+        self.stale_verify = stale_verify
+
+    def run_observed(self, turn, run_id, event_sink):
+        result = super().run_observed(turn, run_id, event_sink)
+        if turn.mode == AgentMode.INSPECT:
+            if self.redacted:
+                event_sink(RuntimeActivity(
+                    run_id=run_id, kind=RuntimeEventKind.TOOL_FINISHED, summary="读取外部知识",
+                    tool_name="Read", data={"path": "<OUTSIDE_WORKSPACE>", "is_error": False},
+                ))
+            elif not self.stale_verify and (not self.repair or len(self.turns) == 1):
+                result.decision.approval.proposal.changes[0].path = None
+        elif self.stale_verify:
+            target = Path(turn.workspace, "dependency.py")
+            target.write_text("old", encoding="utf-8")
+            event_sink(RuntimeActivity(
+                run_id=run_id, kind=RuntimeEventKind.TOOL_FINISHED, summary="读取依赖",
+                tool_name="Read", data={"path": "dependency.py", "is_error": False},
+            ))
+            target.write_text("changed externally", encoding="utf-8")
+        return result
+
+
+def test_external_knowledge_read_does_not_block_valid_approval(tmp_path):
+    runtime = CandidateRuntime(redacted=True)
+    app, _, _, pending = setup_task(tmp_path, runtime)
+    assert pending.status == AgentStatus.APPROVAL_REQUIRED
+    assert not app.get_session(pending.session_id).pending_approval_snapshot.issues
+    assert len(runtime.turns) == 1
+    assert app.approve(pending.session_id).status == AgentStatus.COMPLETED
+
+
+@pytest.mark.parametrize("repair", [False, True])
+def test_only_ready_candidate_is_published_after_one_read_only_repair(tmp_path, repair):
+    runtime = CandidateRuntime(repair=repair)
+    app, settings, _, outcome = setup_task(tmp_path, runtime)
+    session = app.get_session(outcome.session_id)
+    assert len(runtime.turns) == 2
+    assert all(turn.mode == AgentMode.INSPECT for turn in runtime.turns)
+    assert "缺少明确" in runtime.turns[-1].user_message
+    proposals = [artifact for artifact in session.artifacts if artifact.type.value == "proposal"]
+    if repair:
+        assert outcome.status == AgentStatus.APPROVAL_REQUIRED
+        assert not session.pending_approval_snapshot.issues
+        assert len(proposals) == 1
+    else:
+        assert outcome.task_state == TaskState.PAUSED
+        assert outcome.approval is None
+        assert session.pending_approval_snapshot is None
+        assert not proposals
+        assert "缺少明确" in outcome.message
+        restored = build_application(settings=settings, runtime=runtime)
+        assert restored.get_session(session.id).task_state == TaskState.PAUSED
+        runtime.repair = True
+        resumed = restored.resume(session.id)
+        assert resumed.status == AgentStatus.APPROVAL_REQUIRED
+        assert runtime.turns[-1].mode == AgentMode.INSPECT
+
+
+def test_failed_verification_preflight_does_not_repeat_implementation(tmp_path):
+    runtime = CandidateRuntime(stale_verify=True)
+    app, _, workspace, pending = setup_task(tmp_path, runtime)
+    outcome = app.approve(pending.session_id)
+    assert outcome.task_state == TaskState.PAUSED
+    assert outcome.approval is None
+    assert "dependency.py" in outcome.message
+    assert len(runtime.turns) == 2
+    assert (workspace / "service.py").read_text() == "value=2\n"
+
+
 def test_power_loss_before_audit_rebuilds_file_report_without_runtime(tmp_path):
     runtime = EditingRuntime()
     app, settings, workspace, pending = setup_task(tmp_path, runtime)

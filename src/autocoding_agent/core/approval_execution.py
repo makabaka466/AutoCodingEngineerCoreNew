@@ -33,7 +33,8 @@ def _digest(value: str) -> str:
 
 def normalized_path(workspace: str, reference: str) -> str | None:
     """限定为明确工作区内路径；目录或通配表达式不能充当文件授权。"""
-    if not reference.strip() or any(char in reference for char in "*?\0"):
+    # Runtime用尖括号标记工作区外路径等脱敏内容，不能将其当作相对文件名。
+    if not reference.strip() or any(char in reference for char in "*?\0<>"):
         return None
     try:
         root = Path(workspace).resolve()

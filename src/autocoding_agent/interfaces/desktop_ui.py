@@ -636,6 +636,10 @@ class DesktopClient:
         self._overview_visible = False
         self._history_hidden: bool | None = None
         self._review_reading = True
+        self._approval_visible = False
+        self._approval_content_key = None
+        self._review_split = 0.5
+        self._review_layout = None
         self._displayed_conversation = None
         self._conversation_positions: dict[tuple, float] = {}
         self.history_search_var = tk.StringVar()
@@ -657,6 +661,7 @@ class DesktopClient:
         self._current_status: AgentStatus | IncidentStatus | None = None
         self._current_task_state: TaskState | None = None
         self._approval_can_execute = True
+        self._approval_needs_recheck = False
         self._reviewed_approval_version: int | None = None
         self._flow_projects: dict[FlowKind, str] = {
             FlowKind.DEVELOPMENT: "",
@@ -888,19 +893,21 @@ class DesktopClient:
         )
         self.status_badge.grid(row=0, column=2, sticky="e", padx=(0, 10), pady=4)
 
+        self.conversation_panes = tk.PanedWindow(
+            main, orient="horizontal", sashwidth=8, sashrelief="flat",
+            borderwidth=0, bg=COLORS["border_soft"], opaqueresize=True,
+        )
+        self.conversation_panes.grid(row=1, column=0, sticky="nsew", padx=22)
+        self.conversation_panes.bind("<Configure>", self._restore_review_split)
+        self.conversation_panes.bind("<ButtonRelease-1>", self._remember_review_split)
         self.transcript_panel = GlassPanel(
-            main,
+            self.conversation_panes,
             fill=COLORS["glass"],
             radius=0,
             padding=6,
         )
-        self.transcript_panel.grid(
-            row=1,
-            column=0,
-            sticky="nsew",
-            padx=(20, 20),
-            pady=(0, 0),
-        )
+        self.conversation_panes.add(self.transcript_panel, minsize=280, stretch="always")
+        self.transcript_panel.configure(bg=COLORS["surface"])
         transcript_frame = self.transcript_panel.content
         transcript_frame.grid_rowconfigure(1, weight=1)
         transcript_frame.grid_columnconfigure(0, weight=1)
@@ -1144,22 +1151,30 @@ class DesktopClient:
         self.transcript_menu.add_command(label="全选对话", command=self._select_all_transcript)
 
         self.approval_frame = tk.Frame(
-            main,
+            self.conversation_panes,
             bg=COLORS["surface"],
             highlightthickness=1,
             highlightbackground=COLORS["border_soft"],
         )
         self.approval_frame.grid_columnconfigure(0, weight=1)
         self.approval_frame.grid_rowconfigure(1, weight=1)
+        approval_header = tk.Frame(self.approval_frame, bg=COLORS["surface"])
+        approval_header.grid(row=0, column=0, columnspan=2, sticky="ew", padx=16, pady=(12, 5))
+        approval_header.grid_columnconfigure(0, weight=1)
         self.approval_title = tk.Label(
-            self.approval_frame,
+            approval_header,
             text="修改方案",
             anchor="w",
             font=("Microsoft YaHei UI", 10, "bold"),
             fg=COLORS["warning"],
             bg=COLORS["surface"],
         )
-        self.approval_title.grid(row=0, column=0, columnspan=2, sticky="ew", padx=16, pady=(12, 5))
+        self.approval_title.grid(row=0, column=0, sticky="ew")
+        self.collapse_approval_button = self._button(
+            approval_header, "收起方案", self._toggle_review,
+            background=COLORS["surface"], active_background=COLORS["panel_hover"],
+        )
+        self.collapse_approval_button.grid(row=0, column=1, padx=(8, 0))
         self.approval_text = tk.Text(
             self.approval_frame,
             height=9,
@@ -1185,9 +1200,19 @@ class DesktopClient:
         approval_actions = tk.Frame(self.approval_frame, bg=COLORS["surface"])
         approval_actions.grid(row=2, column=0, columnspan=2, sticky="ew", padx=10, pady=(7, 11))
         approval_actions.grid_columnconfigure(0, weight=1)
+        self.approval_issue = tk.Label(
+            approval_actions, text="", anchor="w", justify="left", wraplength=380,
+            fg=COLORS["warning"], bg=COLORS["surface"], font=("Microsoft YaHei UI", 9),
+        )
+        self.approval_issue.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(5, 0))
+        self.approval_issue.grid_remove()
+        self.approval_frame.bind(
+            "<Configure>",
+            lambda event: self.approval_issue.configure(wraplength=max(180, event.width - 40)),
+        )
         self.reject_button = self._button(
             approval_actions,
-            "拒绝或调整",
+            "要求调整",
             self._reject,
             background=COLORS["panel"],
             active_background=COLORS["panel_hover"],
@@ -1195,7 +1220,7 @@ class DesktopClient:
         self.reject_button.grid(row=0, column=1, padx=4)
         self.approve_button = self._button(
             approval_actions,
-            "批准此方案",
+            "批准执行",
             self._approve,
             background=COLORS["accent"],
             active_background=COLORS["accent_hover"],
@@ -1667,8 +1692,27 @@ class DesktopClient:
         self._update_responsive_layout()
 
     def _toggle_review(self) -> None:
+        self._remember_review_split()
         self._review_reading = not self._review_reading
         self._update_responsive_layout()
+
+    def _remember_review_split(self, _event=None) -> None:
+        """只记录双栏状态的比例，折叠或窄窗口不会覆盖用户的宽度选择。"""
+        if len(self.conversation_panes.panes()) == 2:
+            width = self.conversation_panes.winfo_width()
+            if width > 1:
+                self._review_split = self.conversation_panes.sash_coord(0)[0] / width
+
+    def _restore_review_split(self, _event=None) -> None:
+        if _event is not None:
+            self.root.after_idle(self._restore_review_split)
+            return
+        if len(self.conversation_panes.panes()) != 2:
+            return
+        width = self.conversation_panes.winfo_width()
+        if width > 560:
+            position = max(280, min(width - 288, round(width * self._review_split)))
+            self.conversation_panes.sash_place(0, position, 0)
 
     def _update_responsive_layout(self, event=None) -> None:
         if event is not None and event.widget is not self.root:
@@ -1683,39 +1727,37 @@ class DesktopClient:
             self.sidebar_panel.grid()
         self.root.grid_columnconfigure(1, minsize=0 if hidden else 320)
         available = width - 60 - (0 if hidden else 320)
-        inset = 22
-        self.composer_panel.grid_configure(columnspan=2, padx=inset)
-        self.transcript_panel.grid_configure(padx=inset)
+        self.composer_panel.grid_configure(columnspan=2, padx=22)
         self.header_panel.grid_configure(columnspan=2)
         self.footer_panel.grid_configure(columnspan=2)
         self.overview_panel.grid_remove()
         self.main_frame.grid_columnconfigure(0, weight=1)
         self.main_frame.grid_columnconfigure(1, weight=0, minsize=0)
-        if self.approval_frame.winfo_manager():
+        if self._approval_visible:
             self.review_toggle.grid()
-            self.review_toggle.configure(text="查看对话" if self._review_reading else "查看方案")
-            if available >= 1150:
-                self.review_toggle.grid_remove()
-                self.transcript_panel.grid()
-                self.transcript_panel.grid_configure(padx=16)
-                self.main_frame.grid_columnconfigure(0, weight=4)
-                self.main_frame.grid_columnconfigure(1, weight=6)
-                self.approval_frame.grid_configure(row=1, column=1, sticky="nsew",
-                                                   padx=(8, 24), pady=8)
-            else:
-                self.approval_frame.grid_configure(row=1, column=0, sticky="nsew",
-                                                   padx=inset, pady=8)
-                if self._review_reading:
-                    self.transcript_panel.grid_remove()
-                else:
-                    self.transcript_panel.grid()
-                    tk.Misc.tkraise(self.transcript_panel)
+            self.review_toggle.configure(
+                text="收起方案" if self._review_reading else "查看方案 · 待处理",
+            )
         else:
             self.review_toggle.grid_remove()
-            self.transcript_panel.grid()
             if self._overview_visible and available >= 900:
                 self.overview_panel.grid()
                 self.main_frame.grid_columnconfigure(1, minsize=320)
+        show_review = self._approval_visible and self._review_reading
+        desired = (
+            (self.transcript_panel, self.approval_frame) if show_review and available >= 1000
+            else (self.approval_frame,) if show_review
+            else (self.transcript_panel,)
+        )
+        # 只在显示组合变化时重新挂载，进度刷新不会重置分隔位置或阅读位置。
+        if desired != self._review_layout:
+            self._remember_review_split()
+            for pane in self.conversation_panes.panes():
+                self.conversation_panes.forget(pane)
+            for pane in desired:
+                self.conversation_panes.add(pane, minsize=280, stretch="always")
+            self._review_layout = desired
+            self.root.after_idle(self._restore_review_split)
         if hasattr(self, "_chat_renderer"):
             self._chat_renderer.resize()
 
@@ -2849,15 +2891,29 @@ class DesktopClient:
             "Claude Code 正在执行已批准的操作",
         )
 
+    def _recheck_approval(self) -> None:
+        if self.flow != FlowKind.DEVELOPMENT or self._busy or not self.session_id:
+            return
+        session_id = self.session_id
+        self._run_in_background(
+            lambda: self.application.send(
+                session_id,
+                "请只读重新核对当前方案的目标文件、读取依据和审批缺口。"
+                "保留已明确的需求，补齐证据后重新生成可审阅方案，等待用户批准。",
+                progress_sink=self._queue_progress,
+            ),
+            "正在重新核对方案依据",
+        )
+
     def _reject(self) -> None:
         if self.flow != FlowKind.DEVELOPMENT or self._busy or not self.session_id:
             return
         reason = simpledialog.askstring(
-            "拒绝或调整方案",
-            "请说明希望调整的内容（可选）：",
+            "要求调整方案",
+            "提交后将撤回当前审批，由 ACE 只读调查并更新方案。\n请填写需要调整的内容：",
             parent=self.root,
         )
-        if reason is None:
+        if reason is None or not reason.strip():
             return
         session_id = self.session_id
         self._run_in_background(
@@ -3265,7 +3321,9 @@ class DesktopClient:
         )
         self.git_publish_button.configure(state="normal" if can_publish else "disabled")
         self.approve_button.configure(
-            state="normal" if can_decide and self._approval_can_execute else "disabled"
+            state="normal" if can_decide and (
+                self._approval_can_execute or self._approval_needs_recheck
+            ) else "disabled"
         )
         self.reject_button.configure(state="normal" if can_decide else "disabled")
         if recovery_state and not self._busy:
@@ -3291,136 +3349,110 @@ class DesktopClient:
             not self._busy and self.incident_application is not None
         )
 
+    def _set_approval_content(self, session_id: str, content: str) -> None:
+        """同一份方案仅更新按钮状态，保留折叠状态和正文阅读位置。"""
+        key = (self.flow, session_id, content)
+        if key != self._approval_content_key:
+            self._approval_content_key = key
+            self._review_reading = True
+            self.approval_text.configure(state="normal")
+            self.approval_text.delete("1.0", "end")
+            if not hasattr(self, "_approval_renderer"):
+                self._approval_renderer = ChatTranscript(self.approval_text)
+                self.approval_text.tag_configure(
+                    "approval_body", lmargin1=12, lmargin2=12, rmargin=12,
+                    spacing1=2, spacing2=4, spacing3=5,
+                )
+            insert_markdown(self.approval_text, content, "approval_body")
+            self.approval_text.yview_moveto(0.0)
+            self.approval_text.configure(state="disabled")
+        self._approval_visible = True
+        self._update_responsive_layout()
+
     def _show_approval(self, session: AgentSession) -> None:
         approval = session.pending_approval
         self._reviewed_approval_version = session.version if approval is not None else None
+        self._approval_needs_recheck = False
+        self.approval_issue.grid_remove()
         if approval is None and session.task_state in {
             TaskState.PAUSED,
             TaskState.RECOVERY_REQUIRED,
         }:
             recovery = next(
-                (
-                    artifact
-                    for artifact in reversed(session.artifacts)
-                    if artifact.type.value == "recovery_report"
-                ),
-                None,
+                (artifact for artifact in reversed(session.artifacts)
+                 if artifact.type.value == "recovery_report"), None,
             )
             self._approval_can_execute = True
-            self.approval_title.configure(text="恢复任务 · 不会自动重放写操作")
-            self.approval_text.configure(state="normal")
-            self.approval_text.delete("1.0", "end")
-            self.approval_text.insert(
-                "1.0",
-                "检测到中断任务。请选择：只读检查当前现场、放弃旧方案后重新规划，"
-                "或取消任务。\n\n"
-                + (
-                    f"恢复报告：{recovery.relative_path}"
-                    if recovery is not None
-                    else "恢复报告未能生成，请先选择只读检查。"
-                ),
-            )
-            self.approval_text.configure(state="disabled")
+            self.approval_title.configure(text="恢复任务 · 先只读核对")
             self.reject_button.configure(text="取消任务", command=self._cancel_recovery)
             self.approve_button.configure(text="继续任务（先核对）", command=self._resume_recovery)
             self.recovery_replan_button.configure(text="重新规划", command=self._replan_recovery)
             self.recovery_replan_button.grid(row=0, column=2, padx=4)
             self.approve_button.grid_configure(column=3)
-            self.approval_frame.grid(
-                row=2,
-                column=0,
-                sticky="ew",
-                padx=(0, 14),
-                pady=(10, 0),
+            self._set_approval_content(
+                session.id,
+                (session.last_decision.message if session.last_decision else "任务需要恢复。")
+                + "\n\n请选择只读检查当前现场、放弃旧方案后重新规划，或取消任务。\n\n"
+                + (f"恢复报告：{recovery.relative_path}" if recovery is not None
+                   else "可继续任务，让 ACE 先只读核对现有证据。"),
             )
-            self._update_responsive_layout()
             return
         if approval is None:
             self._hide_approval()
             return
-        self.reject_button.configure(text="拒绝或调整", command=self._reject)
-        self.approve_button.configure(command=self._approve)
+        self.reject_button.configure(text="要求调整", command=self._reject)
         self.approve_button.grid_configure(column=2)
         self.recovery_replan_button.grid_remove()
         is_modify = approval.scope == ApprovalScope.MODIFY
         snapshot = session.pending_approval_snapshot
-        needs_revision = snapshot is not None and bool(snapshot.issues)
-        self._approval_can_execute = (
-            not (is_modify and approval.proposal is None) and not needs_revision
-        )
+        issues = list(snapshot.issues) if snapshot is not None else [
+            "历史审批缺少文件依据快照，请重新核对。",
+        ]
+        if is_modify and approval.proposal is None:
+            issues.insert(0, "旧审批缺少修改方案，请重新核对后生成。")
+        self._approval_needs_recheck = bool(issues)
+        self._approval_can_execute = not issues
         self.approval_title.configure(
-            text=(
-                "方案范围尚未确定 · 请调整后重新审阅"
-                if needs_revision
-                else "旧审批缺少修改方案 · 请拒绝并说明需要重新生成方案"
-                if is_modify and approval.proposal is None
-                else "修改方案 · 确认后才会编辑文件"
-                if is_modify
-                else "验证方案 · 确认后才会运行命令"
-            )
+            text=("方案需重新核对" if issues else "修改方案" if is_modify else "验证方案"),
         )
+        if issues:
+            # 固定提示仅保留摘要，完整原因留在可滚动正文中，避免挤掉方案和按钮。
+            summaries = [issue if len(issue) <= 100 else issue[:100] + "…" for issue in issues[:3]]
+            if len(issues) > 3 or any(len(issue) > 100 for issue in issues[:3]):
+                summaries.append("完整原因见方案正文。")
+            self.approval_issue.configure(text="\n".join(summaries))
+            self.approval_issue.grid()
         self.approve_button.configure(
-            text=(
-                "需要重新生成"
-                if needs_revision or (is_modify and approval.proposal is None)
-                else "批准此方案"
-                if is_modify
-                else "批准并验证"
-            )
+            text="重新核对" if issues else "批准执行" if is_modify else "批准并验证",
+            command=self._recheck_approval if issues else self._approve,
         )
-        self.approval_text.configure(state="normal")
-        self.approval_text.delete("1.0", "end")
-        if not hasattr(self, "_approval_renderer"):
-            self._approval_renderer = ChatTranscript(self.approval_text)
-            self.approval_text.tag_configure(
-                "approval_body", lmargin1=12, lmargin2=12, rmargin=12,
-                spacing1=2, spacing2=4, spacing3=5,
-            )
-        insert_markdown(
-            self.approval_text, format_approval_details(approval, snapshot), "approval_body",
-        )
-        self.approval_text.yview_moveto(0.0)
-        self.approval_text.configure(state="disabled")
-        self.approval_frame.grid(
-            row=2,
-            column=0,
-            sticky="ew",
-            padx=(0, 14),
-            pady=(10, 0),
-        )
-        self._update_responsive_layout()
+        self._set_approval_content(session.id, format_approval_details(approval, snapshot))
 
     def _show_incident_recovery(self, session: IncidentSession) -> None:
         self._approval_can_execute = True
-        self.approval_title.configure(text="恢复异常诊断 · 只读查询不会自动重放")
-        self.approval_text.configure(state="normal")
-        self.approval_text.delete("1.0", "end")
-        self.approval_text.insert(
-            "1.0",
-            (session.last_decision.message if session.last_decision else "异常诊断已暂停。")
-            + "\n\n继续后 Agent 会重新核对代码和数据库 schema，并自行形成、执行最小只读 SQL。",
-        )
-        self.approval_text.configure(state="disabled")
+        self._approval_needs_recheck = False
+        self.approval_issue.grid_remove()
+        self.approval_title.configure(text="恢复异常诊断")
         self.reject_button.configure(text="取消诊断", command=self._cancel_recovery)
         self.approve_button.configure(text="继续只读诊断", command=self._resume_recovery)
         self.recovery_replan_button.configure(text="重新调查", command=self._replan_recovery)
         self.recovery_replan_button.grid(row=0, column=2, padx=4)
         self.approve_button.grid_configure(column=3)
-        self.approval_frame.grid(
-            row=2,
-            column=0,
-            sticky="ew",
-            padx=(0, 14),
-            pady=(10, 0),
+        self._set_approval_content(
+            session.id,
+            (session.last_decision.message if session.last_decision else "诊断需要恢复。")
+            + "\n\n继续后 Agent 会重新核对代码和数据库 schema，并自行形成、执行最小只读 SQL。",
         )
-        self._update_responsive_layout()
 
     def _hide_approval(self) -> None:
         self._approval_can_execute = True
+        self._approval_needs_recheck = False
         self._reviewed_approval_version = None
+        self._approval_visible = False
+        self._approval_content_key = None
         self.recovery_replan_button.grid_remove()
         self.approve_button.grid_configure(column=2)
-        self.approval_frame.grid_remove()
+        self.approval_issue.grid_remove()
         self._review_reading = True
         self._update_responsive_layout()
 

@@ -594,9 +594,17 @@ def test_legacy_modify_approval_can_be_revised_but_not_approved(
 
     client._render_session(session)
 
-    assert client.approve_button.cget("state") == "disabled"
+    assert client.approve_button.cget("state") == "normal"
+    assert client.approve_button.cget("text") == "重新核对"
     assert client.reject_button.cget("state") == "normal"
-    assert "缺少修改方案" in client.approval_title.cget("text")
+    assert "缺少修改方案" in client.approval_issue.cget("text")
+    operations = _capture_operation(client)
+    client._approve()
+    assert not operations
+    client.approve_button.invoke()
+    operations.pop()()
+    assert client.application.calls[0][:2] == ("send", session.id)
+    assert "只读重新核对" in client.application.calls[0][2]
 
 
 def test_approval_snapshot_shows_scope_gap_and_requires_revision(root: tk.Toplevel) -> None:
@@ -621,7 +629,9 @@ def test_approval_snapshot_shows_scope_gap_and_requires_revision(root: tk.Toplev
     displayed = client.approval_text.get("1.0", "end")
     assert session.pending_approval_snapshot.id[:8] in displayed
     assert "缺少明确的工作区内文件路径" in displayed
-    assert client.approve_button.cget("state") == "disabled"
+    assert client.approve_button.cget("state") == "normal"
+    assert client.approve_button.cget("command") == client._recheck_approval
+    assert "缺少明确" in client.approval_issue.cget("text")
     assert client.reject_button.cget("state") == "normal"
 
 
@@ -1055,6 +1065,7 @@ def test_review_uses_available_height_and_can_switch_to_conversation(root: tk.To
     session.pending_approval = ApprovalRequest(
         scope=ApprovalScope.VERIFY, reason="验证修改", proposed_actions=["pytest"],
     )
+    session.pending_approval_snapshot = snapshot_approval(session, session.pending_approval)
     client = DesktopClient(root, FakeApplication([session]))  # type: ignore[arg-type]
     root.geometry("1280x800")
     root.deiconify()
@@ -1065,12 +1076,16 @@ def test_review_uses_available_height_and_can_switch_to_conversation(root: tk.To
     assert client.transcript_panel.winfo_manager() == ""
     client._toggle_review()
     root.update()
-    assert client.transcript_panel.winfo_manager() == "grid"
+    assert client.transcript_panel.winfo_manager() == "panedwindow"
     assert client.approve_button.cget("command") == client._approve
     root.geometry("1840x980")
     root.update()
+    assert client.approval_frame.winfo_manager() == ""  # 缩放不能悄悄展开方案。
+    client._toggle_review()
+    root.update()
     assert client.composer_panel.winfo_width() > 650
-    assert int(client.approval_frame.grid_info()["column"]) == 1
+    assert client.approval_frame.winfo_manager() == "panedwindow"
+    assert len(client.conversation_panes.panes()) == 2
     assert client.send_button.winfo_rootx() + client.send_button.winfo_width() < (
         root.winfo_rootx() + root.winfo_width()
     )
@@ -1490,6 +1505,7 @@ def test_approval_buttons_route_exact_session_and_rejection_reason(
             preview_markdown="取消前 9 -> 取消后 10",
         ),
     )
+    session.pending_approval_snapshot = snapshot_approval(session, session.pending_approval)
     application = FakeApplication([session])
     client = DesktopClient(root, application)  # type: ignore[arg-type]
     client.session_id = session.id
@@ -1789,3 +1805,75 @@ def test_bound_incident_window_starts_remediation_in_separate_development_window
     assert repair_window.flow == FlowKind.DEVELOPMENT
     assert repair_window.session_id is None
     assert not app.calls
+
+
+def test_review_split_drag_collapse_and_refresh_preserve_reading(root: tk.Toplevel) -> None:
+    session = _session(AgentStatus.APPROVAL_REQUIRED)
+    session.pending_approval = ApprovalRequest(
+        scope=ApprovalScope.VERIFY, reason="验证修改",
+        proposed_actions=[f"验证第 {index} 个操作并记录结果。" for index in range(50)],
+    )
+    session.pending_approval_snapshot = snapshot_approval(session, session.pending_approval)
+    application = FakeApplication([session])
+    client = DesktopClient(root, application)  # type: ignore[arg-type]
+    client.session_id = session.id
+    root.geometry("1840x980")
+    root.deiconify()
+    client._render_session(session)
+    root.update()
+    panes = client.conversation_panes
+    original = panes.sash_coord(0)[0]
+    panes.event_generate("<ButtonPress-1>", x=original + 2, y=80)
+    panes.event_generate("<B1-Motion>", x=original + 162, y=80)
+    panes.event_generate("<ButtonRelease-1>", x=original + 162, y=80)
+    root.update()
+    moved = panes.sash_coord(0)[0]
+    assert moved > original + 100
+    ratio = client._review_split
+    client.approval_text.yview_moveto(0.5)
+    position = client.approval_text.yview()[0]
+    client.collapse_approval_button.invoke()
+    root.update()
+    assert len(panes.panes()) == 1 and client.transcript_panel.winfo_ismapped()
+    client._render_session(session)
+    root.update()
+    assert not client.approval_frame.winfo_ismapped()
+    client.review_toggle.invoke()
+    root.update()
+    assert abs(panes.sash_coord(0)[0] - moved) <= 3
+    assert abs(client.approval_text.yview()[0] - position) < 0.02
+    client._set_busy(True, "正在处理")
+    root.update()
+    assert abs(client._review_split - ratio) < 0.01
+    for width in (920, 1280, 1840):
+        root.geometry(f"{width}x800")
+        root.update()
+        assert client.approval_frame.winfo_ismapped()
+        assert client.approve_button.winfo_rootx() + client.approve_button.winfo_width() <= (
+            root.winfo_rootx() + root.winfo_width()
+        )
+    assert abs(client._review_split - ratio) < 0.01
+    assert not application.calls
+
+
+def test_many_approval_issues_keep_actions_visible(root: tk.Toplevel) -> None:
+    session = _session(AgentStatus.APPROVAL_REQUIRED)
+    session.pending_approval = ApprovalRequest(
+        scope=ApprovalScope.VERIFY, reason="验证修改", proposed_actions=["pytest"],
+    )
+    issues = tuple(f"第 {index} 项：" + "文件读取依据需要重新核对。" * 20 for index in range(12))
+    session.pending_approval_snapshot = snapshot_approval(
+        session, session.pending_approval,
+    ).model_copy(update={"issues": issues})
+    client = DesktopClient(root, FakeApplication([session]))  # type: ignore[arg-type]
+    client.session_id = session.id
+    root.geometry("1280x800")
+    root.deiconify()
+    client._render_session(session)
+    root.update()
+    assert len(client.approval_issue.cget("text")) < 340
+    assert "第 11 项" in client.approval_text.get("1.0", "end")
+    assert client.approval_text.winfo_height() > 150
+    assert client.approve_button.winfo_rooty() + client.approve_button.winfo_height() < (
+        client.composer_panel.winfo_rooty()
+    )
