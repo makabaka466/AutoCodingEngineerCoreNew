@@ -879,7 +879,7 @@ def _stream_activities(
             continue
         block_type = block.get("type")
         if event_type == "assistant" and block_type == "text":
-            summary = _safe_runtime_text(str(block.get("text") or ""), workspace, limit=500)
+            summary = _safe_runtime_text(str(block.get("text") or ""), workspace, limit=1600)
             if summary:
                 activities.append(
                     RuntimeActivity(
@@ -996,7 +996,8 @@ def _safe_runtime_text(value: str, workspace: str, *, limit: int = 300) -> str:
     text = _redact(value)
     text = re.sub(re.escape(str(Path(workspace).resolve())), "<WORKSPACE>", text, flags=re.I)
     text = re.sub(re.escape(str(Path.home())), "<USER_HOME>", text, flags=re.I)
-    return " ".join(text.split())[:limit]
+    text = " ".join(text.split())
+    return text[:limit] + ("…（已截短）" if len(text) > limit else "")
 
 
 def _optional_int(value: Any) -> int | None:

@@ -1525,3 +1525,13 @@ AgentApplication/IncidentApplication.sync_git增加可选session_id和progress_s
 沿用现有任务和审批接口。新输出approval_required对应已通过文件范围与指纹校验的方案。候选校验失败时inspect最多补查一次，仍失败返回paused、approval=null及明确原因，resume沿用只读恢复。历史审批的issues通过重新调查生成新快照消解，客户端不能直接清空issues来批准。
 
 桌面提供历史方案“重新核对”操作，以及分隔条调宽和折叠入口。折叠不改变任务版本、授权状态或执行进度。
+
+## 0.26.0 分析过程读取
+
+AgentApplication.events / IncidentApplication.events新增可选关键字after_sequence和limit：传入非负after_sequence时从SQLite事件表读取sequence大于游标的记录，按序号升序返回；limit默认200、允许1至500。不传after_sequence沿用旧行为，返回任务全部事件。两个SQLite Store的list_events提供相同可选参数，默认调用仍返回全量；未知task_id继续抛KeyError。
+
+无新增或变更HTTP端点，原事件模型、审批及消息接口保持兼容。开发database_queries_executed的queries条目补充purpose/source/returned_rows/truncated（异常流程已有），字段来自既有查询结果审计；不含原始SQL、参数值及业务行。运行时assistant_message仍是公开text摘要，最多1600字符加截短标记，不新增私有推理字段。
+
+新增桌面“展开分析过程”和逐项详情/更早记录入口，均为本地展示动作。后台事件增量读取不占用任务执行名额，也不触发模型或工具调用。停止及用户补充要求继续使用已有按钮和消息入口。
+
+桌面“新窗口”入口改为“会话”菜单，同工作台内新建及切换会话。内部_open_task_window名称为兼容保留，承载改为Frame页；调用不再创建新的系统窗口。会话页面各自管理草稿、附件、历史、审批与任务后台结果；运行中允许访问历史与新建会话。外部API和并发调度协议不变。

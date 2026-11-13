@@ -7,6 +7,7 @@ import re
 import tkinter as tk
 import unicodedata
 
+from autocoding_agent.interfaces.analysis_trace import AnalysisSection
 from autocoding_agent.interfaces.desktop_theme import COLORS, RoundedTextBlock
 
 _SECTION_TITLES = {
@@ -94,6 +95,8 @@ class ChatTranscript:
         self.links: list[str] = []
         self.details_open = False
         self.blocks: list[RoundedTextBlock] = []
+        self.analysis_sections: dict[str, AnalysisSection] = {}
+        self.analysis_limits: dict[str, int] = {}
         for name, options in {
             "chat_heading": {"font": ("Microsoft YaHei UI", 12, "bold"),
                              "spacing1": 8, "spacing3": 4},
@@ -105,6 +108,7 @@ class ChatTranscript:
             "chat_inline_code": {"font": ("Consolas", 10), "background": "#EEF2F6"},
             "chat_muted": {"foreground": "#667085", "font": ("Microsoft YaHei UI", 9)},
             "chat_gap": {"font": ("Microsoft YaHei UI", 4), "spacing1": 0, "spacing3": 0},
+            "chat_warning": {"foreground": COLORS["warning"]},
             "chat_table": {"font": ("Consolas", 10), "background": "#F7F8FA",
                            "spacing1": 5, "spacing3": 5},
         }.items():
@@ -144,6 +148,8 @@ class ChatTranscript:
 
     @staticmethod
     def key(index: int, role: str, content: str) -> str:
+        if role == "analysis":
+            return "analysis:" + content
         return hashlib.sha256(f"{index}:{role}:{content.strip()}".encode()).hexdigest()
 
     def _link(self, label: str, callback) -> None:
@@ -178,13 +184,76 @@ class ChatTranscript:
         self.expanded.clear()
         self.render(self.entries, details_open=False, preserve_scroll=True)
 
+    def _more_analysis(self, key: str) -> None:
+        self.analysis_limits[key] = self.analysis_limits.get(key, 50) + 50
+        self.render(self.entries, details_open=self.details_open, preserve_scroll=True)
+
+    def _render_analysis(self, key: str) -> None:
+        section = self.analysis_sections.get(key)
+        if section is None or not section.steps:
+            return
+        widget = self.widget
+        opened = "analysis:" + key in self.expanded
+        self._link(
+            f"{'收起' if opened else '展开'}分析过程 · {len(section.steps)} 项",
+            lambda: self.toggle("analysis:" + key),
+        )
+        widget.insert("end", "\n", "chat_muted")
+        latest = section.steps[-1]
+        widget.insert("end", f"{latest.source} · {latest.summary}\n", "chat_muted")
+        if not opened:
+            widget.insert("end", "\n", "chat_gap")
+            return
+        widget.insert("end", "公开说明与操作记录；模型判断不等于验证结论。\n", "chat_muted")
+        limit = self.analysis_limits.get(key, 50)
+        if len(section.steps) > limit:
+            self._link(f"查看更早记录（剩余 {len(section.steps) - limit} 项）",
+                       lambda: self._more_analysis(key))
+            widget.insert("end", "\n")
+        groups = []
+        # 先按完整记录确定分组身份，再限制本次渲染数量。
+        # 否则超过50项后每次刷新都会改变锚点，用户展开的详情会自行收起。
+        for step in section.steps:
+            if groups and step.group and groups[-1][-1].group == step.group:
+                groups[-1].append(step)
+            else:
+                groups.append([step])
+        skipped = max(0, len(section.steps) - limit)
+        for steps in groups:
+            first = steps[0]
+            count = len(steps)
+            steps = steps[skipped:]
+            skipped = max(0, skipped - count)
+            if not steps:
+                continue
+            detail_key = "analysis-step:" + first.key
+            detail_open = detail_key in self.expanded
+            label = f"{first.time.astimezone():%H:%M:%S} · {first.source} · {first.title}"
+            if len(steps) > 1:
+                label += f" · {len(steps)} 次"
+            warning = any(step.failed for step in steps)
+            widget.insert("end", label + "  ",
+                          ("chat_bold", "chat_warning") if warning else "chat_bold")
+            self._link("收起" if detail_open else "详情", lambda k=detail_key: self.toggle(k))
+            widget.insert("end", "\n")
+            widget.insert("end", steps[-1].summary + "\n", "assistant_message")
+            if detail_open:
+                for item in steps:
+                    insert_markdown(widget, item.detail or item.summary, "metadata")
+                    widget.insert("end", "\n", "chat_gap")
+        widget.insert("end", "\n", "chat_gap")
+
     def render(self, entries: list[tuple[str, str]], *, details_open: bool = False,
                preserve_scroll: bool = False) -> None:
         position = self.widget.yview()[0]
         follow_bottom = self.widget.yview()[1] >= .98
         self.entries = entries
         self.details_open = details_open
+        self.analysis_limits = {key: value for key, value in self.analysis_limits.items()
+                                if key in self.analysis_sections}
         valid = {self.key(i, role, content) for i, (role, content) in enumerate(entries)}
+        valid.update("analysis-step:" + step.key for section in self.analysis_sections.values()
+                     for step in section.steps)
         self.expanded.intersection_update(valid)
         widget = self.widget
         widget.configure(state="normal")
@@ -202,6 +271,9 @@ class ChatTranscript:
         latest = max((i for i, item in enumerate(entries) if item[0] == "assistant"), default=-1)
         widget.mark_set("latest_reply", "1.0")
         for index, (role, content) in enumerate(entries):
+            if role == "analysis":
+                self._render_analysis(content)
+                continue
             content = content.strip()
             key = self.key(index, role, content)
             long = role != "user" and (len(content) > 1200 or len(content.splitlines()) > 24)

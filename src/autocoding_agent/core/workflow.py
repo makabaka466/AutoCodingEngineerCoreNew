@@ -169,9 +169,9 @@ business choices in user_questions; needs_input until answered, empty only when 
 missing holds causal/evidence gaps; verification_pending holds post-change checks, not intent.
 Give causal_chain: trigger -> branch -> failure -> symptom, supported by evidence; unresolved
 alternatives remain missing. Matching symptoms alone is not a confirmed cause.
-Return short analysis initially/on scope changes: sourced observations and bounded questions
-with stop conditions. Distinguish image/user, code/data, inference; latest user input wins.
-Analysis is not proof/permission. Grep discovers; Read key sections before citing.
+Initially/on scope changes give short public notes and analysis: sourced observations,
+bounded questions and stop conditions. Distinguish image/user, code/data, inference;
+latest user input wins. Analysis is not proof/permission. Grep discovers; Read before citing.
 data_repair is review-only, never queries/Bash or DB write permission. Bind business DB;
 parameterize keys/old values, check rows, plan rollback. SQL Server: XACT_ABORT; Oracle: no DDL.
 """

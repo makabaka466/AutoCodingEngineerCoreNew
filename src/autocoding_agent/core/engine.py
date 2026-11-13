@@ -1541,7 +1541,11 @@ class AgentEngine:
                     "queries": [
                         {
                             "name": query.name,
+                            "purpose": query.purpose,
                             "datasource_id": query.datasource_id,
+                            "source": result.source.model_dump() if result.source else None,
+                            "returned_rows": result.returned_rows,
+                            "truncated": result.truncated,
                             "sql_fingerprint": sql_fingerprint(query.sql),
                             "parameter_names": sorted(query.parameters),
                             "catalog_info": result.catalog_info,

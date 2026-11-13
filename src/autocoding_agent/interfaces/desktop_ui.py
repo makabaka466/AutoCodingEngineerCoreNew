@@ -59,6 +59,7 @@ from autocoding_agent.incident_attachments import (
     IncidentAttachmentError,
     IncidentAttachmentStore,
 )
+from autocoding_agent.interfaces.analysis_trace import AnalysisTrace
 from autocoding_agent.interfaces.chat_transcript import ChatTranscript, insert_markdown
 from autocoding_agent.interfaces.desktop_theme import COLORS, IconButton, Tooltip
 from autocoding_agent.interfaces.knowledge_management_ui import KnowledgeManagementDialog
@@ -575,7 +576,7 @@ class DesktopClient:
 
     def __init__(
         self,
-        root: tk.Tk | tk.Toplevel,
+        root: tk.Tk | tk.Toplevel | tk.Frame,
         application: AgentApplication | None = None,
         incident_application: IncidentApplication | None = None,
         setup_service: ClaudeModelSetupService | None = None,
@@ -590,6 +591,10 @@ class DesktopClient:
         self.root = root
         self._primary_window = window_group is None
         self._window_group = window_group if window_group is not None else []
+        self._visible_client: DesktopClient = self
+        self._close_conversation_pending = False
+        self._deferred_error: str | None = None
+        self._deferred_git_preview = None
         self._closed = False
         self._stop_when_ready = False
         self.setup_service = setup_service or ClaudeModelSetupService()
@@ -649,6 +654,15 @@ class DesktopClient:
         self._stop_pending = False
         self._task_operation = False
         self._active_task_id: str | None = None
+        self._analysis_trace = AnalysisTrace()
+        self._analysis_identity: tuple[FlowKind, str] | None = None
+        self._analysis_generation = 0
+        self._analysis_poll_pending = False
+        self._analysis_next_poll = 0.0
+        self._analysis_dirty = False
+        self._transcript_entries: list[tuple[str, str]] = []
+        self._transcript_times: list[datetime | None] = []
+        self._transcript_timestamps: list[str] = []
         self._close_after_stop = False
         self._busy = False
         self._busy_label = ""
@@ -698,11 +712,13 @@ class DesktopClient:
         self._render_welcome()
         self._animate_progress_pulse()
         self.root.after(100, self._drain_results)
-        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        if self._primary_window:
+            self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._window_group.append(self)
 
     def _configure_window(self) -> None:
-        self.root.title("ACE · AutoCoding Engineer")
+        if self._primary_window:
+            self.root.title("ACE · AutoCoding Engineer")
         logo_path = Path(__file__).resolve().parents[1] / "assets" / "ace-logo.png"
         self._brand_logo = None
         try:
@@ -723,11 +739,14 @@ class DesktopClient:
                     icons.append(icon)
                 images = (icons, source.subsample(max(1, (source.width() + 69) // 70)))
                 owner._ace_images = images
-            self.root.iconphoto(True, *images[0])
+            if self._primary_window:
+                self.root.iconphoto(True, *images[0])
             self._brand_logo = images[1]
         except (tk.TclError, OSError):
             logger.warning("ACE logo unavailable; using text brand")
         self.root.configure(bg=COLORS["window"])
+        if not self._primary_window:
+            return
         screen_width = self.root.winfo_screenwidth()
         screen_height = self.root.winfo_screenheight()
         width = min(max(1080, round(screen_width * 0.7)), screen_width - 24)
@@ -779,11 +798,12 @@ class DesktopClient:
         tk.Label(brand, text="ACE", bg=COLORS["sidebar"], fg=COLORS["text"],
                  font=("Segoe UI", 15, "bold")).pack(side="left", padx=12)
         self.new_window_button = self._button(
-            brand, "新窗口", self._open_task_window, background=COLORS["sidebar"],
+            brand, "会话 ▾", self._show_session_menu, background=COLORS["sidebar"],
             active_background=COLORS["panel_hover"],
         )
         self.new_window_button.pack(side="right")
-        Tooltip(self.new_window_button, "打开独立会话窗口，可并行处理其他任务")
+        Tooltip(self.new_window_button, "在当前工作台切换会话，后台任务继续运行")
+        self.session_menu = tk.Menu(self.root, tearoff=False)
         self.project_row = tk.Frame(sidebar, bg=COLORS["sidebar"])
         self.project_row.grid(row=1, column=0, sticky="ew", padx=20, pady=(0, 12))
         self.project_row.grid_columnconfigure(0, weight=1)
@@ -1842,10 +1862,7 @@ class DesktopClient:
         )
 
     def _select_flow(self, flow: FlowKind) -> None:
-        if self._busy or flow == self.flow:
-            return
-        if not self._primary_window and self.session_id:
-            self._open_task_window(flow=flow)
+        if flow == self.flow:
             return
         if flow == FlowKind.INCIDENT and self.incident_application is None:
             messagebox.showerror(
@@ -1853,6 +1870,9 @@ class DesktopClient:
                 "当前客户端实例没有配置异常处理应用。",
                 parent=self.root,
             )
+            return
+        if self._conversation_in_use():
+            self._open_task_window(flow=flow)
             return
         self._clear_pending_attachments()
         self._show_incident_details = False
@@ -1927,13 +1947,15 @@ class DesktopClient:
             self._refresh_overview()
 
     def _on_project_selected(self, _event: tk.Event[tk.Misc]) -> None:
-        if self._busy:
-            return
-        if not self._primary_window and self.session_id:
-            self._restore_session_project(self._active_application().get_session(self.session_id))
-            return
         project = next((p for p in self.projects if p.name == self.project_var.get()), None)
         if project is None or project.id == self._flow_projects[self.flow]:
+            return
+        if self._conversation_in_use():
+            # 项目选择是导航，不改写原会话的项目或正在执行的应用实例。
+            previous = next((p for p in self.projects
+                             if p.id == self._flow_projects[self.flow]), None)
+            self.project_var.set(previous.name if previous else "")
+            self._open_task_window(project_id=project.id)
             return
         self._flow_projects[self.flow] = project.id
         self.session_id = None
@@ -1975,7 +1997,9 @@ class DesktopClient:
 
     def _render_active_session(self, session: AgentSession | IncidentSession) -> None:
         title = session.goal if isinstance(session, AgentSession) else session.problem
-        self.root.title(f"ACE · {title[:42]}")
+        primary = self._window_group[0]
+        if primary._visible_client is self:
+            primary.root.title(f"ACE · {title[:42]}")
         if self.flow == FlowKind.DEVELOPMENT:
             if not isinstance(session, AgentSession):
                 raise TypeError("Development flow returned an invalid session.")
@@ -1986,6 +2010,7 @@ class DesktopClient:
         self._render_incident_session(session)
 
     def _render_welcome(self) -> None:
+        self._restore_analysis(None)
         self._show_incident_details = False
         self.incident_actions.grid_remove()
         self.remediation_button.grid_remove()
@@ -2066,9 +2091,9 @@ class DesktopClient:
             if details:
                 entries.append(("metadata", "\n".join(details)))
 
+        self._restore_analysis(session)
         self._replace_transcript(
-            entries, timestamps=[item.created_at.astimezone().strftime("%H:%M")
-                                 for item in session.messages],
+            entries, message_times=[item.created_at for item in session.messages],
         )
         self._restore_session_project(session)
         title = " ".join(session.goal.split()) or "未命名任务"
@@ -2105,6 +2130,7 @@ class DesktopClient:
         self.transcript.tag_configure("assistant_message", spacing1=2, spacing3=3)
         self._current_task_state = session.task_state
         entries: list[tuple[str, str]] = []
+        message_times: list[datetime] = []
         self.incident_details_button.grid()
         self.incident_details_button.configure(
             text="收起诊断详情" if self._show_incident_details else "查看诊断详情"
@@ -2126,6 +2152,7 @@ class DesktopClient:
                     and session.status == IncidentStatus.COMPLETED):
                 content = format_incident_summary(session.last_decision)
             entries.append((role, content))
+            message_times.append(item.created_at)
 
         decision = session.last_decision
         if final_assistant is None and decision and session.status == IncidentStatus.COMPLETED:
@@ -2176,10 +2203,8 @@ class DesktopClient:
             if details:
                 entries.append(("metadata", "\n".join(details)))
 
-        self._replace_transcript(
-            entries, timestamps=[item.created_at.astimezone().strftime("%H:%M")
-                                 for item in session.messages],
-        )
+        self._restore_analysis(session)
+        self._replace_transcript(entries, message_times=message_times)
         self._restore_session_project(session)
         title = " ".join(session.problem.split()) or "未命名异常"
         self.task_title_var.set(title[:64] + ("…" if len(title) > 64 else ""))
@@ -2272,12 +2297,56 @@ class DesktopClient:
         names = "、".join(str(item.name) for item in attachments)
         return f"{content}\n[异常截图：{names}]"
 
+    def _restore_analysis(self, session: AgentSession | IncidentSession | None) -> None:
+        """从同一任务的持久事件恢复视图，并使旧窗口请求失效。"""
+        self._analysis_generation += 1
+        self._analysis_identity = (self.flow, session.id) if session else None
+        self._analysis_trace = AnalysisTrace()
+        self._analysis_dirty = False
+        if session:
+            self._analysis_trace.append(session.events)
+            self._analysis_trace.add_query_details(session.query_observations)
+
     def _replace_transcript(
         self, entries: list[tuple[str, str]], *, timestamps: list[str] | None = None,
+        message_times: list[datetime | None] | None = None,
     ) -> None:
+        self._transcript_entries = list(entries)
+        self._transcript_times = list(message_times or [])
+        self._transcript_timestamps = timestamps or [
+            item.astimezone().strftime("%H:%M") if item else ""
+            for item in self._transcript_times
+        ]
+        self._render_transcript()
+
+    def _render_transcript(self) -> None:
+        """把分析过程放在对应用户轮次下方，刷新只影响展示，不重新加载任务。"""
         if not hasattr(self, "_chat_renderer"):
             self._chat_renderer = ChatTranscript(self.transcript)
-        self._chat_renderer.timestamps = timestamps or []
+        sections = self._analysis_trace.sections
+        prefix = f"{self._analysis_identity}:"
+        self._chat_renderer.analysis_sections = {
+            prefix + key: section for key, section in sections.items() if section.steps
+        }
+        insertions: dict[int, list[str]] = {}
+        for key, section in self._chat_renderer.analysis_sections.items():
+            index = -1
+            for i, (role, _) in enumerate(self._transcript_entries):
+                if (role == "user" and i < len(self._transcript_times)
+                        and self._transcript_times[i] is not None
+                        and self._transcript_times[i] <= section.time):
+                    index = i
+            insertions.setdefault(index, []).append(key)
+        entries = [("analysis", key) for key in insertions.get(-1, [])]
+        timestamps = [""] * len(entries)
+        for i, entry in enumerate(self._transcript_entries):
+            entries.append(entry)
+            timestamps.append(self._transcript_timestamps[i]
+                              if i < len(self._transcript_timestamps) else "")
+            for key in insertions.get(i, []):
+                entries.append(("analysis", key))
+                timestamps.append("")
+        self._chat_renderer.timestamps = timestamps
         key = (self.flow, self.session_id)
         previous = self._displayed_conversation
         if previous is not None and previous != key:
@@ -2307,42 +2376,47 @@ class DesktopClient:
         self._filter_history()
 
     def _select_session(self, _event: tk.Event[tk.Misc]) -> None:
-        if self._busy:
-            return
         selection = self.sessions_list.curselection()
         if not selection:
             return
         session_id = self._session_ids[selection[0]]
+        for client in self._window_group:
+            if client.flow == self.flow and session_id in {
+                client.session_id, client._active_task_id if client._busy else None,
+            }:
+                client._show_conversation()
+                return
         try:
             session = self._active_application().get_session(session_id)
         except Exception as exc:
             messagebox.showerror("无法打开任务", str(exc), parent=self.root)
             return
-        if not self._primary_window and self.session_id and self.session_id != session_id:
+        if self._conversation_in_use():
             self._open_task_window(session=session)
             return
-        for client in self._window_group:
-            if client is not self and client.flow == self.flow and (
-                client.session_id == session_id
-                or (client._busy and client._active_task_id == session_id)
-            ):
-                client.root.deiconify()
-                client.root.lift()
-                client.root.focus_force()
-                return
         self.session_id = session_id
         self._show_incident_details = False
         self._flow_session_ids[self.flow] = session_id
         self._render_active_session(session)
 
     def _new_task(self) -> None:
-        if not self._primary_window and self.session_id:
+        if self._conversation_in_use():
             self._open_task_window()
             return
-        if self._busy:
-            return
+        self._reset_conversation()
+
+    def _conversation_in_use(self) -> bool:
+        """已绑定任务或有草稿的页面不能被导航操作清空。"""
+        return bool(self._busy or self.session_id or self._pending_attachments
+                    or self.prompt_input.get("1.0", "end-1c").strip())
+
+    def _reset_conversation(self) -> None:
+        """只在当前页没有执行操作时复位；关闭会话不会删除持久历史。"""
         self.session_id = None
+        self._active_task_id = None
         self._flow_session_ids[self.flow] = None
+        self.prompt_input.configure(state="normal")
+        self.prompt_input.delete("1.0", "end")
         if self.flow == FlowKind.DEVELOPMENT and not self._applications_injected:
             self.application = self._build_current_development_application()
         elif self.flow == FlowKind.INCIDENT and not self._incident_application_injected:
@@ -2356,13 +2430,84 @@ class DesktopClient:
         self._render_welcome()
         self._reset_progress_display()
         self._sync_controls()
+        if self._window_group[0]._visible_client is self:
+            self.prompt_input.focus_set()
+
+    def _show_session_menu(self) -> None:
+        """按打开时的真实状态构建菜单，隐藏会话不需要不断刷新全部页面。"""
+        menu = self.session_menu
+        menu.delete(0, "end")
+        closing = self._window_group[0]._close_after_stop
+        menu.add_command(label="新建会话", command=self._open_task_window,
+                         state="disabled" if closing else "normal")
+        menu.add_separator()
+        for client in self._window_group:
+            flow = "开发" if client.flow == FlowKind.DEVELOPMENT else "异常"
+            title = " ".join(client.task_title_var.get().split())[:28]
+            state = "正在关闭" if client._close_conversation_pending else (
+                client.activity_var.get() if client._busy else client.status_badge.cget("text")
+            )
+            label = (f"{'✓ ' if client is self else ''}{client.project_var.get() or '未选项目'}"
+                     f" · {flow} · {title} · {state}")
+            menu.add_command(label=label, command=client._show_conversation)
+        menu.add_separator()
+        menu.add_command(label="关闭当前会话", command=self._close_conversation,
+                         state="disabled" if closing or self._close_conversation_pending
+                         else "normal")
+        try:
+            menu.tk_popup(self.new_window_button.winfo_rootx(),
+                          self.new_window_button.winfo_rooty()
+                          + self.new_window_button.winfo_height())
+        finally:
+            menu.grab_release()
+
+    def _show_conversation(self) -> None:
+        """仅切换可见页面；草稿、审批、滚动位置及后台队列留在各自会话。"""
+        if self._closed:
+            return
+        primary = self._window_group[0]
+        for client in self._window_group[1:]:
+            if client is not self:
+                client.root.place_forget()
+        if not self._primary_window:
+            self.root.place(x=0, y=0, relwidth=1, relheight=1)
+            self.root.lift()
+        primary._visible_client = self
+        primary.root.title("ACE · " + self.task_title_var.get()[:42])
+        if self._analysis_dirty and not self.transcript.tag_ranges("sel"):
+            self._analysis_dirty = False
+            self._render_transcript()
+        self._update_responsive_layout()
         self.prompt_input.focus_set()
+        if self._deferred_error:
+            error, self._deferred_error = self._deferred_error, None
+            messagebox.showerror("操作失败", error, parent=self.root.winfo_toplevel())
+        if self._deferred_git_preview is not None:
+            preview, self._deferred_git_preview = self._deferred_git_preview, None
+            self._publish_git(preview)
+
+    def _close_conversation(self) -> None:
+        """关闭当前页先保存正在执行的任务；主页面保留为工作台宿主。"""
+        if not self._primary_window:
+            self._on_close()
+            return
+        self._close_conversation_pending = True
+        if self._busy:
+            if self._task_operation:
+                self._request_stop()
+            self.status_var.set("正在结束当前操作并保存，其他会话继续运行。")
+        else:
+            self._close_conversation_pending = False
+            self._reset_conversation()
+        if len(self._window_group) > 1:
+            self._window_group[1]._show_conversation()
 
     def _open_task_window(
         self, *, session: AgentSession | IncidentSession | None = None,
         flow: FlowKind | None = None,
+        project_id: str | None = None,
     ) -> DesktopClient | None:
-        """每个子窗独立持有任务、Runtime和结果队列，只共享配置服务与持久化目录。"""
+        """兼容旧调用名，页面内复用独立会话控制器，不再创建系统窗口。"""
         if self._window_group[0]._close_after_stop:
             return None
         selected_flow = flow or self.flow
@@ -2372,11 +2517,9 @@ class DesktopClient:
                     client.session_id == session.id
                     or (client._busy and client._active_task_id == session.id)
                 ):
-                    client.root.deiconify()
-                    client.root.lift()
-                    client.root.focus_force()
+                    client._show_conversation()
                     return client
-        window = tk.Toplevel(self._window_group[0].root)
+        window = tk.Frame(self._window_group[0].root, bg=COLORS["window"])
         try:
             child = DesktopClient(
                 window,
@@ -2393,6 +2536,8 @@ class DesktopClient:
             raise
         child.flow = selected_flow
         child._flow_projects = dict(self._flow_projects)
+        if project_id is not None:
+            child._flow_projects[selected_flow] = project_id
         child._refresh_flow_presentation()
         if session is not None:
             child.session_id = session.id
@@ -2402,7 +2547,7 @@ class DesktopClient:
             child._render_welcome()
         child._load_recent_sessions(select_current=session is not None)
         child._sync_controls()
-        child.prompt_input.focus_set()
+        child._show_conversation()
         return child
 
     def _open_system_settings(self, section: str = "model") -> None:
@@ -2420,7 +2565,7 @@ class DesktopClient:
             self._settings_dialog.window.focus_force()
             return
         self._settings_dialog = SystemSettingsDialog(
-            self.root,
+            self.root.winfo_toplevel(),
             self.setup_service,
             self.sqlserver_service,
             initial_section=section,
@@ -2577,7 +2722,7 @@ class DesktopClient:
         if self.rag_service is None:
             self.rag_service = build_configured_rag_service(embedding_setup=self.embedding_service)
         self._knowledge_dialog = KnowledgeManagementDialog(
-            self.root,
+            self.root.winfo_toplevel(),
             self.rag_service,
             on_changed=self._refresh_overview,
         )
@@ -2766,9 +2911,12 @@ class DesktopClient:
         attachments: list[MessageAttachment] | None = None,
     ) -> None:
         attachment_note = f"\n[已附加 {len(attachments)} 张异常截图]" if attachments else ""
-        entries = list(self._chat_renderer.entries) if hasattr(self, "_chat_renderer") else []
+        entries = list(self._transcript_entries)
+        times = list(self._transcript_times)
+        times.extend([None] * (len(entries) - len(times)))
         entries.append(("user", message + attachment_note))
-        self._replace_transcript(entries)
+        times.append(datetime.now().astimezone())
+        self._replace_transcript(entries, message_times=times)
         self.transcript.see("end")
 
     def _focus_transcript(self, _event: tk.Event[tk.Text]) -> None:
@@ -2849,13 +2997,9 @@ class DesktopClient:
         incident = self.incident_application.get_session(self.session_id)
         if not incident.can_remediate:
             return
-        target = self
-        if not self._primary_window:
-            target = self._open_task_window(flow=FlowKind.DEVELOPMENT)
-            if target is None:
-                return
-        else:
-            self._select_flow(FlowKind.DEVELOPMENT)
+        target = self._open_task_window(flow=FlowKind.DEVELOPMENT)
+        if target is None:
+            return
         target.session_id = None
         target._flow_session_ids[FlowKind.DEVELOPMENT] = None
         target._restore_session_project(incident)
@@ -3002,6 +3146,8 @@ class DesktopClient:
             return
         self._task_operation = True
         self._active_task_id = self.session_id
+        self._analysis_generation += 1
+        self._analysis_next_poll = 0.0
         self._stop_pending = False
         self._stop_when_ready = False
         self._set_busy(True, label)
@@ -3032,17 +3178,37 @@ class DesktopClient:
                     if isinstance(payload, ProgressEvent):
                         self._present_progress(payload)
                     continue
+                if kind == "analysis_events":
+                    generation, identity, events = payload
+                    self._analysis_poll_pending = False
+                    if (generation == self._analysis_generation
+                            and identity == self._analysis_identity
+                            and self._busy and self._task_operation):
+                        if events is None:
+                            self._analysis_next_poll = time.monotonic() + 5
+                        else:
+                            self._analysis_dirty |= self._analysis_trace.append(events)
+                            if len(events) == 200:
+                                self._analysis_next_poll = 0.0
+                    continue
                 if kind == "git_preview":
                     self._set_busy(False)
                     if not self._close_after_stop:
-                        self._publish_git(payload)
+                        if self._window_group[0]._visible_client is self:
+                            self._publish_git(payload)
+                        else:
+                            self._deferred_git_preview = payload
+                            self.status_var.set("Git预览已就绪，切回会话后审阅。")
                     continue
                 if kind in {"git_result", "git_error"}:
                     self._set_busy(False)
                     message = str(payload) if kind == "git_result" else f"Git 操作失败：{payload}"
                     self.status_var.set(message)
                     if kind == "git_error":
-                        messagebox.showerror("Git 操作失败", str(payload), parent=self.root)
+                        if self._window_group[0]._visible_client is self:
+                            messagebox.showerror("Git 操作失败", str(payload), parent=self.root)
+                        else:
+                            self._deferred_error = message
                     continue
                 self._set_busy(False)
                 if kind == "success":
@@ -3058,7 +3224,10 @@ class DesktopClient:
                     self._load_recent_sessions(select_current=True)
                 else:
                     self.status_var.set(f"操作失败：{payload}")
-                    messagebox.showerror("操作失败", str(payload), parent=self.root)
+                    if self._window_group[0]._visible_client is self:
+                        messagebox.showerror("操作失败", str(payload), parent=self.root)
+                    else:
+                        self._deferred_error = str(payload)
                     if not self.session_id and self._active_task_id:
                         self.session_id = self._active_task_id
                         self._flow_session_ids[self.flow] = self.session_id
@@ -3071,6 +3240,10 @@ class DesktopClient:
         except queue.Empty:
             pass
         finally:
+            if self._close_conversation_pending and not self._busy:
+                self._close_conversation_pending = False
+                self._reset_conversation()
+            self._poll_analysis()
             if self._close_after_stop and not self._busy:
                 if not self._primary_window or len(self._window_group) == 1:
                     self._destroy_window()
@@ -3078,6 +3251,37 @@ class DesktopClient:
                     self.root.after(100, self._drain_results)
             else:
                 self.root.after(100, self._drain_results)
+
+    def _poll_analysis(self) -> None:
+        """每秒后台读取一页新事件；延迟回复按窗口、任务及轮次隔离。"""
+        if (self._analysis_dirty and self._window_group[0]._visible_client is self
+                and not self.transcript.tag_ranges("sel")):
+            self._analysis_dirty = False
+            self._render_transcript()
+        if (self._closed or not self._busy or not self._task_operation
+                or not self._active_task_id or self._analysis_poll_pending
+                or time.monotonic() < self._analysis_next_poll):
+            return
+        application = self._active_application()
+        if not callable(getattr(application, "events", None)):
+            return
+        identity = (self.flow, self._active_task_id)
+        if identity != self._analysis_identity:
+            self._restore_analysis(None)
+            self._analysis_identity = identity
+        generation, cursor = self._analysis_generation, self._analysis_trace.cursor
+        self._analysis_poll_pending = True
+        self._analysis_next_poll = time.monotonic() + 1
+
+        def read_events() -> None:
+            try:
+                events = application.events(identity[1], after_sequence=cursor, limit=200)
+            except Exception:
+                logger.warning("analysis_events_read_failed task_id=%s", identity[1])
+                events = None
+            self._result_queue.put(("analysis_events", (generation, identity, events)))
+
+        threading.Thread(target=read_events, name="analysis-events", daemon=True).start()
 
     def _set_busy(self, busy: bool, label: str = "") -> None:
         self._busy = busy
@@ -3285,8 +3489,8 @@ class DesktopClient:
             self.remediation_button.grid_remove()
         self.remediation_button.configure(state="disabled" if self._busy else "normal")
         self.incident_details_button.configure(state="disabled" if self._busy else "normal")
-        can_start_new = not self._busy
-        can_choose_project = not self._busy and (self._primary_window or not self.session_id)
+        can_start_new = not self._window_group or not self._window_group[0]._close_after_stop
+        can_choose_project = can_start_new
         can_send = not self._busy and self._current_task_state not in {
             TaskState.CANCELLED,
             TaskState.PAUSED,
@@ -3339,14 +3543,14 @@ class DesktopClient:
             self.stop_button.grid_remove()
             self.send_button.grid()
         self.model_shortcut.configure(state="disabled" if self._busy else "normal")
-        self.history_search.configure(state="disabled" if self._busy else "normal")
+        self.history_search.configure(state="normal")
         self._update_responsive_layout()
-        self.sessions_list.configure(state="normal" if not self._busy else "disabled")
+        self.sessions_list.configure(state="normal")
         self.model_config_button.configure(state="normal" if not self._busy else "disabled")
         self.knowledge_database_button.configure(state="normal" if not self._busy else "disabled")
-        self.development_flow_button.set_enabled(not self._busy)
+        self.development_flow_button.set_enabled(can_start_new)
         self.incident_flow_button.set_enabled(
-            not self._busy and self.incident_application is not None
+            can_start_new and self.incident_application is not None
         )
 
     def _set_approval_content(self, session_id: str, content: str) -> None:
@@ -3502,9 +3706,13 @@ class DesktopClient:
             callback = self.root.tk.call("after", "info", timer)[0]
             if callback in commands:
                 self.root.after_cancel(timer)
+        primary = self._window_group[0]
         if self in self._window_group:
             self._window_group.remove(self)
         self.root.destroy()
+        if (not self._primary_window and not primary._close_after_stop
+                and primary._visible_client is self):
+            primary._show_conversation()
 
 
 def _enable_windows_dpi_awareness() -> None:

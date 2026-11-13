@@ -14,6 +14,7 @@ from autocoding_agent.config import Settings
 from autocoding_agent.core.approval_execution import snapshot_approval
 from autocoding_agent.core.models import (
     AgentDecision,
+    AgentEvent,
     AgentOutcome,
     AgentSession,
     AgentStatus,
@@ -21,6 +22,7 @@ from autocoding_agent.core.models import (
     ApprovalScope,
     ChangeProposal,
     ChatMessage,
+    EventType,
     MessageAttachment,
     MessageRole,
     ProposedChange,
@@ -446,6 +448,154 @@ def _capture_operation(
     return operations
 
 
+def test_analysis_history_is_under_each_turn_and_restores_without_duplicates(root, tmp_path):
+    session = _session()
+    start = session.messages[0].created_at
+    session.messages[1].created_at = start + timedelta(seconds=3)
+    session.messages.append(ChatMessage(role=MessageRole.USER, content="补充限额规则",
+                                       created_at=start + timedelta(seconds=4)))
+    session.events = [
+        AgentEvent(type=EventType.TURN_STARTED, message="开始调查",
+                   created_at=start + timedelta(seconds=1)),
+        AgentEvent(type=EventType.RUNTIME_ACTIVITY, message="先确认入口与计数规则",
+                   data={"kind": "assistant_message"}, created_at=start + timedelta(seconds=2)),
+        AgentEvent(type=EventType.TURN_STARTED, message="继续任务",
+                   created_at=start + timedelta(seconds=5)),
+        AgentEvent(type=EventType.STATE_TRANSITIONED, message="停止",
+                   data={"to": "paused", "reason": "用户停止，状态已保存"},
+                   created_at=start + timedelta(seconds=6)),
+    ]
+    client = DesktopClient(root, FakeApplication([session]),
+                           workspace_service=FakeWorkspaceService(tmp_path))
+    client.session_id = session.id
+    client._render_session(session)
+    assert [role for role, _ in client._chat_renderer.entries] == [
+        "user", "analysis", "assistant", "user", "analysis",
+    ]
+    assert client.transcript.get("1.0", "end").count("展开分析过程") == 2
+    original = list(client._chat_renderer.entries)
+    first_key = original[1][1]
+    client._chat_renderer.toggle("analysis:" + first_key)
+    assert "收起分析过程" in client.transcript.get("1.0", "end")
+    client._render_session(session)
+    assert client._chat_renderer.entries == original
+    assert "analysis:" + first_key in client._chat_renderer.expanded
+    client._render_welcome()
+    assert not client._chat_renderer.analysis_sections
+    client._render_session(session)
+    assert client._chat_renderer.entries == original
+
+
+def test_analysis_groups_reads_and_lazily_shows_older_details(root):
+    from autocoding_agent.interfaces.analysis_trace import AnalysisTrace
+
+    trace = AnalysisTrace()
+    trace.append([AgentEvent(type=EventType.TOOL_FINISHED, message="返回",
+                            data={"tool_name": "Read", "tool_use_id": str(i),
+                                  "path": f"src/file_{i}.py", "is_error": i == 65})
+                  for i in range(70)])
+    widget = tk.Text(root)
+    renderer = ChatTranscript(widget)
+    renderer.analysis_sections = trace.sections
+    renderer.render([("analysis", "legacy")])
+    assert "src/file_69.py" in widget.get("1.0", "end")
+    assert "src/file_1.py" not in widget.get("1.0", "end")
+    renderer.toggle("analysis:legacy")
+    assert "读取文件 · 50 次" in widget.get("1.0", "end")
+    assert widget.tag_ranges("chat_warning")
+    renderer.toggle("analysis-step:" + trace.sections["legacy"].steps[0].key)
+    assert "src/file_20.py" in widget.get("1.0", "end")
+    assert "src/file_1.py" not in widget.get("1.0", "end")
+    trace.append([AgentEvent(type=EventType.TOOL_FINISHED, message="返回",
+                            data={"tool_name": "Read", "tool_use_id": "70",
+                                  "path": "src/file_70.py", "is_error": False})])
+    renderer.render(renderer.entries, preserve_scroll=True)
+    assert "src/file_21.py" in widget.get("1.0", "end")
+    assert "analysis-step:" + trace.sections["legacy"].steps[0].key in renderer.expanded
+    renderer._more_analysis("legacy")
+    assert "src/file_1.py" in widget.get("1.0", "end")
+    renderer.collapse_all()
+    assert "src/file_1.py" not in widget.get("1.0", "end")
+
+
+def test_analysis_poll_is_background_bounded_and_does_not_end_task(root, tmp_path):
+    import threading
+    import time
+
+    session = _session()
+    app = FakeApplication([session])
+    entered, release = threading.Event(), threading.Event()
+    calls = []
+    def read_events(task_id, *, after_sequence, limit):
+        calls.append((task_id, after_sequence, limit, threading.get_ident()))
+        entered.set()
+        assert release.wait(timeout=2)
+        return [AgentEvent(type=EventType.RUNTIME_ACTIVITY, sequence=1,
+                           message="检查绑定事件后再看数据库", data={"kind": "assistant_message"})]
+    app.events = read_events
+    client = DesktopClient(root, app, workspace_service=FakeWorkspaceService(tmp_path))
+    client.session_id = session.id
+    client._render_session(session)
+    client._task_operation, client._active_task_id = True, session.id
+    client._set_busy(True, "调查中")
+    try:
+        client._poll_analysis()
+        assert entered.wait(timeout=1)
+        client._poll_analysis()
+        assert len(calls) == 1 and calls[0][:3] == (session.id, 0, 200)
+        assert calls[0][3] != threading.get_ident()
+        root.update_idletasks()  # 数据库尚未返回时，主线程仍可布局。
+        release.set()
+        deadline = time.monotonic() + 2
+        while client._analysis_trace.cursor != 1 and time.monotonic() < deadline:
+            client._drain_results()
+            time.sleep(.01)
+        assert client._analysis_trace.cursor == 1
+        assert client._busy and client._task_operation
+        assert "检查绑定事件后再看数据库" in client.transcript.get("1.0", "end")
+        client._poll_analysis()
+        assert len(calls) == 1  # 无新事件时也不高频全量拉取。
+    finally:
+        release.set()
+        client._set_busy(False)
+
+
+def test_analysis_drops_stale_and_foreign_window_results_and_preserves_selection(root, tmp_path):
+    sessions = [_session(), _session()]
+    app = FakeApplication(sessions)
+    client = DesktopClient(root, app, workspace_service=FakeWorkspaceService(tmp_path))
+    client.session_id = sessions[0].id
+    client._render_session(sessions[0])
+    child = client._open_task_window(session=sessions[1])
+    client._task_operation, client._active_task_id = True, sessions[0].id
+    client._set_busy(True, "调查中")
+    item = AgentEvent(type=EventType.RUNTIME_ACTIVITY, sequence=1,
+                      message="当前任务的公开说明", data={"kind": "assistant_message"})
+    generation, identity = client._analysis_generation, client._analysis_identity
+    for wrong_generation, wrong_identity in ((generation - 1, identity),
+                                             (generation, child._analysis_identity)):
+        client._result_queue.put(("analysis_events", (wrong_generation, wrong_identity, [item])))
+    client._drain_results()
+    assert client._analysis_trace.cursor == 0
+    client.transcript.tag_add("sel", "1.0", "1.2")
+    client._result_queue.put(("analysis_events", (generation, identity, [item])))
+    client._drain_results()
+    assert client.transcript.tag_ranges("sel") and client._analysis_dirty
+    assert "当前任务的公开说明" not in child.transcript.get("1.0", "end")
+    client.transcript.tag_remove("sel", "1.0", "end")
+    client._poll_analysis()
+    assert client._analysis_dirty  # 隐藏页面只投影，切回时才刷新。
+    client._show_conversation()
+    assert "当前任务的公开说明" in client.transcript.get("1.0", "end")
+    client._set_busy(False)
+    client._result_queue.put(("analysis_events", (generation, identity, [
+        item.model_copy(update={"id": "late", "sequence": 2}),
+    ])))
+    client._drain_results()
+    assert client._analysis_trace.cursor == 1
+    child._on_close()
+
+
 def test_session_list_label_is_compact_and_includes_status() -> None:
     session = _session(AgentStatus.COMPLETED)
 
@@ -733,9 +883,11 @@ def test_completed_task_keeps_composer_available_for_follow_up(root: tk.Toplevel
     assert application.calls == [("send", session.id, "继续说明重试边界")]
 
     client._new_task()
-    assert client.prompt_input.cget("state") == "normal"
-    assert client.send_button.cget("text") == "发送任务"
-    assert "任务目标" in client.prompt_placeholder.cget("text")
+    fresh = client._window_group[-1]
+    assert fresh is not client and client.session_id == session.id
+    assert fresh.prompt_input.cget("state") == "normal"
+    assert fresh.send_button.cget("text") == "发送任务"
+    assert "任务目标" in fresh.prompt_placeholder.cget("text")
 
 
 def test_completed_incident_keeps_composer_available_for_follow_up(
@@ -775,8 +927,8 @@ def test_busy_state_blocks_conflicting_controls(root: tk.Toplevel) -> None:
     client._set_busy(True, "处理中")
 
     assert client.send_button.cget("state") == "disabled"
-    assert client.new_task_button.cget("state") == "disabled"
-    assert client.sessions_list.cget("state") == "disabled"
+    assert client.new_task_button.cget("state") == "normal"
+    assert client.sessions_list.cget("state") == "normal"
     assert client.model_config_button.cget("state") == "disabled"
     assert client.knowledge_database_button.cget("state") == "disabled"
 
@@ -1308,20 +1460,24 @@ def test_project_switch_isolates_history_and_routes_new_tasks(
     client._render_session(sa)
     client.project_var.set(b.name)
     client._on_project_selected(None)
-    assert client.session_id is None
-    assert client._session_ids == [sb.id]
-    assert client.workspace_var.get() == str(second)
-    operations = _capture_operation(client)
-    client.prompt_input.insert("1.0", "处理 B")
-    client._send_message()
+    second_page = client._window_group[-1]
+    assert second_page is not client and client.session_id == sa.id
+    assert second_page.session_id is None
+    assert second_page._session_ids == [sb.id]
+    assert second_page.workspace_var.get() == str(second)
+    operations = _capture_operation(second_page)
+    second_page.prompt_input.insert("1.0", "处理 B")
+    second_page._send_message()
     operations[0]()
     assert app.calls[-1] == ("start", str(second), "处理 B", b.id)
     client._select_flow(FlowKind.INCIDENT)
-    assert client._session_ids == [incident.id]
-    assert client.project_path_var.get().endswith(f"incident/{a.id}/{a.id}.md")
-    client.project_var.set(b.name)
-    client._on_project_selected(None)
-    assert client._session_ids == []
+    incident_page = client._window_group[-1]
+    assert client.session_id == sa.id and client.flow == FlowKind.DEVELOPMENT
+    assert incident_page._session_ids == [incident.id]
+    assert incident_page.project_path_var.get().endswith(f"incident/{a.id}/{a.id}.md")
+    incident_page.project_var.set(b.name)
+    incident_page._on_project_selected(None)
+    assert incident_page._session_ids == []
     assert app.get_session(sa.id).workspace == str(first)
 
 
@@ -1550,7 +1706,9 @@ def test_busy_window_waits_for_safe_close(root: tk.Toplevel) -> None:
     assert "等待当前操作" in client.status_var.get()
 
 
-def test_incident_summary_details_and_manual_repair_entry(root: tk.Toplevel, tmp_path: Path):
+def test_incident_summary_details_and_manual_repair_entry(
+    root: tk.Toplevel, tmp_path: Path, monkeypatch,
+):
     class RepairApplication(FakeApplication):
         def start_incident_remediation(self, incident, *, progress_sink=None):
             self.calls.append(("repair", incident.id))
@@ -1590,18 +1748,22 @@ def test_incident_summary_details_and_manual_repair_entry(root: tk.Toplevel, tmp
     assert "内部证据详情" in transcript and "内部查询过程" in transcript
     client._toggle_incident_details()
     assert "内部证据详情" not in client.transcript.get("1.0", "end")
-    operations = _capture_operation(client)
+    operations = []
+    monkeypatch.setattr(DesktopClient, "_run_in_background",
+                        lambda page, operation, label: operations.append((page, operation)))
     client.remediation_button.invoke()
-    assert client.flow == FlowKind.DEVELOPMENT
-    assert client._flow_session_ids[FlowKind.INCIDENT] == incident.id
+    assert client.flow == FlowKind.INCIDENT and client.session_id == incident.id
     assert len(operations) == 1 and not application.calls
-    outcome = operations[0]()
+    repair, operation = operations[0]
+    assert repair is not client and repair.flow == FlowKind.DEVELOPMENT
+    outcome = operation()
     assert application.calls[0] == ("repair", incident.id)
-    client.session_id = outcome.session_id
-    client._render_session(application.get_session(outcome.session_id))
-    assert client.remediation_button.winfo_manager() == ""
+    repair.session_id = outcome.session_id
+    repair._render_session(application.get_session(outcome.session_id))
+    assert repair.remediation_button.winfo_manager() == ""
     assert not any(call[0] == "approve" for call in application.calls)
-    client._select_flow(FlowKind.INCIDENT)
+    client._show_conversation()
+    assert client._visible_client is client
     assert client.session_id == incident.id
     assert incidents.calls == []
 
@@ -1662,7 +1824,7 @@ def test_stop_button_records_once_and_waits_for_worker(root, monkeypatch):
 
 
 
-def test_new_window_is_available_while_parent_runs_and_keeps_queues_separate(root, tmp_path):
+def test_new_page_is_available_while_parent_runs_and_keeps_queues_separate(root, tmp_path):
     first, second = _session(), _session()
     app = FakeApplication([first, second])
     client = DesktopClient(root, app, workspace_service=FakeWorkspaceService(tmp_path))
@@ -1673,10 +1835,14 @@ def test_new_window_is_available_while_parent_runs_and_keeps_queues_separate(roo
     child = client._open_task_window(session=second)
     assert child is not None and child is not client
     assert child.session_id == second.id
+    assert isinstance(child.root, tk.Frame)
+    assert child.root.winfo_toplevel() is root
     assert child._result_queue is not client._result_queue
     assert not child._busy and client._busy
-    assert str(child.project_combo.cget("state")) == "disabled"
+    assert str(child.project_combo.cget("state")) == "readonly"
     assert client.new_window_button.cget("state") == "normal"
+    assert client.new_window_button.cget("text").startswith("会话")
+    assert client._visible_client is child
     assert child._open_task_window(session=second) is child
     assert len(client._window_group) == 2
     child._on_close()
@@ -1684,7 +1850,7 @@ def test_new_window_is_available_while_parent_runs_and_keeps_queues_separate(roo
     assert len(client._window_group) == 1
 
 
-def test_bound_window_opens_new_task_without_replacing_its_session(root, tmp_path):
+def test_bound_page_opens_new_task_without_replacing_its_session(root, tmp_path):
     session = _session()
     client = DesktopClient(root, FakeApplication([session]),
                            workspace_service=FakeWorkspaceService(tmp_path))
@@ -1696,7 +1862,146 @@ def test_bound_window_opens_new_task_without_replacing_its_session(root, tmp_pat
     assert str(client._window_group[-1].project_combo.cget("state")) == "readonly"
 
 
-def test_two_windows_run_concurrently_and_child_stop_does_not_stop_parent(root, tmp_path):
+def test_close_primary_conversation_waits_without_stopping_other_page(root, tmp_path):
+    sessions = [_session(), _session()]
+    app = FakeApplication(sessions)
+    stopped = []
+    app.request_stop = stopped.append
+    client = DesktopClient(root, app, workspace_service=FakeWorkspaceService(tmp_path))
+    client.session_id = sessions[0].id
+    client._render_session(sessions[0])
+    child = client._open_task_window(session=sessions[1])
+    for page in (client, child):
+        page._task_operation, page._active_task_id = True, page.session_id
+        page._set_busy(True, "运行中")
+    client._close_conversation()
+    assert stopped == [sessions[0].id]
+    assert not client._close_after_stop and child._busy
+    client._set_busy(False)
+    client._drain_results()
+    assert client.session_id is None and client.root.winfo_exists()
+    assert child._busy and child.session_id == sessions[1].id
+    assert client._visible_client is child
+    child._set_busy(False)
+    child._close_conversation()
+
+
+def test_background_error_and_git_preview_wait_for_page_selection(root, tmp_path, monkeypatch):
+    client = DesktopClient(root, FakeApplication(),
+                           workspace_service=FakeWorkspaceService(tmp_path))
+    child = client._open_task_window()
+    errors, previews = [], []
+    monkeypatch.setattr("autocoding_agent.interfaces.desktop_ui.messagebox.showerror",
+                        lambda *args, **kwargs: errors.append(args))
+    client._publish_git = previews.append
+    client._result_queue.put(("error", RuntimeError("后台错误")))
+    client._result_queue.put(("git_preview", {"commit": "review"}))
+    client._drain_results()
+    assert not errors and not previews and client._visible_client is child
+    client._show_conversation()
+    assert len(errors) == 1 and previews == [{"commit": "review"}]
+    client._show_conversation()
+    assert len(errors) == 1 and len(previews) == 1
+    child._close_conversation()
+
+
+def test_same_page_switch_preserves_draft_attachment_and_expanded_analysis(root, tmp_path):
+    incidents = [IncidentSession(workspace=str(tmp_path), project="ace-test", problem=f"异常{i}",
+                                 status=IncidentStatus.NEEDS_INPUT) for i in range(2)]
+    incidents[0].messages = [ChatMessage(role=MessageRole.USER, content="检查订单异常")]
+    incidents[0].events = [
+        AgentEvent(type=EventType.TURN_STARTED, message="调查"),
+        AgentEvent(type=EventType.RUNTIME_ACTIVITY, message="先核对订单入口",
+                   data={"kind": "assistant_message"}),
+    ]
+    client = DesktopClient(root, FakeApplication(), FakeIncidentApplication(incidents),
+                           workspace_service=FakeWorkspaceService(tmp_path))
+    client._select_flow(FlowKind.INCIDENT)
+    client.session_id = incidents[0].id
+    client._render_incident_session(incidents[0])
+    client.prompt_input.insert("1.0", "尚未发送的现场补充")
+    image = tmp_path / "evidence.png"
+    image.write_bytes(b"test attachment")
+    attachment = MessageAttachment(path=str(image), name=image.name, media_type="image/png",
+                                   size_bytes=image.stat().st_size)
+    client._pending_attachments.append(attachment)
+    client._refresh_attachment_display()
+    trace_key = next(iter(client._chat_renderer.analysis_sections))
+    client._chat_renderer.toggle("analysis:" + trace_key)
+    child = client._open_task_window(session=incidents[1], flow=FlowKind.INCIDENT)
+    child.prompt_input.insert("1.0", "第二个会话的草稿")
+    assert client._visible_client is child and child.root.winfo_manager() == "place"
+    assert not child._pending_attachments
+    client._show_conversation()
+    assert client._visible_client is client and not child.root.winfo_manager()
+    assert client.prompt_input.get("1.0", "end").strip() == "尚未发送的现场补充"
+    assert client._pending_attachments == [attachment]
+    assert "analysis:" + trace_key in client._chat_renderer.expanded
+    assert "收起分析过程" in client.transcript.get("1.0", "end")
+    child._show_conversation()
+    assert child.prompt_input.get("1.0", "end").strip() == "第二个会话的草稿"
+    child._on_close()
+    assert client._visible_client is client and root.winfo_exists()
+
+
+def test_running_task_can_open_history_and_new_page_without_replacing_identity(root, tmp_path):
+    first, second = _session(), _session()
+    for session in (first, second):
+        session.workspace, session.project = str(tmp_path), "ace-test"
+    app = FakeApplication([first, second])
+    client = DesktopClient(root, app, workspace_service=FakeWorkspaceService(tmp_path))
+    client.session_id = first.id
+    client._render_session(first)
+    client._task_operation, client._active_task_id = True, first.id
+    client._set_busy(True, "正在调查 A")
+    assert str(client.sessions_list.cget("state")) == "normal"
+    assert str(client.history_search.cget("state")) == "normal"
+    assert client.new_task_button.cget("state") == "normal"
+    client.sessions_list.selection_set(client._session_ids.index(second.id))
+    client._select_session(None)
+    child = client._visible_client
+    assert child is not client and child.session_id == second.id
+    assert client.session_id == first.id and client._active_task_id == first.id and client._busy
+    assert client._open_task_window(session=first) is client
+    assert client._visible_client is client and len(client._window_group) == 2
+    client._new_task()
+    assert client._visible_client.session_id is None and len(client._window_group) == 3
+    assert client._busy and client.session_id == first.id
+    client._set_busy(False)
+
+
+def test_approval_display_and_version_stay_with_each_conversation(root, tmp_path):
+    sessions = [_session(AgentStatus.APPROVAL_REQUIRED) for _ in range(2)]
+    for i, session in enumerate(sessions):
+        session.version = i + 5
+        session.pending_approval = ApprovalRequest(
+            scope=ApprovalScope.VERIFY, reason=f"方案 {i}", proposed_actions=[f"验证目标 {i}"],
+        )
+        session.pending_approval_snapshot = snapshot_approval(session, session.pending_approval)
+    app = FakeApplication(sessions)
+    client = DesktopClient(root, app, workspace_service=FakeWorkspaceService(tmp_path))
+    client.session_id = sessions[0].id
+    client._render_session(sessions[0])
+    client.collapse_approval_button.invoke()
+    original_text = client.approval_text.get("1.0", "end")
+    child = client._open_task_window(session=sessions[1])
+    assert "验证目标 1" in child.approval_text.get("1.0", "end")
+    assert child._reviewed_approval_version == 6
+    child_calls, parent_calls = _capture_operation(child), _capture_operation(client)
+    child._approve()
+    client._show_conversation()
+    assert client._reviewed_approval_version == 5
+    assert client.approval_text.get("1.0", "end") == original_text
+    assert not client._review_reading
+    client._approve()
+    assert len(child_calls) == len(parent_calls) == 1
+    parent_calls[0]()
+    child_calls[0]()
+    assert app.calls == [("approve", sessions[0].id), ("approve", sessions[1].id)]
+    assert app.approval_versions == [5, 6]
+
+
+def test_two_pages_run_concurrently_and_child_stop_does_not_stop_parent(root, tmp_path):
     import threading
     import time
 
@@ -1723,6 +2028,10 @@ def test_two_windows_run_concurrently_and_child_stop_does_not_stop_parent(root, 
         client._run_in_background(lambda: operation(0), "任务一")
         child._run_in_background(lambda: operation(1), "任务二")
         assert all(event.wait(timeout=1) for event in ready)
+        client._show_conversation()
+        assert client._visible_client is client and client._busy and child._busy
+        child._show_conversation()
+        assert client._visible_client is child and client._busy and child._busy
         child._on_close()
         assert stopped == [sessions[1].id]
         assert child._close_after_stop and client._busy
@@ -1780,7 +2089,7 @@ def test_stop_before_task_id_waits_for_first_progress_and_ignores_other_task(roo
 
 
 
-def test_bound_incident_window_starts_remediation_in_separate_development_window(
+def test_bound_incident_page_starts_remediation_in_separate_development_page(
     root, tmp_path, monkeypatch,
 ):
     incident = IncidentSession(

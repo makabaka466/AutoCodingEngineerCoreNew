@@ -165,6 +165,8 @@ class SQLiteRuntimeDatabase:
         table: str,
         json_column: str,
         order_by: tuple[str, ...],
+        after_sequence: int | None = None,
+        limit: int | None = None,
     ) -> list[str]:
         """从受信任领域表中按稳定顺序读取 JSON 记录。"""
 
@@ -175,13 +177,26 @@ class SQLiteRuntimeDatabase:
         if not ordering:
             raise ValueError("At least one SQLite ordering column is required.")
         safe_id = self.safe_id(task_id)
-        with self.connect() as connection:
+        filters = "task_id = ?"
+        parameters: list[object] = [safe_id]
+        if after_sequence is not None:
+            if table != self.layout.events or after_sequence < 0:
+                raise ValueError("Event cursor must be nonnegative and refer to the event table.")
+            filters += " AND sequence > ?"
+            parameters.append(after_sequence)
+        suffix = ""
+        if limit is not None:
+            if not 1 <= limit <= 500:
+                raise ValueError("Event page size must be between 1 and 500.")
+            suffix = " LIMIT ?"
+            parameters.append(limit)
+        with closing(self.connect()) as connection:
             if not self.task_exists(connection, safe_id):
                 raise KeyError(f"Unknown {self.layout.label} session: {safe_id}")
             rows = connection.execute(
                 f"SELECT {json_column} FROM {table} "
-                f"WHERE task_id = ? ORDER BY {ordering}",
-                (safe_id,),
+                f"WHERE {filters} ORDER BY {ordering}{suffix}",
+                parameters,
             ).fetchall()
         return [str(row[0]) for row in rows]
 

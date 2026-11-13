@@ -147,12 +147,13 @@ class SQLiteIncidentStore:
             ).fetchall()
         return [IncidentSession.model_validate_json(row[0]) for row in rows]
 
-    def list_events(self, task_id: str) -> list[AgentEvent]:
+    def list_events(self, task_id: str, *, after_sequence: int | None = None,
+                    limit: int | None = None) -> list[AgentEvent]:
         payloads = self.database.read_json_records(
             task_id,
             table=INCIDENT_LAYOUT.events,
             json_column="event_json",
-            order_by=("sequence",),
+            order_by=("sequence",), after_sequence=after_sequence, limit=limit,
         )
         return [AgentEvent.model_validate_json(payload) for payload in payloads]
 

@@ -276,8 +276,13 @@ class AgentApplication:
     def explain_change(self, session_id: str, path: str) -> ChangeExplanation:
         return self._engine.explain_change(session_id, path)
 
-    def events(self, session_id: str) -> list[AgentEvent]:
-        return self._engine.get_session(session_id).events
+    def events(self, session_id: str, *, after_sequence: int | None = None,
+               limit: int = 200) -> list[AgentEvent]:
+        if after_sequence is None:
+            return self._engine.get_session(session_id).events
+        return self._engine.sessions.list_events(
+            session_id, after_sequence=after_sequence, limit=limit,
+        )
 
     def artifacts(self, session_id: str) -> list[ArtifactRecord]:
         return self._engine.get_session(session_id).artifacts
