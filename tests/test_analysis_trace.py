@@ -170,3 +170,37 @@ def test_event_pages_are_ordered_isolated_and_do_not_load_task_snapshots(tmp_pat
         app.events(session.id, after_sequence=0, limit=501)
     app._engine.get_session = lambda task_id: store.load(task_id)
     assert len(app.events(session.id)) == 5  # 无参旧接口仍返回全部事件。
+
+
+def test_two_images_with_same_filename_remain_distinct_in_tool_trace(tmp_path):
+    paths = [str(tmp_path / n / "screen.png") for n in ("a", "b")]
+    ctx = {}
+    for number, path in enumerate(paths, 1):
+        args = dict(workspace=str(tmp_path / "repo"), tool_context=ctx, run_id="run",
+                    attachment_paths=paths)
+        started = _stream_activities({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": str(number), "name": "Read", "input": {"file_path": path}},
+        ]}}, **args)[0]
+        finished = _stream_activities({"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": str(number), "content": [{"type": "image"}]},
+        ]}}, **args)[0]
+        assert started.data["image_number"] == number
+        assert finished.data["image_delivered"]
+        assert path not in finished.model_dump_json()
+        trace = AnalysisTrace()
+        trace.append([event(EventType.TOOL_FINISHED, 1, **finished.data)])
+        assert f"图{number} · 已返回图像" in trace.sections["legacy"].steps[0].summary
+
+
+def test_call_summary_survives_history_and_missing_or_interrupted_report():
+    trace = AnalysisTrace()
+    trace.append([
+        event(EventType.RUNTIME_COMPLETED, 1, call_number=1, call_summary={
+            "checked": "图2和保存入口", "finding": "重试绕过校验", "next_step": "核对提交分支"}),
+        event(EventType.RUNTIME_COMPLETED, 2, call_number=2, model_message="候选尚待核对"),
+        event(EventType.RUNTIME_INTERRUPTED, 3, call_number=3, terminal_reason="用户停止"),
+    ])
+    steps = trace.sections["legacy"].steps
+    assert steps[0].summary == "重试绕过校验" and "下一步：核对提交分支" in steps[0].detail
+    assert "未提供分项小结" in steps[1].detail
+    assert "未完成" in steps[2].title and "用户停止" in steps[2].detail

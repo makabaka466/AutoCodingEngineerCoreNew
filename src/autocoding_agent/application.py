@@ -138,6 +138,8 @@ class AgentApplication:
                 "summary": decision.message,
                 "diagnosis": decision.diagnosis,
                 "solutions": decision.recommended_actions,
+                "impact": decision.impact,
+                "screenshot_clues": [item.model_dump() for item in decision.screenshot_clues],
                 "data_repair": (
                     decision.data_repair.model_dump(mode="json") if decision.data_repair else None
                 ),

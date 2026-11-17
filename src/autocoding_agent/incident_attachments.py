@@ -32,8 +32,16 @@ class IncidentAttachmentStore:
     def capture_clipboard_image(self) -> MessageAttachment | None:
         """Return None for ordinary text clipboard content and an attachment for an image."""
 
+        images = self._capture_images(1, first_only=True)
+        return images[0] if images else None
+
+    def capture_clipboard_images(self, remaining: int = 5) -> list[MessageAttachment]:
+        """按剪贴板顺序保存整批截图；超过当前消息余量时整批退回。"""
+        return self._capture_images(remaining, first_only=False)
+
+    def _capture_images(self, remaining: int, *, first_only: bool) -> list[MessageAttachment]:
         try:
-            from PIL import Image, ImageGrab, UnidentifiedImageError
+            from PIL import Image, ImageGrab
         except ImportError as exc:
             raise IncidentAttachmentError(
                 "图片粘贴组件未安装，请重新运行启动脚本安装 Pillow。"
@@ -46,21 +54,35 @@ class IncidentAttachmentStore:
 
         if isinstance(payload, Image.Image):
             try:
-                return self.save_image(payload)
+                if remaining < 1:
+                    raise IncidentAttachmentError("每条消息最多粘贴 5 张异常截图。")
+                return [self.save_image(payload)]
             finally:
                 payload.close()
-        if isinstance(payload, list):
-            for raw_path in payload:
-                source = Path(raw_path)
-                if source.suffix.casefold() not in SUPPORTED_IMAGE_SUFFIXES:
-                    continue
-                try:
-                    with Image.open(source) as image:
-                        image.load()
-                        return self.save_image(image)
-                except (OSError, UnidentifiedImageError) as exc:
-                    raise IncidentAttachmentError(f"无法读取粘贴的图片文件：{exc}") from exc
-        return None
+        if not isinstance(payload, list):
+            return []
+        paths = [path for path in map(Path, payload) if path.suffix.casefold()
+                 in SUPPORTED_IMAGE_SUFFIXES]
+        if first_only:
+            paths = paths[:1]
+        if len(paths) > remaining:
+            raise IncidentAttachmentError(
+                f"本次有 {len(paths)} 张图片，这条消息还能添加 {remaining} 张。"
+            )
+        saved = []
+        try:
+            for source in paths:
+                with Image.open(source) as image:
+                    saved.append(self.save_image(image))
+        except Exception as exc:
+            for item in saved:
+                target = Path(item.path)
+                target.unlink(missing_ok=True)
+                target.parent.rmdir()
+            if isinstance(exc, OSError):
+                raise IncidentAttachmentError(f"无法读取粘贴的图片文件：{exc}") from exc
+            raise
+        return saved
 
     def save_image(self, image: Image) -> MessageAttachment:
         """Normalize a Pillow image to PNG and enforce deterministic host limits."""

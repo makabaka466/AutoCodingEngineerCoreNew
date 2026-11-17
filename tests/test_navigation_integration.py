@@ -133,5 +133,43 @@ def test_stop_during_catalog_becomes_pause_not_query_failure(tmp_path, flow):
     engine._stop_requested = lambda task: bool(fake.calls)
     result = engine.start(session.workspace, "页面定位", project="ace-one")
     assert result.task_state.value == "paused"
-    assert len(runtime.turns) == 1
+    assert len(runtime.turns) == (0 if flow == "incident" else 1)
     assert not list((tmp_path / "state/navigation/cache").glob("*.json"))
+
+
+@pytest.mark.parametrize(("description", "expects_catalog"), [
+    ("采集页面无法保存", True), ("请核对 src/Order1.cs 的保存按钮", False),
+    ("后台任务调用 API 失败，没有页面", False), ("Client.Order1 窗体报错", False),
+])
+def test_first_incident_turn_catalog(tmp_path, description, expects_catalog):
+    session, fake, access = configured(tmp_path)
+    runtime = ScriptedStructuredRuntime([
+        IncidentDecision(status="needs_input", message="需核实", question="发生在哪个工单？")
+    ])
+    engine = IncidentEngine(runtime, JsonIncidentStore(tmp_path / "tasks"), None)
+    engine.database_access = access
+    result = engine.start(session.workspace, description, project="ace-one")
+    assert len(runtime.turns) == 1
+    assert bool(fake.calls) == expects_catalog
+    assert ("Project menu catalog already obtained" in runtime.turns[0].user_message
+            ) == expects_catalog
+    saved = engine.get_session(result.session_id)
+    if expects_catalog:
+        kinds = [e.type.value for e in saved.events]
+        assert kinds.index("database_queries_executed") < kinds.index("runtime_started")
+        assert saved.page_query_rounds == 1 and saved.business_query_rounds == 0
+        assert "Client.Order1" not in saved.model_dump_json()
+
+
+def test_menu_failure_continues_source_investigation(tmp_path):
+    session, fake, access = configured(tmp_path)
+    fake.failure = ValueError("数据源离线")
+    runtime = ScriptedStructuredRuntime([
+        IncidentDecision(status="needs_input", message="需核实", question="页面标题是什么？")
+    ])
+    engine = IncidentEngine(runtime, JsonIncidentStore(tmp_path / "tasks"), None)
+    engine.database_access = access
+    result = engine.start(session.workspace, "打开页面失败", project="ace-one")
+    assert "Menu catalog unavailable" in runtime.turns[0].user_message
+    assert result.query_observations[0].status.value == "failed"
+    assert len(fake.calls) == 1

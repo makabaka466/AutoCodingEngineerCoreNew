@@ -44,8 +44,7 @@ class ClaudeCodeSearchPolicyError(ClaudeCodeError, RuntimePolicyBlockedError):
             "本轮源码调查预算已用完，已保存读取与搜索记录。"
             "可点击继续任务，先核对已有证据，再处理未解决的问题；无需重复提供页面路径。"
         ) if violation.budget_exhausted else (
-            "ACE 已阻止范围过大的源码搜索。"
-            f"{violation.reason}。请缩小到明确文件名、类名或候选子目录后重试。"
+            f"ACE 已拦截 {violation.tool_name} 搜索：{violation.reason}。"
         )
         RuntimePolicyBlockedError.__init__(
             self,
@@ -387,7 +386,7 @@ class ClaudeCodeRuntime:
                         part,
                         run_id=run_id,
                         workspace=turn.workspace,
-                        tool_context=tool_context,
+                        tool_context=tool_context, attachment_paths=turn.attachment_paths,
                     ):
                         if (activity.kind == RuntimeEventKind.TOOL_STARTED
                                 and (activity.tool_name or "").casefold() in {"glob", "grep"}):
@@ -623,10 +622,14 @@ class ClaudeCodeRuntime:
         prompt_path = Path(system_prompt_file)
         if not prompt_path.is_file():
             raise ValueError(f"System prompt file does not exist: {prompt_path}")
-        # 仅去掉 JSON 空白；描述、约束和字段完全保留，不能以响应速度换契约质量。
-        schema = json.dumps(
-            response_model.model_json_schema(), ensure_ascii=False, separators=(",", ":")
-        )
+        contract = response_model.model_json_schema()
+        # 新模型调用必须返回小结，持久化模型仍允许读取没有该字段的历史任务。
+        summary = contract.get("properties", {}).get("call_summary", {})
+        reference = {"$ref": "#/$defs/CallSummary"}
+        if reference in summary.get("anyOf", []):
+            contract["properties"]["call_summary"] = reference
+            contract.setdefault("required", []).append("call_summary")
+        schema = json.dumps(contract, ensure_ascii=False, separators=(",", ":"))
         command = [
             self.settings.claude_command,
             "-p",
@@ -854,6 +857,7 @@ def _stream_activities(
     run_id: str,
     workspace: str,
     tool_context: dict[str, tuple[str, dict[str, Any]]],
+    attachment_paths: tuple[str, ...] | list[str] = (),
 ) -> list[RuntimeActivity]:
     event_type = str(envelope.get("type") or "")
     activities: list[RuntimeActivity] = []
@@ -892,6 +896,14 @@ def _stream_activities(
             tool_name = str(block.get("name") or "unknown")
             tool_use_id = str(block.get("id") or "") or None
             data = _safe_tool_data(tool_name, block.get("input"), workspace)
+            if tool_name.casefold() == "read" and attachment_paths:
+                raw = block.get("input")
+                path = raw.get("file_path") if isinstance(raw, dict) else None
+                if isinstance(path, str) and Path(path).is_absolute():
+                    for number, attached in enumerate(attachment_paths, 1):
+                        if Path(path) == Path(attached):
+                            data["image_number"] = number
+                            break
             if tool_use_id:
                 tool_context[tool_use_id] = (tool_name, data)
             activities.append(
@@ -908,6 +920,11 @@ def _stream_activities(
             tool_use_id = str(block.get("tool_use_id") or "") or None
             tool_name, data = tool_context.get(tool_use_id or "", ("unknown", {}))
             is_error = bool(block.get("is_error", False))
+            if data.get("image_number"):
+                blocks = block.get("content")
+                data = {**data, "image_delivered": not is_error and isinstance(blocks, list)
+                        and any(isinstance(item, dict) and item.get("type") == "image"
+                                for item in blocks)}
             # 仅认可 Runtime 明确提供的退出码，不从模型文本或自然语言输出猜测成功。
             tool_result = envelope.get("tool_use_result")
             exit_code = None

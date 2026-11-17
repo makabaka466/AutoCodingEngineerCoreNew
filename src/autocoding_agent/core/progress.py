@@ -162,7 +162,8 @@ class ProgressProjector:
         if tool in cls._READ_TOOLS:
             phase = (
                 ProgressPhase.ANALYZING_IMAGE
-                if cls._is_attachment_image(safe_path, attachment_paths)
+                if (activity.data.get("image_number")
+                    or cls._is_attachment_image(safe_path, attachment_paths))
                 else ProgressPhase.INSPECTING_CODE
             )
         elif tool in cls._SEARCH_TOOLS:
@@ -178,7 +179,8 @@ class ProgressProjector:
             )
         else:
             return None
-        detail = _path_detail(safe_path)
+        detail = (f"图{activity.data['image_number']}" if activity.data.get("image_number")
+                  else _path_detail(safe_path))
         if tool in cls._SEARCH_TOOLS and "search_calls" in activity.data:
             detail = (f"源码搜索 {activity.data['search_calls']}/"
                       f"{activity.data['search_limit']} 次"

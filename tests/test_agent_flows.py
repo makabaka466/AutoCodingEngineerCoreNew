@@ -789,7 +789,7 @@ def test_development_inspect_retries_one_correctable_source_search_block(
                     "blocked Grep",
                     policy="bounded_source_search",
                     operation="Grep",
-                    reason="目录级 Grep 必须提供 glob 或 type 文件过滤器",
+                    reason="Grep 必须设置 1..100 的 head_limit",
                     retryable=True,
                 )
             return RuntimeResult(
@@ -806,7 +806,7 @@ def test_development_inspect_retries_one_correctable_source_search_block(
 
     assert outcome.status == AgentStatus.COMPLETED
     assert len(runtime.turns) == 2
-    assert "include a language-appropriate glob or type" in runtime.turns[1].user_message
+    assert "use a distinctive clue plus head_limit" in runtime.turns[1].user_message
     session = app.get_session(outcome.session_id)
     assert any(
         event.type == EventType.POLICY_REPAIR_REQUESTED for event in session.events

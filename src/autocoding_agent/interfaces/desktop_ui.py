@@ -18,6 +18,7 @@ from pathlib import Path
 from tkinter import messagebox, simpledialog, ttk
 
 from autocoding_agent.application import AgentApplication, build_application
+from autocoding_agent.core.data_repair import data_repair_text
 from autocoding_agent.core.investigation import entry_text
 from autocoding_agent.core.models import (
     AgentOutcome,
@@ -61,6 +62,7 @@ from autocoding_agent.incident_attachments import (
 )
 from autocoding_agent.interfaces.analysis_trace import AnalysisTrace
 from autocoding_agent.interfaces.chat_transcript import ChatTranscript, insert_markdown
+from autocoding_agent.interfaces.desktop_diagnostics import monitor_mainloop, timed_ui
 from autocoding_agent.interfaces.desktop_theme import COLORS, IconButton, Tooltip
 from autocoding_agent.interfaces.knowledge_management_ui import KnowledgeManagementDialog
 from autocoding_agent.interfaces.proposal_presentation import format_approval_details
@@ -648,8 +650,10 @@ class DesktopClient:
         self._displayed_conversation = None
         self._conversation_positions: dict[tuple, float] = {}
         self.history_search_var = tk.StringVar()
-        self._model_ready_cache: bool | None = None
-        self._database_ready_cache: bool | None = None
+        self._model_ready_cache = window_group[0]._model_ready_cache if window_group else None
+        self._database_ready_cache = window_group[0]._database_ready_cache if window_group else None
+        self._history_generation = 0
+        self._displayed_incident: IncidentSession | None = None
         self._result_queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self._stop_pending = False
         self._task_operation = False
@@ -707,9 +711,9 @@ class DesktopClient:
         self._configure_window()
         self._build_layout()
         self.root.bind("<Configure>", self._update_responsive_layout, add="+")
-        self._refresh_flow_presentation()
-        self._load_recent_sessions()
-        self._render_welcome()
+        if self._primary_window:
+            self._render_welcome()
+            self._load_recent_sessions()
         self._animate_progress_pulse()
         self.root.after(100, self._drain_results)
         if self._primary_window:
@@ -2010,6 +2014,7 @@ class DesktopClient:
         self._render_incident_session(session)
 
     def _render_welcome(self) -> None:
+        self._displayed_incident = None
         self._restore_analysis(None)
         self._show_incident_details = False
         self.incident_actions.grid_remove()
@@ -2126,6 +2131,7 @@ class DesktopClient:
         self._present_session_state(session)
 
     def _render_incident_session(self, session: IncidentSession) -> None:
+        self._displayed_incident = session
         self.incident_actions.grid()
         self.transcript.tag_configure("assistant_message", spacing1=2, spacing3=3)
         self._current_task_state = session.task_state
@@ -2150,13 +2156,13 @@ class DesktopClient:
             content = self._message_display_content(item)
             if (item is final_assistant and session.last_decision
                     and session.status == IncidentStatus.COMPLETED):
-                content = format_incident_summary(session.last_decision)
+                content = format_incident_summary(session.last_decision, compact=True)
             entries.append((role, content))
             message_times.append(item.created_at)
 
         decision = session.last_decision
         if final_assistant is None and decision and session.status == IncidentStatus.COMPLETED:
-            entries.append(("assistant", format_incident_summary(decision)))
+            entries.append(("assistant", format_incident_summary(decision, compact=True)))
         if decision is not None and self._show_incident_details:
             details: list[str] = []
             if session.task_analysis and not (decision.assessment and decision.assessment.analysis):
@@ -2184,6 +2190,14 @@ class DesktopClient:
                     details.extend(f"• {item}" for item in decision.page.unresolved_conflicts)
             if decision.diagnosis:
                 details.append(f"为什么出现这个异常\n{decision.diagnosis}")
+            if decision.screenshot_clues:
+                details.append("截图线索（模型标注）")
+                for clue in decision.screenshot_clues:
+                    roles = {"primary": "主要页面", "related": "关联页面", "unclear": "待核对"}
+                    role = roles[clue.role]
+                    details.append(f"图{clue.number} · {role} · {clue.clue}")
+            if decision.data_repair:
+                details.append(data_repair_text(decision.data_repair))
             if decision.findings:
                 details.append("发现")
                 details.extend(f"• {item.summary}" for item in decision.findings)
@@ -2294,7 +2308,7 @@ class DesktopClient:
         attachments = list(getattr(message, "attachments", []))
         if not attachments:
             return content
-        names = "、".join(str(item.name) for item in attachments)
+        names = "、".join(f"图{i} {item.name}" for i, item in enumerate(attachments, 1))
         return f"{content}\n[异常截图：{names}]"
 
     def _restore_analysis(self, session: AgentSession | IncidentSession | None) -> None:
@@ -2319,6 +2333,7 @@ class DesktopClient:
         ]
         self._render_transcript()
 
+    @timed_ui
     def _render_transcript(self) -> None:
         """把分析过程放在对应用户轮次下方，刷新只影响展示，不重新加载任务。"""
         if not hasattr(self, "_chat_renderer"):
@@ -2364,7 +2379,27 @@ class DesktopClient:
         if previous != key and key in self._conversation_positions:
             self.transcript.yview_moveto(self._conversation_positions[key])
 
-    def _load_recent_sessions(self, select_current: bool = False) -> None:
+    @timed_ui
+    def _load_recent_sessions(self, select_current: bool = False, *, background=False) -> None:
+        self._history_generation += 1
+        if background:
+            generation = self._history_generation
+            application = self._active_application()
+            project_id = self._flow_projects[self.flow]
+            project = next((p for p in self.projects if p.id == project_id), None)
+
+            @timed_ui
+            def read_history():
+                try:
+                    rows = [s for s in application.list_sessions()
+                            if project and project.owns(s.project, s.workspace)]
+                    payload = generation, rows, None
+                except Exception as exc:
+                    payload = generation, [], str(exc)
+                self._result_queue.put(("history", payload))
+
+            threading.Thread(target=read_history, name="ace-history", daemon=True).start()
+            return
         try:
             sessions = self._active_application().list_sessions()
         except Exception as exc:
@@ -2502,10 +2537,11 @@ class DesktopClient:
         if len(self._window_group) > 1:
             self._window_group[1]._show_conversation()
 
+    @timed_ui
     def _open_task_window(
         self, *, session: AgentSession | IncidentSession | None = None,
         flow: FlowKind | None = None,
-        project_id: str | None = None,
+        project_id: str | None = None, remediation: bool = False,
     ) -> DesktopClient | None:
         """兼容旧调用名，页面内复用独立会话控制器，不再创建系统窗口。"""
         if self._window_group[0]._close_after_stop:
@@ -2523,9 +2559,11 @@ class DesktopClient:
         try:
             child = DesktopClient(
                 window,
-                application=self.application if self._applications_injected else None,
+                application=(self.application if remediation or self._applications_injected
+                             else None),
                 incident_application=(self.incident_application
-                                      if self._incident_application_injected else None),
+                                      if remediation or self._incident_application_injected
+                                      else None),
                 setup_service=self.setup_service, sqlserver_service=self.sqlserver_service,
                 knowledge_service=self.knowledge_service, workspace_service=self.workspace_service,
                 attachment_store=self.attachment_store, embedding_service=self.embedding_service,
@@ -2534,18 +2572,22 @@ class DesktopClient:
         except Exception:
             window.destroy()
             raise
+        if remediation:
+            child._applications_injected = self._applications_injected
+            child._incident_application_injected = self._incident_application_injected
+            child._active_incident_database_reference = self._active_incident_database_reference
         child.flow = selected_flow
         child._flow_projects = dict(self._flow_projects)
         if project_id is not None:
             child._flow_projects[selected_flow] = project_id
-        child._refresh_flow_presentation()
         if session is not None:
+            child._refresh_flow_presentation()
             child.session_id = session.id
             child._flow_session_ids[selected_flow] = session.id
             child._render_active_session(session)
         else:
             child._render_welcome()
-        child._load_recent_sessions(select_current=session is not None)
+        child._load_recent_sessions(select_current=session is not None, background=remediation)
         child._sync_controls()
         child._show_conversation()
         return child
@@ -2951,20 +2993,18 @@ class DesktopClient:
     def _on_prompt_paste(self, _event: tk.Event[tk.Misc]) -> str | None:
         if self.flow != FlowKind.INCIDENT or self._busy:
             return None
-        if len(self._pending_attachments) >= 5:
-            self.status_var.set("每条消息最多粘贴 5 张异常截图。")
-            return "break"
         try:
-            attachment = self.attachment_store.capture_clipboard_image()
+            remaining = 5 - len(self._pending_attachments)
+            images = self.attachment_store.capture_clipboard_images(remaining)
         except IncidentAttachmentError as exc:
             self.status_var.set(str(exc))
             return "break"
         except Exception as exc:
             self.status_var.set(f"粘贴异常截图失败：{exc}")
             return "break"
-        if attachment is None:
+        if not images:
             return None
-        self._pending_attachments.append(attachment)
+        self._pending_attachments.extend(images)
         self._refresh_attachment_display()
         self._hide_prompt_placeholder()
         self.status_var.set("异常截图已附加；发送后 Agent 会读取图片进行诊断。")
@@ -2990,29 +3030,35 @@ class DesktopClient:
         self._show_incident_details = not self._show_incident_details
         self._render_incident_session(self.incident_application.get_session(self.session_id))
 
+    @timed_ui
     def _start_incident_remediation(self) -> None:
         """点击只授权生成方案；写权限仍由后续的批准按钮单独授予。"""
         if self._busy or self.flow != FlowKind.INCIDENT or not self.session_id:
             return
-        incident = self.incident_application.get_session(self.session_id)
-        if not incident.can_remediate:
+        incident = self._displayed_incident
+        if not incident or incident.id != self.session_id or not incident.can_remediate:
             return
-        target = self._open_task_window(flow=FlowKind.DEVELOPMENT)
+        project_id = self._flow_projects[FlowKind.INCIDENT]
+        target = self._open_task_window(flow=FlowKind.DEVELOPMENT, project_id=project_id,
+                                        remediation=True)
         if target is None:
             return
-        target.session_id = None
-        target._flow_session_ids[FlowKind.DEVELOPMENT] = None
         target._restore_session_project(incident)
-        target._load_recent_sessions()
-        target._render_welcome()
         target.flow_caption_var.set("异常处理 · 正在核对诊断并准备修复方案")
         target.task_title_var.set("异常处理：" + incident.problem[:48])
-        target._run_in_background(
-            lambda: target.application.start_incident_remediation(
-                incident, progress_sink=target._queue_progress
-            ),
-            "正在生成异常处理方案",
-        )
+        source = self.incident_application
+
+        def prepare():
+            current = source.get_session(incident.id)
+            if current.revision != incident.revision or not current.can_remediate:
+                raise ValueError("诊断结果已更新，请重新打开诊断并审阅最新方案。")
+            if not target._applications_injected:
+                target.application = target._build_current_development_application()
+            return target.application.start_incident_remediation(
+                current, progress_sink=target._queue_progress,
+            )
+
+        target._run_in_background(prepare, "正在生成异常处理方案")
 
     def _approve(self) -> None:
         if (
@@ -3172,8 +3218,18 @@ class DesktopClient:
         if self._closed:
             return
         try:
-            while True:
+            deadline = time.monotonic() + .025
+            while time.monotonic() < deadline:
                 kind, payload = self._result_queue.get_nowait()
+                if kind == "history":
+                    generation, rows, error = payload
+                    if generation == self._history_generation:
+                        if error:
+                            self.status_var.set(f"读取历史任务失败：{error}")
+                        else:
+                            self._refresh_overview(rows)
+                            self._filter_history()
+                    continue
                 if kind == "progress":
                     if isinstance(payload, ProgressEvent):
                         self._present_progress(payload)
@@ -3475,14 +3531,9 @@ class DesktopClient:
     def _sync_controls(self) -> None:
         """Keep controls consistent with the durable task state and current worker."""
 
-        can_remediate = False
-        if self.flow == FlowKind.INCIDENT and self.session_id:
-            try:
-                can_remediate = self.incident_application.get_session(
-                    self.session_id
-                ).can_remediate
-            except Exception:
-                pass
+        incident = self._displayed_incident
+        can_remediate = (self.flow == FlowKind.INCIDENT and incident is not None
+                         and self.session_id == incident.id and incident.can_remediate)
         if can_remediate:
             self.remediation_button.grid()
         else:
@@ -3828,9 +3879,11 @@ def main() -> None:
         root.destroy()
         _release_single_instance()
         raise
+    stop_monitor = monitor_mainloop(root)
     try:
         root.mainloop()
     finally:
+        stop_monitor()
         _release_single_instance()
 
 

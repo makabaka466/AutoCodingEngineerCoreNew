@@ -1566,8 +1566,8 @@ def test_incident_screenshot_paste_attaches_image_and_allows_image_only_send(
     )
 
     class FakeAttachmentStore:
-        def capture_clipboard_image(self) -> MessageAttachment:
-            return attachment
+        def capture_clipboard_images(self, remaining: int) -> list[MessageAttachment]:
+            return [attachment][:remaining]
 
         def prepare_for_send(self, candidate: MessageAttachment) -> MessageAttachment:
             return candidate
@@ -1607,7 +1607,7 @@ def test_development_text_paste_does_not_invoke_image_clipboard(
     root: tk.Toplevel,
 ) -> None:
     class FailingAttachmentStore:
-        def capture_clipboard_image(self) -> MessageAttachment:
+        def capture_clipboard_images(self, remaining: int) -> list[MessageAttachment]:
             raise AssertionError("development paste must keep Tk text behavior")
 
     client = DesktopClient(
@@ -1751,7 +1751,26 @@ def test_incident_summary_details_and_manual_repair_entry(
     operations = []
     monkeypatch.setattr(DesktopClient, "_run_in_background",
                         lambda page, operation, label: operations.append((page, operation)))
-    client.remediation_button.invoke()
+    # 人为挂起历史读取，交接页面和 Tk 回调仍应可以立即操作。
+    import threading
+
+    entered, release = threading.Event(), threading.Event()
+
+    def slow_history():
+        entered.set()
+        assert release.wait(5)
+        return []
+
+    monkeypatch.setattr(application, "list_sessions", slow_history)
+    try:
+        client.remediation_button.invoke()
+        assert entered.wait(2)
+        ticks = []
+        root.after(0, lambda: ticks.append(True))
+        root.update()
+        assert ticks
+    finally:
+        release.set()
     assert client.flow == FlowKind.INCIDENT and client.session_id == incident.id
     assert len(operations) == 1 and not application.calls
     repair, operation = operations[0]

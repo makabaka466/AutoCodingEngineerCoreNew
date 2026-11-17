@@ -17,7 +17,7 @@ from autocoding_agent.core.hermes import HermesSkillObservation, HermesSkillRequ
 from autocoding_agent.core.investigation import InvestigationEntry
 from autocoding_agent.core.runtime.models import RuntimeRunRecord
 from autocoding_agent.core.state_machine.models import CommandReceipt, TaskState
-from autocoding_agent.core.workflow import TaskAnalysis, WorkflowAssessment
+from autocoding_agent.core.workflow import CallSummary, TaskAnalysis, WorkflowAssessment
 from autocoding_agent.database_models import DataQuery, QueryObservation
 from autocoding_agent.datasource_models import TaskDataSources
 
@@ -188,6 +188,7 @@ class AgentDecision(BaseModel):
         default=None, description="当前调查入口；旧任务兼容为空。"
     )
     status: AgentStatus
+    call_summary: CallSummary | None = None
     assessment: WorkflowAssessment | None = Field(
         default=None, description="阶段推进依据、证据出处与本轮结果等级；None 兼容历史会话。"
     )
@@ -372,6 +373,7 @@ class RuntimeTurn(BaseModel):
     permission_mode: str = "dontAsk"
     capability_dir: str | None = None
     additional_dirs: list[str] = Field(default_factory=list, max_length=5)
+    attachment_paths: list[str] = Field(default_factory=list, max_length=5)
 
 
 class RuntimeResult(BaseModel):

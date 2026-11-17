@@ -72,6 +72,8 @@ def test_compact_schema_preserves_every_description_and_constraint(tmp_path: Pat
     command = runtime.build_command(turn, response_model, system_prompt_file=prompt)
     encoded = command[command.index("--json-schema") + 1]
     schema = response_model.model_json_schema()
+    schema["properties"]["call_summary"] = {"$ref": "#/$defs/CallSummary"}
+    schema["required"].append("call_summary")
     assert json.loads(encoded) == schema
     assert len(encoded) < len(json.dumps(schema, ensure_ascii=False))
 

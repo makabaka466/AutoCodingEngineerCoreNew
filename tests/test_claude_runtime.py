@@ -594,7 +594,7 @@ def test_observed_runtime_blocks_repository_wide_glob(tmp_path: Path) -> None:
     runtime = ClaudeCodeRuntime(_settings(tmp_path), popen_factory=popen_factory)
     activities = []
 
-    with pytest.raises(ClaudeCodeError, match="范围过大的源码搜索") as error:
+    with pytest.raises(ClaudeCodeError, match="已拦截 Glob 搜索") as error:
         runtime.run_observed(_turn(tmp_path), "run-broad-glob", activities.append)
 
     assert isinstance(error.value, RuntimePolicyBlockedError)

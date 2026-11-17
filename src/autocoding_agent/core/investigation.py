@@ -64,7 +64,7 @@ Otherwise page clues use configured catalogs: query_kind=menu_catalog (omit sql)
 Compare all candidates with user/images, then Read source; cached/incomplete catalogs are clues,
 not identity or cause evidence. Refresh stale mappings. Non-page entries skip menu catalogs.
 Search exact clues first, then a justified subtree; each expansion must close a named gap.
-Root manifests may orient structure, not justify a repository-wide business scan. Stop repeated
+Distinctive clues can be searched across the workspace with bounded output. Stop repeated
 searches without new evidence. Candidate alternatives must remain visibly unconfirmed.
 Set entry.state=excluded when user denies it or evidence disproves it; explain why. Old diagnosis
 and proposal then become stale. Never silently revive an excluded entry. Reconsider only with new

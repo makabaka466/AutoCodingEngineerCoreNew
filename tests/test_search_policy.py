@@ -22,13 +22,11 @@ def test_exact_filename_glob_is_allowed_while_repository_walk_is_blocked(
     assert "禁止通配整个项目" in violation.reason
 
 
-def test_recursive_extension_only_glob_is_blocked(tmp_path: Path) -> None:
+def test_recursive_extension_only_glob_is_allowed(tmp_path: Path) -> None:
     guard = BoundedSearchGuard(str(tmp_path))
 
-    violation = guard.inspect("Glob", {"pattern": "**/*.cs"})
-
-    assert violation is not None
-    assert "禁止通配整个项目" in violation.reason
+    assert guard.inspect("Glob", {"pattern": "**/*.cs"}) is None
+    assert guard.inspect("Glob", {"pattern": "../**/*.cs"}) is not None
 
 
 def test_extension_glob_inside_explicit_candidate_subtree_is_allowed(tmp_path: Path) -> None:
@@ -59,9 +57,8 @@ def test_grep_requires_bounded_output_and_file_scope(tmp_path: Path) -> None:
     )
 
     assert no_limit is not None and "head_limit" in no_limit.reason
-    assert no_filter is not None and "glob 或 type" in no_filter.reason
+    assert no_filter is None
     assert no_limit.retryable is True
-    assert no_filter.retryable is True
     assert allowed is None
 
 
@@ -171,12 +168,12 @@ def test_same_tool_event_is_not_double_counted_and_path_aliases_share_directory(
     assert "禁止通配" in violation.reason
 
 
-def test_root_overview_is_not_permission_to_scan_all_business_code(tmp_path):
+def test_root_grep_allows_distinctive_clue_across_project(tmp_path):
     guard = BoundedSearchGuard(str(tmp_path))
     assert guard.inspect("Glob", {"pattern": "*.sln"}) is None
     assert guard.inspect("Grep", {
         "pattern": "Order", "path": ".", "glob": "*.cs", "head_limit": 20,
-    }) is not None
+    }) is None
     assert guard.inspect("Grep", {
         "pattern": "Order", "path": ".", "glob": "**/OrderController.cs", "head_limit": 20,
     }) is None

@@ -25,7 +25,7 @@ from autocoding_agent.core.runtime.models import (
     RuntimeRunRecord,
 )
 from autocoding_agent.core.state_machine.models import TaskState
-from autocoding_agent.core.workflow import read_fingerprint
+from autocoding_agent.core.workflow import CallSummary, read_fingerprint
 from autocoding_agent.ports.runtime import RuntimeInterruptedError, RuntimePolicyBlockedError
 
 
@@ -189,6 +189,8 @@ class RuntimeLifecycle:
         reason: str | None,
         command_id: str | None,
         runtime_session_id: str | None = None,
+        call_summary: CallSummary | None = None,
+        model_message: str | None = None,
     ) -> None:
         """把已启动 Run 转为唯一且不可改写的终态，并生成对应事件。"""
 
@@ -215,6 +217,9 @@ class RuntimeLifecycle:
                 data={
                     "run_id": run.id,
                     "mode": run.mode,
+                    "call_number": len(session.runs),
+                    "call_summary": call_summary.model_dump() if call_summary else None,
+                    "model_message": None if call_summary else (model_message or "")[:300],
                     "terminal_reason": run.terminal_reason,
                     "workflow": self.workflow.value,
                 },

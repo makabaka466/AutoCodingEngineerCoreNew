@@ -151,7 +151,11 @@ class AnalysisTrace:
                 status += f"，退出码 {data['exit_code']}"
                 failed |= data["exit_code"] != 0
             target = public_text(data.get("path") or data.get("pattern") or tool, 160)
-            if target.casefold() == "<outside_workspace>":
+            if data.get("image_number"):
+                target = f"图{data['image_number']}"
+                if kind == "tool_finished" and not data.get("is_error"):
+                    status = "已返回图像" if data.get("image_delivered") else "未记录图像返回"
+            elif target.casefold() == "<outside_workspace>":
                 target = "工作区外路径（已脱敏）"
             summary = f"{target} · {status}"
             detail = "\n".join(f"{label}：{public_text(data[name], 800)}" for name, label in (
@@ -160,6 +164,17 @@ class AnalysisTrace:
             detail += f"\n结果：{status}\n记录：{event.id[:8]}"
             if tool.casefold() == "bash":
                 detail += "\n命令返回状态不等于功能验收通过。"
+        elif kind == "runtime_completed" and data.get("call_number"):
+            source, title = "模型公开说明", f"第 {data['call_number']} 次调用 · 调查小结"
+            report = data.get("call_summary")
+            report = report if isinstance(report, dict) else {}
+            summary = public_text(report.get("finding") or data.get("model_message")
+                                  or "本次调用未返回调查小结。", 240)
+            detail = "\n".join(f"{label}：{public_text(report[key], 240)}"
+                               for key, label in (("checked", "检查"), ("finding", "发现"),
+                                                  ("next_step", "下一步")) if report.get(key))
+            if not detail:
+                detail = "模型未提供分项小结。\n" + summary
         elif kind == "decision_recorded" and data.get("assessment"):
             try:
                 assessment = WorkflowAssessment.model_validate(data["assessment"])
@@ -186,6 +201,8 @@ class AnalysisTrace:
         elif kind in {"policy_repair_requested", "decision_repaired", "recovery_required",
                       "runtime_failed", "runtime_interrupted", "verification_failed"}:
             title = "调查调整" if "repair" in kind else "执行受阻"
+            if data.get("call_number") and kind in {"runtime_failed", "runtime_interrupted"}:
+                title = f"第 {data['call_number']} 次调用 · 未完成"
             failed = "failed" in kind or kind == "recovery_required"
             summary = public_text(event.message, 180)
             detail = public_text(event.message)

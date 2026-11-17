@@ -970,6 +970,7 @@ class AgentEngine:
                 reason=None,
                 command_id=command.id,
                 runtime_session_id=result.runtime_session_id,
+                call_summary=result.decision.call_summary, model_message=result.decision.message,
             )
             self.sessions.save(session)
 

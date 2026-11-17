@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import StrEnum
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, Field, StringConstraints, model_validator
@@ -16,7 +16,7 @@ from autocoding_agent.core.investigation import InvestigationEntry
 from autocoding_agent.core.models import AgentEvent, AgentUsage, ChatMessage, utc_now
 from autocoding_agent.core.runtime.models import RuntimeRunRecord
 from autocoding_agent.core.state_machine.models import CommandReceipt, TaskState
-from autocoding_agent.core.workflow import TaskAnalysis, WorkflowAssessment
+from autocoding_agent.core.workflow import CallSummary, TaskAnalysis, WorkflowAssessment
 from autocoding_agent.database_models import (
     DataQuery,
     QueryObservation,
@@ -102,6 +102,15 @@ class LocatedPage(BaseModel):
     explanation: NonEmptyText
 
 
+class ScreenshotClue(BaseModel):
+    """单张图在本次调查的作用。可见线索和待核对的代码位置分别记录。"""
+
+    number: int = Field(ge=1, le=5)
+    role: Literal["primary", "related", "unclear"]
+    clue: str = Field(min_length=1, max_length=240, description="可见标题、操作或步骤。")
+    source_path: str | None = Field(default=None, max_length=500)
+
+
 class IncidentFinding(BaseModel):
     summary: NonEmptyText
     evidence: list[NonEmptyText] = Field(default_factory=list)
@@ -111,6 +120,7 @@ class IncidentContinuationDecision(BaseModel):
     """Compact follow-up answer or escalation without replaying the full workflow prompt."""
 
     status: IncidentContinuationStatus
+    call_summary: CallSummary | None = None
     assessment: WorkflowAssessment | None = Field(
         default=None, description="依据已有证据回答或升级调查的阶段评估，不得提升历史结论等级。"
     )
@@ -148,6 +158,7 @@ class IncidentDecision(BaseModel):
         default=None, description="当前调查入口；旧任务兼容为空。"
     )
     status: IncidentStatus
+    call_summary: CallSummary | None = None
     assessment: WorkflowAssessment | None = Field(
         default=None, description="阶段推进依据、证据出处与本轮交付等级；None 兼容历史会话。"
     )
@@ -198,6 +209,8 @@ class IncidentDecision(BaseModel):
             "explicit certainty level when the root cause is not fully proven."
         ),
     )
+    screenshot_clues: list[ScreenshotClue] = Field(default_factory=list, max_length=5)
+    impact: str | None = Field(default=None, max_length=360, description="建议的影响范围。")
     findings: list[IncidentFinding] = Field(default_factory=list)
     recommended_actions: list[NonEmptyText] = Field(
         default_factory=list,

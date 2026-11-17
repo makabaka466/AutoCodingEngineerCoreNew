@@ -22,6 +22,7 @@ from autocoding_agent.core.hermes import (
     HermesSkillSummary,
 )
 from autocoding_agent.core.models import (
+    AgentEvent,
     AgentUsage,
     EventType,
     MessageAttachment,
@@ -29,7 +30,7 @@ from autocoding_agent.core.models import (
 )
 from autocoding_agent.core.progress import ProgressPhase
 from autocoding_agent.core.state_machine.models import TaskState
-from autocoding_agent.core.workflow import ResultKind
+from autocoding_agent.core.workflow import ResultKind, read_fingerprint
 from autocoding_agent.incident.capability_store import IncidentCapabilityStore
 from autocoding_agent.incident.engine import IncidentEngine
 from autocoding_agent.incident.models import (
@@ -1112,7 +1113,7 @@ def test_incident_flow_retries_one_correctable_source_search_policy_block(
                     "blocked Grep",
                     policy="bounded_source_search",
                     operation="Grep",
-                    reason="目录级 Grep 必须提供 glob 或 type 文件过滤器",
+                    reason="Grep 必须设置 1..100 的 head_limit",
                     retryable=True,
                 )
             return StructuredRuntimeResult(
@@ -1137,7 +1138,7 @@ def test_incident_flow_retries_one_correctable_source_search_policy_block(
     assert outcome.status == IncidentStatus.COMPLETED
     assert len(runtime.turns) == 2
     assert runtime.turns[1].runtime_session_id == outcome.session_id
-    assert "include a language-appropriate glob or type" in runtime.turns[1].user_message
+    assert "use a distinctive clue plus head_limit" in runtime.turns[1].user_message
     saved = store.load(outcome.session_id)
     repair_events = [
         event for event in saved.events if event.type == EventType.POLICY_REPAIR_REQUESTED
@@ -1165,7 +1166,7 @@ def test_incident_flow_stops_after_one_source_search_policy_correction(
                 "blocked Grep",
                 policy="bounded_source_search",
                 operation="Grep",
-                reason="目录级 Grep 必须提供 glob 或 type 文件过滤器",
+                reason="Grep 必须设置 1..100 的 head_limit",
                 retryable=True,
             )
 
@@ -1180,7 +1181,7 @@ def test_incident_flow_stops_after_one_source_search_policy_correction(
     assert outcome.status == IncidentStatus.FAILED
     assert outcome.task_state == TaskState.PAUSED
     assert "内部源码搜索受阻" in outcome.message
-    assert "目录级 Grep 必须提供 glob 或 type 文件过滤器" in outcome.message
+    assert "Grep 必须设置 1..100 的 head_limit" in outcome.message
     assert runtime.calls == 2
     saved = store.load(outcome.session_id)
     assert sum(
@@ -1217,7 +1218,7 @@ def test_incident_flow_allows_one_correction_in_each_successful_stage(
                     reason=(
                         "Grep 必须设置 1..100 的 head_limit"
                         if self.calls == 1
-                        else "目录级 Grep 必须提供 glob 或 type 文件过滤器"
+                        else "Grep 必须设置 1..100 的 head_limit"
                     ),
                     retryable=True,
                 )
@@ -1604,3 +1605,33 @@ def test_incident_flow_consults_hermes_and_keeps_external_guidance_untrusted(
     assert ProgressPhase.CONSULTING_ENGINEERING_EXPERIENCE in [
         item.phase for item in progress
     ]
+
+@pytest.mark.parametrize("delivered,changed,expected", [
+    (True, False, ["main.cs"]), (False, False, ["main.cs", "save.cs"]),
+    (True, True, ["main.cs", "save.cs"]),
+])
+def test_related_screenshot_page_requires_image_and_current_source(
+    tmp_path, delivered, changed, expected,
+):
+    (tmp_path / "save.cs").write_text("save")
+    session = IncidentSession(workspace=str(tmp_path), problem="图1采集，图2保存")
+    session.events.extend([
+        AgentEvent(type=EventType.TOOL_FINISHED, message="Read", command_id="c",
+                   data={"tool_name": "Read", "is_error": False, "image_number": 2,
+                         "image_delivered": delivered}),
+        AgentEvent(type=EventType.TOOL_FINISHED, message="Read", command_id="c",
+                   data={"tool_name": "Read", "is_error": False, "path": "save.cs",
+                         "content_sha256": read_fingerprint(str(tmp_path), "save.cs")}),
+    ])
+    if changed:
+        (tmp_path / "save.cs").write_text("changed")
+    decision = IncidentDecision(status="completed", message="已核对", diagnosis="保存未提交",
+        page=_page().model_copy(update={
+            "source_paths": ["main.cs", "save.cs"], "related_paths": [],
+        }),
+        entry={"kind": "page", "label": "采集", "reason": "标题匹配", "source_paths": ["main.cs"]},
+        screenshot_clues=[{"number": 2, "role": "related", "clue": "保存窗体",
+                           "source_path": "save.cs"}])
+    IncidentEngine._separate_related_pages(session, decision, [object(), object()], "c")
+    assert decision.page.source_paths == expected
+    assert bool(decision.page.related_paths) == (delivered and not changed)

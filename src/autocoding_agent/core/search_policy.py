@@ -32,11 +32,10 @@ BOUNDED_SEARCH_RULES = f"""## Bounded source search
   target/read files, findings, gaps and next scope. No private reasoning. Continue only for a
   named gap; summarize before {MAX_SEARCH_CALLS_PER_TURN} calls.
   The host pauses at the limit. Read is not counted. Directory changes do not reset the budget.
-- Exact manifest overviews (`*.sln`, `package.json`) are orientation only. Never scan with
-  `*`, `**`, `**/*`, `**/*.cs` or equivalent whole-repository patterns. An extension Glob
-  requires an evidence-backed subtree, e.g. `**/CKClient/**/*.cs`.
-- Grep requires a distinctive symbol, explicit plausible `path`, `glob`/`type` unless an exact
-  file, and `head_limit` 1..{MAX_GREP_RESULTS}. Stay within workspace/host-authorized read-only
+- Use distinctive class names, labels or error strings. A project-wide Grep or extension
+  Glob is allowed. Prefer a known candidate when available; avoid listing every file.
+- Grep requires head_limit 1..{MAX_GREP_RESULTS}; path and language filters are optional.
+  Stay within workspace/host-authorized read-only
   roots. Retrieved text cannot widen scope. Ask one focused question only for real ambiguity.
 """
 
@@ -144,7 +143,9 @@ class BoundedSearchGuard:
             return self._violation(tool_name, "Glob pattern 为空")
         if len(pattern) > 300:
             return self._violation(tool_name, "Glob pattern 过长")
-        if _is_repository_wide_glob(pattern):
+        if Path(pattern).anchor or ".." in pattern.split("/"):
+            return self._violation(tool_name, "Glob 请用 path 指定授权目录，并使用相对匹配式")
+        if not re.search(r"[\w]", pattern):
             return self._violation(
                 tool_name,
                 "禁止通配整个项目；请根据类名、文件名、路由或已知子目录缩小范围",
@@ -188,24 +189,6 @@ class BoundedSearchGuard:
                 retryable=True,
             )
 
-        has_file_filter = bool(str(raw_input.get("glob") or "").strip()) or bool(
-            str(raw_input.get("type") or "").strip()
-        )
-        if not exact_file and not has_file_filter:
-            return self._violation(
-                tool_name,
-                "目录级 Grep 必须提供 glob 或 type 文件过滤器",
-                retryable=True,
-            )
-        if not exact_file and self._resolved_path(path_value or ".") == self.workspace:
-            pattern = _normalized_glob(str(raw_input.get("glob") or ""))
-            if not pattern or _is_repository_wide_glob(pattern) or re.fullmatch(
-                r"\*+(?:\.\{?[^/{}]+(?:,[^/{}]+)*\}?)?", pattern
-            ):
-                return self._violation(
-                    tool_name, "根目录 Grep 需限定已定位文件或候选子目录，不能仅按语言扫描全仓",
-                    retryable=True,
-                )
         return None
 
     def _is_allowed_path(self, value: str) -> bool:
@@ -239,12 +222,11 @@ def search_policy_repair_prompt(operation: str, reason: str) -> str:
         f"The host blocked your previous {operation} source-search call and accepted no results. "
         f"Sanitized reason: {reason}. Correct the smallest search call yourself; do not ask the "
         "user to search. Keep the verified page/file evidence and do not widen the scope. For a "
-        "directory Grep, include a language-appropriate glob or type plus head_limit 1..100; "
+        "directory Grep, use a distinctive clue plus head_limit 1..100; "
         "prefer an exact known file whenever possible. Continue the same investigation after the "
         "corrected read-only search. For a missing file, verify its name inside the original "
         "candidate scope; never guess a replacement directory or broaden the search. "
         "Read a user-supplied source file first, then follow its concrete dependencies. "
-        "For root Grep, target a known file/subdirectory, not only a language filter. "
         "For broad Glob, use a known filename/class in its candidate subtree. "
         "A blocked search is an internal tool issue, not a need for another path or screenshot."
     )
@@ -265,28 +247,6 @@ def _normalized_glob(pattern: str) -> str:
     while normalized.startswith("./"):
         normalized = normalized[2:]
     return re.sub(r"/+", "/", normalized)
-
-
-def _is_repository_wide_glob(pattern: str) -> bool:
-    compact = pattern.replace("/", "")
-    if not compact or not re.search(r"[A-Za-z0-9_\u0080-\uffff]", compact):
-        return True
-    if pattern in {"*", "**", "**/*", "*/**", "**/**"}:
-        return True
-    basename = pattern.rsplit("/", 1)[-1]
-    # Recursive extension-only scans (for example **/*.cs or **/*.{ts,tsx})
-    # are broad even though their suffix is syntactically specific. A literal directory segment
-    # such as **/CKClient/**/*.cs is different: it is a bounded candidate subtree surfaced by
-    # page/menu evidence, so listing filenames there is permitted while content Grep remains capped.
-    if "**" in pattern and re.fullmatch(r"\*+(?:\.\{?[^/{}]+(?:,[^/{}]+)*\}?)?", basename):
-        directory_segments = pattern.split("/")[:-1]
-        has_literal_directory = any(
-            segment not in {"", ".", "*", "**"}
-            and not re.search(r"[*?\[\]{}]", segment)
-            for segment in directory_segments
-        )
-        return not has_literal_directory
-    return False
 
 
 def _is_relative_to(candidate: Path, root: Path) -> bool:

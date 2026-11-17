@@ -52,6 +52,13 @@ class WorkflowEvidence(BaseModel):
 AnalysisText = Annotated[str, Field(max_length=240)]
 
 
+class CallSummary(BaseModel):
+    """一次模型调用可公开核对的工作摘要。"""
+    checked: str = Field(min_length=1, max_length=240, description="本次检查对象或沿用证据。")
+    finding: str = Field(min_length=1, max_length=240, description="本次发现或证据缺口。")
+    next_step: str = Field(min_length=1, max_length=240, description="下一步操作或结束原因。")
+
+
 class TaskObservation(BaseModel):
     """模型标注的信息来源；来源标签不等于宿主已核验证据。"""
 
@@ -157,6 +164,8 @@ class WorkflowAssessment(BaseModel):
 
 
 WORKFLOW_RULES = """## Advancement
+Always return call_summary in the user language: checked, finding, next_step. Cite concrete
+files, queries or image numbers; public facts only. Between tool batches briefly report findings.
 Return assessment: facts, reason, gaps, evidence (Read paths, query names, test IDs).
 Host verifies provenance, not causality. No private reasoning, raw rows, parameters or secrets.
 Close a named gap per action; revisit conflicts, stop repetition. Confidence grants no permission.
