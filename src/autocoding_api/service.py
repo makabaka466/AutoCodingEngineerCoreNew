@@ -214,7 +214,8 @@ class ApiService:
         decision = session.last_decision if session else None
         summary = None
         if decision:
-            summary = (format_incident_summary(decision) if task["workflow"] == "incident"
+            summary = (format_incident_summary(decision, session=session)
+                       if task["workflow"] == "incident"
                        else decision.message)
         # 不返回本机目录、运行原始日志、系统提示词、凭据或原始 SQL 行。
         result = None

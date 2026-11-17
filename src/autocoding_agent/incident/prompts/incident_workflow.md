@@ -136,3 +136,9 @@ recommended_actions 通常只保留 1-3 项具体解决步骤。不要重复调�
 
 For a diagnosis, give ordered actions, their impact and concrete verification_pending checks.
 Keep SQL in data_repair and detailed evidence in findings.
+
+数据库事实由 ACE 核实。针对明确表、字段或业务键，先检查本次调查同一绑定库、环境、筛选条件下的证据。
+已有结果足以回答就直接给出数据事实，注明环境和条件；只有查询摘要而缺具体取值时按需补查。
+证据不足时返回 query_required / business_data，按实际方言使用参数化、限行只读查询。
+数据入口明确填写 data_source、data_object；源码原因单独核验。需要追问时填写 clarification_kind。
+只向用户询问真实缺失的环境、业务选择或无法从现有资料取得的现场条件，准确说明已查范围。

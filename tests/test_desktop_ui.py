@@ -2258,3 +2258,52 @@ def test_many_approval_issues_keep_actions_visible(root: tk.Toplevel) -> None:
     assert client.approve_button.winfo_rooty() + client.approve_button.winfo_height() < (
         client.composer_panel.winfo_rooty()
     )
+
+def test_fold_link_stays_at_its_screen_position(root: tk.Toplevel) -> None:
+    from autocoding_agent.interfaces.chat_transcript import ChatTranscript
+
+    widget = tk.Text(root, wrap="word")
+    widget.pack(fill="both", expand=True)
+    root.geometry("740x480")
+    root.deiconify()
+    renderer = ChatTranscript(widget)
+    body = "核对标准字段并保存。\n" * 100
+    entries = [("assistant", f"回复 {i}\n" * 8) for i in range(16)]
+    entries.insert(8, ("metadata", body))
+    renderer.render(entries, details_open=True)
+    root.update()
+    key = renderer.key(8, "metadata", body)
+    pos = renderer._anchors[key]
+    widget.yview(pos)
+    widget.yview_scroll(-90, "pixels")
+    root.update()
+    before = widget.dlineinfo(pos)[1]
+    renderer.toggle(key)
+    root.update()
+    assert "100 行详情" in widget.get("1.0", "end")
+    after = widget.dlineinfo(renderer._anchors[key])
+    assert after and abs(after[1] - before) <= 2
+
+
+def test_history_measures_long_titles_once_per_width(root: tk.Toplevel, monkeypatch) -> None:
+    from tkinter import font
+
+    session = _session()
+    session.goal = "请核对字段、标准和异常日志。" * 220
+    client = DesktopClient(root, FakeApplication([session]))
+    client._recent_sessions = [session]
+    client._history_label_cache.clear()
+    real = font.Font.measure
+    lengths = []
+
+    def measure(instance, value, *args):
+        lengths.append(len(value))
+        return real(instance, value, *args)
+
+    monkeypatch.setattr(font.Font, "measure", measure)
+    client._filter_history()
+    assert 0 < len(lengths) < 20 and max(lengths) < len(session.goal)
+    assert client.sessions_list.get(0).endswith("…")
+    lengths.clear()
+    client._filter_history()
+    assert not lengths

@@ -234,9 +234,14 @@ def test_data_can_collect_evidence_without_page_but_cannot_query_another_source(
     )
     allowed, deferred = IncidentEngine._defer_unresolved_page_conflict(decision)
     assert not deferred and allowed.page is None
+    decision.queries[0].datasource_id = None
+    assert not IncidentEngine._defer_unresolved_page_conflict(decision, business_default="test")[1]
+    assert IncidentEngine._defer_unresolved_page_conflict(decision, business_default="other")[1]
     decision.queries[0].datasource_id = "production"
-    blocked, deferred = IncidentEngine._defer_unresolved_page_conflict(decision)
-    assert deferred and blocked.status == IncidentStatus.NEEDS_INPUT
+    for state in ("candidate", "confirmed"):
+        decision.entry.state = state
+        blocked, deferred = IncidentEngine._defer_unresolved_page_conflict(decision)
+        assert deferred and blocked.status == IncidentStatus.NEEDS_INPUT
 
 
 class ObservedEntryRuntime(ScriptedStructuredRuntime):
@@ -470,3 +475,61 @@ def test_missing_entry_does_not_implicitly_reuse_old_identity(tmp_path):
     assert result.status == IncidentStatus.NEEDS_INPUT
     assert result.entry.state == "candidate"
     assert not engine.get_session(result.session_id).can_remediate
+
+
+@pytest.mark.parametrize("scenario", ["query", "reuse", "environment", "repeated"])
+def test_database_fact_investigation_uses_bound_evidence(tmp_path, scenario):
+    from test_navigation_integration import configured
+
+    from autocoding_agent.database_models import QueryResult
+
+    context, _, access = configured(tmp_path)
+    source = context.database_binding.sources["ds-menu"]
+    calls = []
+
+    def execute(snapshot, query, stage, **kwargs):
+        assert snapshot.project == context.project and stage == "business_data"
+        assert query.datasource_id == source.datasource_id
+        calls.append(query.name)
+        return QueryResult(query_name=query.name, rows=[{"n": 9}], columns=["n"],
+                           returned_rows=1, source=source)
+
+    access.service.execute = execute
+    table = "B_TestItemStandard_GX"
+    target = entry("data", state="candidate", label=table, data_source=source.datasource_id,
+                   data_object=table, evidence=[], source_paths=[])
+    ask = IncidentDecision(status="needs_input", entry=target, message="需要确认表数据。",
+                           question="该组有几条标准？", clarification_kind="database_fact")
+    query = IncidentDecision(
+        status="query_required", entry=target, message="核对标准条数。",
+        query_stage="business_data",
+        queries=[DataQuery(name="group_count", datasource_id=source.datasource_id,
+                           purpose="按组统计", sql=f"SELECT COUNT(*) AS n FROM {table}")],
+    )
+    confirmed = target.model_copy(update={
+        "state": "confirmed", "source_paths": ["src/Order1.cs"],
+        "evidence": [WorkflowEvidence(kind="query", reference="group_count")],
+    })
+    done = IncidentDecision(status="completed", entry=confirmed, message="当前库返回 9 条标准。",
+                            diagnosis="代码原因待核实。", recommended_actions=["核对调用位置"])
+    options = {"query": [ask, query, done], "reuse": [query, ask, done],
+               "repeated": [ask, ask], "environment": [
+                   ask.model_copy(update={"clarification_kind": "environment",
+                                          "question": "需要核对哪一个生产环境？"})]}
+    runtime = ScriptedStructuredRuntime(options[scenario])
+    engine = IncidentEngine(runtime, JsonIncidentStore(tmp_path / "tasks"), None)
+    engine.database_access = access
+    result = engine.start(context.workspace, f"只查数据库表 {table}", project=context.project)
+    assert len(runtime.turns) == len(options[scenario])
+    if scenario == "environment":
+        assert result.status == IncidentStatus.NEEDS_INPUT and not calls
+    elif scenario == "repeated":
+        assert result.task_state == TaskState.PAUSED and not calls
+    else:
+        assert result.status == IncidentStatus.COMPLETED and calls == ["group_count"]
+        assert "已查询数据源：菜单（test）" in result.message
+        assert "源码关联待核验：src/Order1.cs" in result.message
+        saved = engine.get_session(result.session_id)
+        assert saved.investigation_entry.state == "confirmed"
+        assert saved.last_decision.assessment.result != "cause_confirmed"
+        assert len(saved.query_observations) == 1

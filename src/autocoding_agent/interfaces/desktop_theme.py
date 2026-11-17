@@ -140,6 +140,8 @@ class RoundedTextBlock(tk.Canvas):
             self.text.configure(xscrollcommand=self.scroll.set)
             self.scroll_window = self.create_window(14, 60, anchor="nw", window=self.scroll)
         self.text.bind("<MouseWheel>", self._scroll_chat)
+        self._layout_width = 0
+        self._height_pending = False
         self.bind("<Configure>", self._layout)
 
     def _scroll_chat(self, event):
@@ -148,10 +150,15 @@ class RoundedTextBlock(tk.Canvas):
 
     def _layout(self, _event=None):
         width = max(100, self.winfo_width())
-        self.itemconfigure(self.text_window, width=width - 28)
-        self.after_idle(self._fit_height)
+        if width != self._layout_width:
+            self._layout_width = width
+            self.itemconfigure(self.text_window, width=width - 28)
+            if not self._height_pending:
+                self._height_pending = True
+                self.after_idle(self._fit_height)
 
     def _fit_height(self):
+        self._height_pending = False
         if not self.winfo_exists():
             return
         rows = self.text.count("1.0", "end", "displaylines")

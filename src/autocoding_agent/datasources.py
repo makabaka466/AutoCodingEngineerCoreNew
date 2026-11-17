@@ -162,12 +162,7 @@ class DataSourceService:
             raise ValueError("任务的数据源授权或默认值已变化，请核对配置后新建任务")
         source_id = query.datasource_id
         if source_id is None:
-            source_id = (
-                snapshot.binding.menu_default if stage == "page_lookup"
-                else snapshot.binding.business_default
-            )
-            if source_id is None and len(snapshot.binding.source_ids) == 1:
-                source_id = snapshot.binding.source_ids[0]
+            source_id = snapshot.binding.default_for(stage)
         if source_id is None:
             raise ValueError("数据源不明确：请依据子项目和环境指定 datasource_id，必要时询问用户")
         if source_id not in snapshot.binding.source_ids:

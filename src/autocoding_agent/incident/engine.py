@@ -592,6 +592,7 @@ class IncidentEngine:
         consecutive_search_repair_rounds = 0
         page_correction_used = False
         entry_repair_used = False
+        data_fact_reviewed = False
         budget_closure_requested = False
         first_investigation_turn = True
         catalog_checked = False
@@ -784,7 +785,7 @@ class IncidentEngine:
                         decision.entry.conflicts = list(dict.fromkeys(conflicts))[:6]
                     elif decision.entry.kind != "page":
                         decision.page = None
-                    decision.entry = accept_entry(session, decision.entry)
+                    decision.entry = accept_entry(session, decision.entry, diagnose_data=True)
                 elif session.investigation_entry is not None:
                     # 一旦采用入口契约，遗漏字段不能绕过确认条件或复活旧页面。
                     decision.entry = accept_entry(session, session.investigation_entry.model_copy(
@@ -792,7 +793,11 @@ class IncidentEngine:
                             "本轮未明确确认历史入口是否仍适用，不能自动沿用。",
                         ]},
                     ))
-                decision, conflict_deferred = self._defer_unresolved_page_conflict(decision)
+                binding = session.database_binding
+                business_default = binding.binding.default_for("business_data") if binding else None
+                decision, conflict_deferred = self._defer_unresolved_page_conflict(
+                    decision, business_default=business_default,
+                )
                 entry_correction_requested = (
                     conflict_deferred and claimed_entry and decision.entry is not None
                     and decision.entry.kind != "unknown"
@@ -875,7 +880,18 @@ class IncidentEngine:
             # 可以重新获得一次有界纠正机会。
             consecutive_search_repair_rounds = 0
             supplied_assessment = decision.assessment is not None
-            decision.assessment = bind_assessment(session, decision, mode="inspect")
+            entry = decision.entry
+            decision.assessment = bind_assessment(
+                session, decision, mode="inspect",
+                business_source=entry.data_source if entry and entry.kind == "data" else None,
+            )
+            if entry and entry.kind == "data" and entry.state == "confirmed":
+                for item in entry.evidence:
+                    if (item.kind == "code" and not item.verified
+                            and len(decision.assessment.missing) < 6):
+                        gap = f"源码关联待核验：{item.reference}"
+                        if gap not in decision.assessment.missing:
+                            decision.assessment.missing.append(gap)
             if decision.data_repair is not None:
                 decision.data_repair = bind_data_repair(
                     session, decision.data_repair, self.database_access,
@@ -1025,6 +1041,39 @@ class IncidentEngine:
                     },
                 )
             )
+            if (decision.status == IncidentStatus.NEEDS_INPUT and not conflict_deferred
+                    and entry and entry.state != "excluded" and not entry.conflicts
+                    and (decision.clarification_kind == "database_fact" or (
+                        decision.clarification_kind is None and entry.kind == "data"
+                        and entry.data_object and entry.data_source
+                    ))
+                    and (entry.kind == "data" or entry.state == "confirmed")
+                    and self.database_access.available(session)):
+                source_id = entry.data_source or business_default
+                if binding and source_id in binding.binding.source_ids:
+                    question = decision.question or decision.message
+                    if data_fact_reviewed:
+                        return self._pause_at_boundary(session, command, message=(
+                            f"已定位待核实的数据问题（数据源 {source_id}）：{question}\n"
+                            "本次自动取证未取得足够证据，可继续调查。"
+                        ))
+                    data_fact_reviewed = True
+                    pending_message = (
+                        f"核实绑定数据源 {source_id} 的数据库事实：{question}。"
+                        "先复用本周期同一环境、相同条件下的已核实结果。仅有查询名称或行数不足以回答具体取值。"
+                        "若仍有业务查询预算，请按需提交 query_required/business_data，"
+                        "明确数据源并使用有界只读查询。预算已耗尽时给出部分结论和证据缺口。"
+                        "若缺少现场条件、环境或业务选择，请用 "
+                        "environment、business_choice 或 other "
+                        "标记 clarification_kind，并仅询问该项。"
+                    )
+                    session.events.append(AgentEvent(
+                        type=EventType.POLICY_REPAIR_REQUESTED, message="由 ACE 核实数据库事实。",
+                        command_id=command.id, correlation_id=run.id,
+                        data={"policy": "database_fact", "datasource_id": source_id},
+                    ))
+                    self.sessions.save(session)
+                    continue
             if entry_correction_requested:
                 checked = decision.entry
                 if entry_repair_used:
@@ -1140,7 +1189,7 @@ class IncidentEngine:
                     content=(
                         "Agent 已形成最小只读查询计划，正在自动核对数据库证据。"
                         if decision.status == IncidentStatus.QUERY_REQUIRED
-                        else format_incident_summary(decision)
+                        else format_incident_summary(decision, session=session)
                     ),
                 )
             )
@@ -1996,7 +2045,7 @@ class IncidentEngine:
 
     @staticmethod
     def _defer_unresolved_page_conflict(
-        decision: IncidentDecision,
+        decision: IncidentDecision, *, business_default: str | None = None,
     ) -> tuple[IncidentDecision, bool]:
         """缺少已验证页面或模型声明冲突时转为追问，不带着旧绑定执行 SQL。"""
 
@@ -2010,13 +2059,20 @@ class IncidentEngine:
         entry = decision.entry
         if entry is not None:
             # 数据入口先按明确的库/对象收集查询证据，不强制查找不存在的页面。
+            source_matches = all(
+                (query.datasource_id or business_default) == entry.data_source
+                for query in decision.queries
+            )
             collecting_data = (
                 decision.status == IncidentStatus.QUERY_REQUIRED and entry.kind == "data"
                 and entry.state == "candidate" and entry.data_source and entry.data_object
                 and not entry.conflicts
-                and all(query.datasource_id == entry.data_source for query in decision.queries)
+                and source_matches
             )
-            if entry.state == "confirmed" or collecting_data:
+            wrong_source = (entry.kind == "data"
+                            and decision.status == IncidentStatus.QUERY_REQUIRED
+                            and not source_matches)
+            if (entry.state == "confirmed" and not wrong_source) or collecting_data:
                 return decision, False
             return IncidentDecision(
                 status=IncidentStatus.NEEDS_INPUT, entry=entry,
@@ -2172,7 +2228,7 @@ class IncidentEngine:
             completion_kind=decision.completion_kind,
             task_state=session.task_state,
             cycle_number=session.cycle_number,
-            message=format_incident_summary(decision),
+            message=format_incident_summary(decision, session=session),
             question=decision.question,
             entry=session.investigation_entry,
             page=decision.page,
@@ -2289,13 +2345,22 @@ Return call_summary (checked, finding, next_step) in the user language.
 Return assessment with public reason and gaps; never upgrade previous certainty."""
 
 
-def format_incident_summary(decision: IncidentDecision, *, compact: bool = False) -> str:
+def format_incident_summary(decision: IncidentDecision, *, compact: bool = False,
+                            session: IncidentSession | None = None) -> str:
     """按用户要求的调查深度生成完成消息，避免页面定位任务被扩成完整诊断。"""
 
     prefix = entry_text(decision.entry)
     prefix = prefix + "\n\n" if prefix else ""
+    sources = {}
+    if session is not None:
+        for row in session.query_observations[session.cycle_query_observation_start:]:
+            if (row.stage == "business_data" and row.source
+                    and row.status == QueryObservationStatus.SUCCEEDED):
+                source = row.source
+                sources[source.datasource_id] = f"{source.name}（{source.environment}）"
+    scope = "已查询数据源：" + "、".join(sources.values()) + "\n" if sources else ""
     if decision.status != IncidentStatus.COMPLETED:
-        return prefix + (clarification_text(decision)
+        return scope + prefix + (clarification_text(decision)
                          if decision.status == IncidentStatus.NEEDS_INPUT else decision.message)
     if decision.completion_kind == IncidentCompletionKind.PAGE_LOCATION:
         page = decision.page
@@ -2317,10 +2382,10 @@ def format_incident_summary(decision: IncidentDecision, *, compact: bool = False
     if decision.diagnosis and decision.diagnosis.strip() != decision.message.strip():
         summary += f"\n原因：{decision.diagnosis}"
     if decision.assessment and decision.assessment.missing:
-        summary += "\n待确认：" + "；".join(decision.assessment.missing)
+        summary += "\n证据缺口：" + "；".join(decision.assessment.missing)
     if not compact and decision.assessment and decision.assessment.causal_chain:
         summary += "\n因果链：" + " → ".join(decision.assessment.causal_chain)
-    rendered = ("" if compact else prefix) + f"异常总结\n{summary}\n\n解决方案\n{actions}"
+    rendered = scope + ("" if compact else prefix) + f"异常总结\n{summary}\n\n解决方案\n{actions}"
     if decision.impact:
         rendered += "\n\n影响范围\n" + decision.impact
     if decision.assessment and decision.assessment.verification_pending:

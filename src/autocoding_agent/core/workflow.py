@@ -228,7 +228,8 @@ def cycle_events(session: Any) -> list[Any]:
     return session.events[start:]
 
 
-def bind_assessment(session: Any, decision: Any, *, mode: str) -> WorkflowAssessment:
+def bind_assessment(session: Any, decision: Any, *, mode: str,
+                    business_source: str | None = None) -> WorkflowAssessment:
     """核对证据出处并保守规范化完成等级，语义充分性仍由模型判断。"""
     supplied = decision.assessment
     assessment = (
@@ -256,6 +257,11 @@ def bind_assessment(session: Any, decision: Any, *, mode: str) -> WorkflowAssess
                     and row.get("status", "succeeded") == "succeeded"
                     # 菜单目录只提供导航线索；新获取或缓存命中都不是业务根因证据。
                     and row.get("catalog_info") is None
+                    and (business_source is None or (
+                        data.get("query_stage") in {None, "business_data"}
+                        and ((row.get("source") or {}).get("datasource_id")
+                             or row.get("datasource_id")) == business_source
+                    ))
                     for row in data.get("queries", [])
                 )
             elif item.kind == "code":
@@ -440,7 +446,12 @@ def evidence_catalog(session: Any) -> str:
                 )
         elif event.type.value == "database_queries_executed":
             references.extend(
-                {"kind": "query", "reference": row.get("query_name", row.get("name"))}
+                {"kind": "query", "reference": row.get("query_name", row.get("name")),
+                 "source": ((row.get("source") or {}).get("datasource_id")
+                            or row.get("datasource_id")),
+                 "environment": (row.get("source") or {}).get("environment"),
+                 "stage": data.get("query_stage"), "purpose": str(row.get("purpose") or "")[:120],
+                 "rows": row.get("returned_rows"), "truncated": row.get("truncated")}
                 for row in data.get("queries", [])
                 if row.get("catalog_info") is None
             )

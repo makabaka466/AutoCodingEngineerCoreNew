@@ -97,6 +97,7 @@ class ChatTranscript:
         self.image_tiles: list[AttachmentTile] = []
         self.expanded: set[str] = set()
         self.links: list[str] = []
+        self._link_commands: list[str] = []
         self.details_open = False
         self.blocks: list[RoundedTextBlock] = []
         self.analysis_sections: dict[str, AnalysisSection] = {}
@@ -117,13 +118,27 @@ class ChatTranscript:
                            "spacing1": 5, "spacing3": 5},
         }.items():
             widget.tag_configure(name, **options)
-        widget.bind("<Configure>", lambda _: self.resize(), add="+")
+        self._width = 0
+        self._resize_job = None
+        self._latest_job = None
+        self._anchors: dict[str, str] = {}
+        self._collapsed_details: set[str] = set()
+        self._default_details: set[str] = set()
+        widget.bind("<Configure>", self._schedule_resize, add="+")
         widget.tag_configure("chat_source", elide=True)
         self.resize()
+
+    def _schedule_resize(self, event) -> None:
+        if max(300, event.width) != self._width and self._resize_job is None:
+            self._resize_job = self.widget.after_idle(self.resize)
 
     def resize(self) -> None:
         """正文随可用区域展开，用户气泡保持右对齐；不更改原文或选择复制。"""
         width = max(300, self.widget.winfo_width())
+        self._resize_job = None
+        if width == self._width:
+            return
+        self._width = width
         margin = 12
         for tag in ("assistant_message", "assistant_name", "system_message", "system_name",
                     "metadata", "chat_heading", "chat_subheading"):
@@ -142,6 +157,8 @@ class ChatTranscript:
 
     def _insert_block(self, content: str, *, code: bool = False) -> None:
         block = RoundedTextBlock(self.widget, content, code=code)
+        available = max(160, self._width - 64)
+        block.configure(width=available if code else min(650, available))
         self.blocks.append(block)
         start = self.widget.index("end-1c")
         self.widget.window_create("end", window=block)
@@ -161,32 +178,80 @@ class ChatTranscript:
         self.links.append(tag)
         self.widget.tag_configure(tag, foreground=COLORS["subtle"],
                                   font=("Microsoft YaHei UI", 9), spacing1=6, spacing3=8)
-        self.widget.tag_bind(tag, "<Button-1>", lambda _event: callback())
-        self.widget.tag_bind(tag, "<Enter>", lambda _event: (
+        click = self.widget.tag_bind(tag, "<Button-1>", lambda _event: callback())
+        enter = self.widget.tag_bind(tag, "<Enter>", lambda _event: (
             self.widget.configure(cursor="hand2"),
             self.widget.tag_configure(tag, foreground=COLORS["text"])))
-        self.widget.tag_bind(tag, "<Leave>", lambda _event: (
+        leave = self.widget.tag_bind(tag, "<Leave>", lambda _event: (
             self.widget.configure(cursor="xterm"),
             self.widget.tag_configure(tag, foreground=COLORS["subtle"])))
+        self._link_commands.extend((click, enter, leave))
         self.widget.insert("end", label, tag)
 
     def _copy(self, content: str) -> None:
         self.widget.clipboard_clear()
         self.widget.clipboard_append(content)
 
+    def reading_anchor(self, key: str | None = None):
+        """保存可识别的消息或折叠链接及其屏幕坐标。"""
+        widget = self.widget
+        if key in self._anchors:
+            info = widget.dlineinfo(self._anchors[key])
+            if info:
+                return key, 0, 0, info[1]
+        top = widget.index("@0,0")
+        # 外层异常详情切换可能增删整条系统记录，以稳定的消息身份定位。
+        messages = [(k, pos) for k, pos in self._anchors.items() if k.startswith("message:")]
+        for k, pos in messages:
+            if widget.compare(pos, ">=", top):
+                info = widget.dlineinfo(pos)
+                if info:
+                    return k, 0, 0, info[1]
+                break
+        for k, pos in reversed(messages):
+            if widget.compare(pos, "<=", top):
+                line, col = map(int, top.split("."))
+                info = widget.dlineinfo(top)
+                return k, line - int(pos.split(".")[0]), col, info[1] if info else 0
+        return None
+
+    def restore_anchor(self, anchor) -> None:
+        if anchor is None or anchor[0] not in self._anchors:
+            return
+        key, offset, column, screen_y = anchor
+        widget = self.widget
+        pos = self._anchors[key]
+        if offset or column:
+            pos = widget.index(f"{int(pos.split('.')[0]) + offset}.{column}")
+        widget.update_idletasks()  # 内嵌气泡尺寸确定后再恢复像素偏移。
+        widget.yview(pos)
+        info = widget.dlineinfo(pos)
+        if info:
+            widget.yview_scroll(info[1] - screen_y, "pixels")
+
     def toggle(self, key: str) -> None:
-        self.expanded.symmetric_difference_update({key})
+        anchor = self.reading_anchor(key)
+        if key in self._default_details:
+            self._collapsed_details.symmetric_difference_update({key})
+        else:
+            self.expanded.symmetric_difference_update({key})
         self.render(self.entries, details_open=self.details_open, preserve_scroll=True)
+        self.restore_anchor(anchor)
 
     def expand_all(self) -> None:
+        anchor = self.reading_anchor()
+        self._collapsed_details.clear()
         self.expanded = {
             self.key(i, role, content) for i, (role, content) in enumerate(self.entries)
         }
         self.render(self.entries, details_open=self.details_open, preserve_scroll=True)
+        self.restore_anchor(anchor)
 
     def collapse_all(self) -> None:
+        anchor = self.reading_anchor()
         self.expanded.clear()
         self.render(self.entries, details_open=False, preserve_scroll=True)
+        self.restore_anchor(anchor)
 
     def _more_analysis(self, key: str) -> None:
         self.analysis_limits[key] = self.analysis_limits.get(key, 50) + 50
@@ -198,6 +263,7 @@ class ChatTranscript:
             return
         widget = self.widget
         opened = "analysis:" + key in self.expanded
+        self._anchors["analysis:" + key] = widget.index("end-1c")
         self._link(
             f"{'收起' if opened else '展开'}分析过程 · {len(section.steps)} 项",
             lambda: self.toggle("analysis:" + key),
@@ -238,6 +304,7 @@ class ChatTranscript:
             warning = any(step.failed for step in steps)
             widget.insert("end", label + "  ",
                           ("chat_bold", "chat_warning") if warning else "chat_bold")
+            self._anchors[detail_key] = widget.index("end-1c")
             self._link("收起" if detail_open else "详情", lambda k=detail_key: self.toggle(k))
             widget.insert("end", "\n")
             widget.insert("end", steps[-1].summary + "\n", "assistant_message")
@@ -249,9 +316,14 @@ class ChatTranscript:
 
     def render(self, entries: list[tuple[str, str]], *, details_open: bool = False,
                preserve_scroll: bool = False) -> None:
+        if self._latest_job is not None:
+            self.widget.after_cancel(self._latest_job)
+            self._latest_job = None
         position = self.widget.yview()[0]
         follow_bottom = self.widget.yview()[1] >= .98
         self.entries = entries
+        if not details_open:
+            self._collapsed_details.clear()
         self.details_open = details_open
         self.analysis_limits = {key: value for key, value in self.analysis_limits.items()
                                 if key in self.analysis_sections}
@@ -271,12 +343,18 @@ class ChatTranscript:
         for tag in self.links:
             widget.tag_delete(tag)
         self.links.clear()
+        for command in self._link_commands:
+            widget.deletecommand(command)
+        self._link_commands.clear()
         for tag in ("assistant_message", "system_message", "metadata"):
             widget.tag_configure(tag, spacing1=1, spacing3=3)
         names = {"user": "你", "assistant": "ACE", "system": "系统记录",
                  "metadata": "调查与验证详情"}
         latest = max((i for i, item in enumerate(entries) if item[0] == "assistant"), default=-1)
         widget.mark_set("latest_reply", "1.0")
+        self._anchors.clear()
+        self._default_details.clear()
+        ordinals = {"user": 0, "assistant": 0}
         for index, (role, content) in enumerate(entries):
             if role == "analysis":
                 self._render_analysis(content)
@@ -285,7 +363,14 @@ class ChatTranscript:
             key = self.key(index, role, content)
             long = role != "user" and (len(content) > 1200 or len(content.splitlines()) > 24)
             foldable = long or role in {"metadata", "system"}
-            opened = key in self.expanded or (details_open and role in {"metadata", "system"})
+            if details_open and role in {"metadata", "system"}:
+                self._default_details.add(key)
+            opened = (key in self.expanded or key in self._default_details) and (
+                key not in self._collapsed_details
+            )
+            if role in ordinals:
+                self._anchors[f"message:{role}:{ordinals[role]}"] = widget.index("end-1c")
+                ordinals[role] += 1
             if index == latest:
                 widget.mark_set("latest_reply", widget.index("end-1c"))
                 widget.mark_gravity("latest_reply", "left")
@@ -295,6 +380,7 @@ class ChatTranscript:
             if index < len(self.timestamps):
                 widget.insert("end", self.timestamps[index] + "    ", "chat_muted")
             if foldable:
+                self._anchors[key] = widget.index("end-1c")
                 self._link("收起详情" if opened else "展开全文", lambda key=key: self.toggle(key))
                 widget.insert("end", "   ·   ", "chat_muted")
             self._link("复制全文", lambda content=content: self._copy(content))
@@ -338,7 +424,6 @@ class ChatTranscript:
         else:
             if latest >= 0:
                 widget.yview("latest_reply")
-                widget.after_idle(lambda: widget.yview("latest_reply") if widget.winfo_exists()
-                                  else None)
+                self._latest_job = widget.after_idle(widget.yview, "latest_reply")
             else:
                 widget.see("end")

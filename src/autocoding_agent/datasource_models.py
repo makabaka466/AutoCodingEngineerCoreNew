@@ -29,6 +29,12 @@ class ProjectDataSources(BaseModel):
     menu_default: str | None = Field(default=None, description="菜单查询默认数据源")
     business_default: str | None = Field(default=None, description="业务查询默认数据源")
 
+    def default_for(self, stage: str | None) -> str | None:
+        default = self.menu_default if stage == "page_lookup" else self.business_default
+        if default is None and len(self.source_ids) == 1:
+            return self.source_ids[0]
+        return default
+
     @model_validator(mode="after")
     def check_defaults(self):
         if len(set(self.source_ids)) != len(self.source_ids):

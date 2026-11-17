@@ -74,7 +74,8 @@ Data-only results must not claim a confirmed code cause. No private reasoning or
 """
 
 
-def accept_entry(session: Any, entry: InvestigationEntry) -> InvestigationEntry:
+def accept_entry(session: Any, entry: InvestigationEntry, *,
+                 diagnose_data: bool = False) -> InvestigationEntry:
     """复用阶段证据核验；只持久化摘要，不存 SQL 结果。历史入口不自动背书。"""
     checked = entry.model_copy(deep=True)
     checked.excluded_event_count = len(session.events) if checked.state == "excluded" else 0
@@ -113,7 +114,10 @@ def accept_entry(session: Any, entry: InvestigationEntry) -> InvestigationEntry:
         phase=ProgressPhase.ANALYZING_REQUEST, reason=checked.reason, evidence=checked.evidence
     )
     proxy = SimpleNamespace(assessment=assessment, status=SimpleNamespace(value="needs_input"))
-    checked.evidence = bind_assessment(session, proxy, mode="inspect").evidence
+    data_only = diagnose_data and checked.kind == "data"
+    checked.evidence = bind_assessment(
+        session, proxy, mode="inspect", business_source=checked.data_source if data_only else None,
+    ).evidence
     # 改名不能绕过已排除的路径；恢复必须显式声明，并引用排除后取得的新证据。
     for excluded in exclusions if checked.state != "excluded" else []:
         if not _same_target(excluded, checked):
@@ -133,6 +137,9 @@ def accept_entry(session: Any, entry: InvestigationEntry) -> InvestigationEntry:
             if item.kind == "code" and item.verified
         }
         has_identity = bool(checked.evidence) and all(item.verified for item in checked.evidence)
+        if data_only:
+            # 数据对象由同源业务查询核验。附带的源码线索单独保留其核验状态。
+            has_identity = all(item.verified for item in checked.evidence if item.kind != "code")
         if checked.kind == "data":
             has_identity = (
                 has_identity

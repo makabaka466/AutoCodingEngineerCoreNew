@@ -648,6 +648,13 @@ class DesktopClient:
         self._approval_content_key = None
         self._review_split = 0.5
         self._review_layout = None
+        self._responsive_width = 0
+        self._layout_pending = False
+        self._sash_dragging = False
+        self._sash_restore_pending = False
+        self._history_label_cache = {}
+        self._history_metrics = None
+        self._history_resize_job = None
         self._displayed_conversation = None
         self._conversation_positions: dict[tuple, float] = {}
         self.history_search_var = tk.StringVar()
@@ -856,6 +863,7 @@ class DesktopClient:
             activestyle="none", exportselection=False, selectborderwidth=0, width=1)
         self.sessions_list.grid(row=0, column=0, sticky="nsew")
         self.sessions_list.bind("<<ListboxSelect>>", self._select_session)
+        self.sessions_list.bind("<Configure>", self._resize_history)
         scroll = ttk.Scrollbar(sessions_frame, orient="vertical", command=self.sessions_list.yview)
         scroll.grid(row=0, column=1, sticky="ns")
         self.sessions_list.configure(yscrollcommand=scroll.set)
@@ -921,10 +929,11 @@ class DesktopClient:
 
         self.conversation_panes = tk.PanedWindow(
             main, orient="horizontal", sashwidth=8, sashrelief="flat",
-            borderwidth=0, bg=COLORS["border_soft"], opaqueresize=True,
+            borderwidth=0, bg=COLORS["border_soft"], opaqueresize=False,
         )
         self.conversation_panes.grid(row=1, column=0, sticky="nsew", padx=22)
         self.conversation_panes.bind("<Configure>", self._restore_review_split)
+        self.conversation_panes.bind("<ButtonPress-1>", self._begin_review_drag)
         self.conversation_panes.bind("<ButtonRelease-1>", self._remember_review_split)
         self.transcript_panel = GlassPanel(
             self.conversation_panes,
@@ -1602,6 +1611,10 @@ class DesktopClient:
 
         if sessions is not None:
             self._recent_sessions = sessions
+            ids = {item.id for item in sessions}
+            self._history_label_cache = {
+                key: value for key, value in self._history_label_cache.items() if key in ids
+            }
         sessions = self._recent_sessions
         today = datetime.now().astimezone().date()
         completed = sum(
@@ -1725,8 +1738,16 @@ class DesktopClient:
         self._review_reading = not self._review_reading
         self._update_responsive_layout()
 
+    def _begin_review_drag(self, event) -> None:
+        self._sash_dragging = bool(self.conversation_panes.identify(event.x, event.y))
+
     def _remember_review_split(self, _event=None) -> None:
         """只记录双栏状态的比例，折叠或窄窗口不会覆盖用户的宽度选择。"""
+        if _event is not None:
+            # Tk 在控件绑定之后才把拖动预览应用到实际面板。
+            self.root.after_idle(self._remember_review_split)
+            return
+        self._sash_dragging = False
         if len(self.conversation_panes.panes()) == 2:
             width = self.conversation_panes.winfo_width()
             if width > 1:
@@ -1734,21 +1755,31 @@ class DesktopClient:
 
     def _restore_review_split(self, _event=None) -> None:
         if _event is not None:
-            self.root.after_idle(self._restore_review_split)
+            if not self._sash_dragging and not self._sash_restore_pending:
+                self._sash_restore_pending = True
+                self.root.after_idle(self._restore_review_split)
             return
-        if len(self.conversation_panes.panes()) != 2:
+        self._sash_restore_pending = False
+        if self._sash_dragging or len(self.conversation_panes.panes()) != 2:
             return
         width = self.conversation_panes.winfo_width()
         if width > 560:
             position = max(280, min(width - 288, round(width * self._review_split)))
-            self.conversation_panes.sash_place(0, position, 0)
+            if self.conversation_panes.sash_coord(0)[0] != position:
+                self.conversation_panes.sash_place(0, position, 0)
 
     def _update_responsive_layout(self, event=None) -> None:
-        if event is not None and event.widget is not self.root:
+        if event is not None:
+            if event.widget is self.root and event.width != self._responsive_width:
+                if not self._layout_pending:
+                    self._layout_pending = True
+                    self.root.after_idle(self._update_responsive_layout)
             return
+        self._layout_pending = False
         if not hasattr(self, "overview_panel"):
             return
         width = self.root.winfo_width()
+        self._responsive_width = width
         hidden = self._history_hidden if self._history_hidden is not None else width < 1100
         if hidden:
             self.sidebar_panel.grid_remove()
@@ -1787,8 +1818,6 @@ class DesktopClient:
                 self.conversation_panes.add(pane, minsize=280, stretch="always")
             self._review_layout = desired
             self.root.after_idle(self._restore_review_split)
-        if hasattr(self, "_chat_renderer"):
-            self._chat_renderer.resize()
 
     def _resize_prompt(self, _event=None) -> None:
         # 只改变输入展示尺寸；保留正文、快捷键和发送协议。
@@ -1823,7 +1852,17 @@ class DesktopClient:
         finally:
             menu.grab_release()
 
+    def _resize_history(self, event) -> None:
+        width = max(20, event.width - 8)
+        if self._history_metrics and width == self._history_metrics[0]:
+            return
+        if self._history_resize_job is None:
+            self._history_resize_job = self.sessions_list.after_idle(self._filter_history)
+
     def _filter_history(self) -> None:
+        if self._history_resize_job is not None:
+            self.sessions_list.after_cancel(self._history_resize_job)
+            self._history_resize_job = None
         if not hasattr(self, "sessions_list"):
             return
         query = self.history_search_var.get().strip().casefold()
@@ -1836,13 +1875,34 @@ class DesktopClient:
         self.sessions_list.delete(0, "end")
         self._session_ids = [item.id for item in sessions]
         title_font = tkfont.Font(font=self.sessions_list.cget("font"))
+        width = max(20, self.sessions_list.winfo_width() - 8)
+        if self.sessions_list.winfo_width() <= 1:
+            width = 230
+        metrics = (width, tuple(title_font.actual().items()), title_font.metrics("linespace"))
+        if self._history_metrics != metrics:
+            self._history_metrics = metrics
+            self._history_label_cache.clear()
         for session in sessions:
-            title = " ".join((session.goal if isinstance(session, AgentSession)
-                              else session.problem).split()) or "未命名对话"
-            label = title
-            while title_font.measure(label) > 230 and len(label) > 1:
-                label = label[:-2] + "…"
-            self.sessions_list.insert("end", label)
+            raw = session.goal if isinstance(session, AgentSession) else session.problem
+            cached = self._history_label_cache.get(session.id)
+            if cached is None or cached[0] != raw:
+                title = " ".join(raw.split()) or "未命名对话"
+                label = title
+                # 从短前缀探测，超长需求只测量接近可视宽度的文本。
+                high = min(32, len(title))
+                while high < len(title) and title_font.measure(title[:high] + "…") <= width:
+                    high = min(2 * high, len(title))
+                if high < len(title) or title_font.measure(title) > width:
+                    low = 0
+                    while low < high:
+                        mid = (low + high + 1) // 2
+                        if title_font.measure(title[:mid] + "…") <= width:
+                            low = mid
+                        else:
+                            high = mid - 1
+                    label = title[:low] + "…"
+                self._history_label_cache[session.id] = raw, label
+            self.sessions_list.insert("end", self._history_label_cache[session.id][1])
         if self.session_id in self._session_ids:
             index = self._session_ids.index(self.session_id)
             self.sessions_list.selection_set(index)
@@ -2137,7 +2197,7 @@ class DesktopClient:
         self._sync_controls()
         self._present_session_state(session)
 
-    def _render_incident_session(self, session: IncidentSession) -> None:
+    def _render_incident_session(self, session: IncidentSession, *, refresh_analysis=True) -> None:
         self._displayed_incident = session
         self.incident_actions.grid()
         self.transcript.tag_configure("assistant_message", spacing1=2, spacing3=3)
@@ -2166,13 +2226,16 @@ class DesktopClient:
                 images[len(entries)] = item.attachments
             if (item is final_assistant and session.last_decision
                     and session.status == IncidentStatus.COMPLETED):
-                content = format_incident_summary(session.last_decision, compact=True)
+                content = format_incident_summary(
+                    session.last_decision, compact=True, session=session,
+                )
             entries.append((role, content))
             message_times.append(item.created_at)
 
         decision = session.last_decision
         if final_assistant is None and decision and session.status == IncidentStatus.COMPLETED:
-            entries.append(("assistant", format_incident_summary(decision, compact=True)))
+            content = format_incident_summary(decision, compact=True, session=session)
+            entries.append(("assistant", content))
         if decision is not None and self._show_incident_details:
             details: list[str] = []
             if session.task_analysis and not (decision.assessment and decision.assessment.analysis):
@@ -2227,7 +2290,8 @@ class DesktopClient:
             if details:
                 entries.append(("metadata", "\n".join(details)))
 
-        self._restore_analysis(session)
+        if refresh_analysis:
+            self._restore_analysis(session)
         self._replace_transcript(entries, message_times=message_times, attachments=images)
         self._restore_session_project(session)
         title = " ".join(session.problem.split()) or "未命名异常"
@@ -3080,8 +3144,13 @@ class DesktopClient:
     def _toggle_incident_details(self) -> None:
         if self._busy or self.flow != FlowKind.INCIDENT or not self.session_id:
             return
+        session = self._displayed_incident
+        if session is None or session.id != self.session_id:
+            return
+        anchor = self._chat_renderer.reading_anchor()
         self._show_incident_details = not self._show_incident_details
-        self._render_incident_session(self.incident_application.get_session(self.session_id))
+        self._render_incident_session(session, refresh_analysis=False)
+        self._chat_renderer.restore_anchor(anchor)
 
     @timed_ui
     def _start_incident_remediation(self) -> None:

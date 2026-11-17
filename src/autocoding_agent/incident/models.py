@@ -186,6 +186,12 @@ class IncidentDecision(BaseModel):
         )
     )
     question: NonEmptyText | None = None
+    clarification_kind: Literal[
+        "database_fact", "environment", "business_choice", "other"
+    ] | None = Field(
+        default=None, description="追问原因。可从绑定库核实的表数据或结构用 database_fact，"
+        "缺少目标环境用 environment，业务意图或规则选择用 business_choice。",
+    )
     page: LocatedPage | None = Field(
         default=None,
         description=(
