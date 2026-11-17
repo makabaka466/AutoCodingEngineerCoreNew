@@ -7,7 +7,9 @@ import re
 import tkinter as tk
 import unicodedata
 
+from autocoding_agent.core.models import MessageAttachment
 from autocoding_agent.interfaces.analysis_trace import AnalysisSection
+from autocoding_agent.interfaces.attachment_preview import AttachmentTile
 from autocoding_agent.interfaces.desktop_theme import COLORS, RoundedTextBlock
 
 _SECTION_TITLES = {
@@ -91,6 +93,8 @@ class ChatTranscript:
         self.widget = widget
         self.entries: list[tuple[str, str]] = []
         self.timestamps: list[str] = []
+        self.attachments: dict[int, list[MessageAttachment]] = {}
+        self.image_tiles: list[AttachmentTile] = []
         self.expanded: set[str] = set()
         self.links: list[str] = []
         self.details_open = False
@@ -260,6 +264,9 @@ class ChatTranscript:
         for block in self.blocks:
             block.destroy()
         self.blocks.clear()
+        for tile in self.image_tiles:
+            tile.destroy()
+        self.image_tiles.clear()
         widget.delete("1.0", "end")
         for tag in self.links:
             widget.tag_delete(tag)
@@ -307,6 +314,15 @@ class ChatTranscript:
             if role == "user":
                 widget.insert("end", shown + "\n", (base, "chat_source"))
                 self._insert_block(shown)
+                if index in self.attachments:
+                    start = widget.index("end-1c")
+                    for number, item in enumerate(self.attachments[index], 1):
+                        tile = AttachmentTile(widget, item, number)
+                        self.image_tiles.append(tile)
+                        widget.window_create("end", window=tile, padx=2)
+                        widget.insert("end", " ", "user_block")
+                    widget.insert("end", "\n", "user_block")
+                    widget.tag_add("user_block", start, "end-1c")
             else:
                 insert_markdown(widget, shown, base,
                                 lambda code: self._insert_block(code, code=True))

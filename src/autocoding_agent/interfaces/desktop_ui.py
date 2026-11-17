@@ -15,7 +15,7 @@ from collections.abc import Callable
 from datetime import datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
-from tkinter import messagebox, simpledialog, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from autocoding_agent.application import AgentApplication, build_application
 from autocoding_agent.core.data_repair import data_repair_text
@@ -61,6 +61,7 @@ from autocoding_agent.incident_attachments import (
     IncidentAttachmentStore,
 )
 from autocoding_agent.interfaces.analysis_trace import AnalysisTrace
+from autocoding_agent.interfaces.attachment_preview import TILE_WIDTH, AttachmentTile
 from autocoding_agent.interfaces.chat_transcript import ChatTranscript, insert_markdown
 from autocoding_agent.interfaces.desktop_diagnostics import monitor_mainloop, timed_ui
 from autocoding_agent.interfaces.desktop_theme import COLORS, IconButton, Tooltip
@@ -665,6 +666,7 @@ class DesktopClient:
         self._analysis_next_poll = 0.0
         self._analysis_dirty = False
         self._transcript_entries: list[tuple[str, str]] = []
+        self._transcript_attachments: dict[int, list[MessageAttachment]] = {}
         self._transcript_times: list[datetime | None] = []
         self._transcript_timestamps: list[str] = []
         self._close_after_stop = False
@@ -1358,6 +1360,9 @@ class DesktopClient:
             borderwidth=0,
             cursor="hand2",
         ).grid(row=0, column=1, padx=(4, 8))
+        self.attachment_tiles = tk.Frame(self.attachment_frame, bg=COLORS["input"])
+        self.attachment_tiles.grid(row=1, column=0, columnspan=2, sticky="ew")
+        self.attachment_tiles.bind("<Configure>", self._layout_attachment_tiles)
         self.attachment_frame.grid_remove()
 
         action_row = tk.Frame(self.composer_frame, bg=COLORS["input"])
@@ -1802,6 +1807,8 @@ class DesktopClient:
     def _show_context_menu(self) -> None:
         menu = tk.Menu(self.root, tearoff=False)
         if self.flow == FlowKind.INCIDENT:
+            menu.add_command(label="添加图片…", command=self._choose_images,
+                             state="disabled" if self._busy else "normal")
             menu.add_command(label="粘贴截图", command=lambda: self._on_prompt_paste(None),
                              state="disabled" if self._busy else "normal")
             menu.add_separator()
@@ -2137,6 +2144,7 @@ class DesktopClient:
         self._current_task_state = session.task_state
         entries: list[tuple[str, str]] = []
         message_times: list[datetime] = []
+        images: dict[int, list[MessageAttachment]] = {}
         self.incident_details_button.grid()
         self.incident_details_button.configure(
             text="收起诊断详情" if self._show_incident_details else "查看诊断详情"
@@ -2153,7 +2161,9 @@ class DesktopClient:
                 MessageRole.ASSISTANT: "assistant",
                 MessageRole.SYSTEM: "system",
             }[item.role]
-            content = self._message_display_content(item)
+            content = item.content
+            if role == "user" and item.attachments:
+                images[len(entries)] = item.attachments
             if (item is final_assistant and session.last_decision
                     and session.status == IncidentStatus.COMPLETED):
                 content = format_incident_summary(session.last_decision, compact=True)
@@ -2218,7 +2228,7 @@ class DesktopClient:
                 entries.append(("metadata", "\n".join(details)))
 
         self._restore_analysis(session)
-        self._replace_transcript(entries, message_times=message_times)
+        self._replace_transcript(entries, message_times=message_times, attachments=images)
         self._restore_session_project(session)
         title = " ".join(session.problem.split()) or "未命名异常"
         self.task_title_var.set(title[:64] + ("…" if len(title) > 64 else ""))
@@ -2324,7 +2334,9 @@ class DesktopClient:
     def _replace_transcript(
         self, entries: list[tuple[str, str]], *, timestamps: list[str] | None = None,
         message_times: list[datetime | None] | None = None,
+        attachments: dict[int, list[MessageAttachment]] | None = None,
     ) -> None:
+        self._transcript_attachments = attachments or {}
         self._transcript_entries = list(entries)
         self._transcript_times = list(message_times or [])
         self._transcript_timestamps = timestamps or [
@@ -2354,7 +2366,10 @@ class DesktopClient:
             insertions.setdefault(index, []).append(key)
         entries = [("analysis", key) for key in insertions.get(-1, [])]
         timestamps = [""] * len(entries)
+        self._chat_renderer.attachments = {}
         for i, entry in enumerate(self._transcript_entries):
+            if i in self._transcript_attachments:
+                self._chat_renderer.attachments[len(entries)] = self._transcript_attachments[i]
             entries.append(entry)
             timestamps.append(self._transcript_timestamps[i]
                               if i < len(self._transcript_timestamps) else "")
@@ -2952,13 +2967,15 @@ class DesktopClient:
         message: str,
         attachments: list[MessageAttachment] | None = None,
     ) -> None:
-        attachment_note = f"\n[已附加 {len(attachments)} 张异常截图]" if attachments else ""
+        images = dict(self._transcript_attachments)
         entries = list(self._transcript_entries)
         times = list(self._transcript_times)
         times.extend([None] * (len(entries) - len(times)))
-        entries.append(("user", message + attachment_note))
+        if attachments:
+            images[len(entries)] = attachments
+        entries.append(("user", message))
         times.append(datetime.now().astimezone())
-        self._replace_transcript(entries, message_times=times)
+        self._replace_transcript(entries, message_times=times, attachments=images)
         self.transcript.see("end")
 
     def _focus_transcript(self, _event: tk.Event[tk.Text]) -> None:
@@ -2990,38 +3007,74 @@ class DesktopClient:
             self.transcript_menu.grab_release()
         return "break"
 
+    def _choose_images(self) -> None:
+        if self.flow != FlowKind.INCIDENT or self._busy:
+            return
+        paths = filedialog.askopenfilenames(
+            parent=self.root.winfo_toplevel(), title="添加异常截图",
+            filetypes=[("图片", "*.png *.jpg *.jpeg *.webp *.gif")],
+        )
+        if paths:
+            self._add_images([Path(path) for path in paths])
+
     def _on_prompt_paste(self, _event: tk.Event[tk.Misc]) -> str | None:
         if self.flow != FlowKind.INCIDENT or self._busy:
             return None
+        return self._add_images()
+
+    def _add_images(self, paths: list[Path] | None = None) -> str | None:
+        remaining = 5 - len(self._pending_attachments)
         try:
-            remaining = 5 - len(self._pending_attachments)
-            images = self.attachment_store.capture_clipboard_images(remaining)
+            images = (self.attachment_store.import_image_files(paths, remaining) if paths
+                      else self.attachment_store.capture_clipboard_images(remaining))
         except IncidentAttachmentError as exc:
             self.status_var.set(str(exc))
             return "break"
         except Exception as exc:
-            self.status_var.set(f"粘贴异常截图失败：{exc}")
+            self.status_var.set(f"添加异常截图失败：{exc}")
             return "break"
         if not images:
             return None
         self._pending_attachments.extend(images)
         self._refresh_attachment_display()
         self._hide_prompt_placeholder()
-        self.status_var.set("异常截图已附加；发送后 Agent 会读取图片进行诊断。")
+        self.status_var.set("截图已附加，可点击缩略图查看。")
         return "break"
 
-    def _clear_pending_attachments(self) -> None:
-        self._pending_attachments.clear()
+    def _clear_pending_attachments(self, attachment_id: str | None = None) -> None:
+        if not self._pending_attachments:
+            return
+        for item in self._pending_attachments.copy():
+            if attachment_id is None or item.id == attachment_id:
+                self._pending_attachments.remove(item)
+                try:
+                    self.attachment_store.discard_draft(item)
+                except OSError:
+                    logger.warning("Unable to remove draft attachment copy: %s", item.id)
         self._refresh_attachment_display()
+        if self._pending_attachments:
+            self.status_var.set(f"待发送 {len(self._pending_attachments)} 张截图。")
+        else:
+            self.status_var.set("待发送截图已清空。")
+            self._restore_prompt_placeholder()
+
+    def _layout_attachment_tiles(self, _event=None) -> None:
+        columns = max(1, self.attachment_tiles.winfo_width() // (TILE_WIDTH + 4))
+        for i, tile in enumerate(self.attachment_tiles.winfo_children()):
+            tile.grid(row=i // columns, column=i % columns, sticky="w", padx=2, pady=2)
 
     def _refresh_attachment_display(self) -> None:
+        for tile in self.attachment_tiles.winfo_children():
+            tile.destroy()
         count = len(self._pending_attachments)
         if not count or self.flow != FlowKind.INCIDENT:
             self.attachment_status_var.set("")
             self.attachment_frame.grid_remove()
             return
-        total_bytes = sum(item.size_bytes for item in self._pending_attachments)
-        self.attachment_status_var.set(f"已粘贴 {count} 张异常截图 · {total_bytes / 1024:.1f} KiB")
+        self.attachment_status_var.set(f"{count} 张异常截图")
+        for number, item in enumerate(self._pending_attachments, 1):
+            AttachmentTile(self.attachment_tiles, item, number, self._clear_pending_attachments)
+        self._layout_attachment_tiles()
         self.attachment_frame.grid()
 
     def _toggle_incident_details(self) -> None:
@@ -3718,7 +3771,7 @@ class DesktopClient:
     def _hide_prompt_placeholder(self, _event: tk.Event[tk.Misc] | None = None) -> None:
         self.prompt_placeholder.place_forget()
 
-    def _restore_prompt_placeholder(self, _event: tk.Event[tk.Misc]) -> None:
+    def _restore_prompt_placeholder(self, _event: tk.Event[tk.Misc] | None = None) -> None:
         if not self.prompt_input.get("1.0", "end-1c").strip():
             self.prompt_placeholder.place(x=13, y=11)
 

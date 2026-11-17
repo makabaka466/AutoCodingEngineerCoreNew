@@ -65,6 +65,14 @@ class IncidentAttachmentStore:
                  in SUPPORTED_IMAGE_SUFFIXES]
         if first_only:
             paths = paths[:1]
+        return self.import_image_files(paths, remaining)
+
+    def import_image_files(self, paths: list[Path], remaining: int) -> list[MessageAttachment]:
+        """文件选择与剪贴板共用整批导入；任一文件失败时回收本批产生的副本。"""
+        from PIL import Image
+
+        if any(path.suffix.casefold() not in SUPPORTED_IMAGE_SUFFIXES for path in paths):
+            raise IncidentAttachmentError("请选择 PNG、JPEG、WebP 或 GIF 图片。")
         if len(paths) > remaining:
             raise IncidentAttachmentError(
                 f"本次有 {len(paths)} 张图片，这条消息还能添加 {remaining} 张。"
@@ -80,7 +88,7 @@ class IncidentAttachmentStore:
                 target.unlink(missing_ok=True)
                 target.parent.rmdir()
             if isinstance(exc, OSError):
-                raise IncidentAttachmentError(f"无法读取粘贴的图片文件：{exc}") from exc
+                raise IncidentAttachmentError(f"无法读取图片文件：{exc}") from exc
             raise
         return saved
 
@@ -120,6 +128,16 @@ class IncidentAttachmentStore:
             media_type="image/png",
             size_bytes=size,
         )
+
+    def discard_draft(self, item: MessageAttachment) -> None:
+        """只清理本机草稿生成的隔离副本；上传源文件和已发送消息不走此入口。"""
+        path = Path(item.path)
+        if (path.parent.parent != self.root or path.parent.name != item.id
+                or path.name != "incident-screenshot.png" or path.resolve() != path):
+            return
+        path.unlink(missing_ok=True)
+        if path.parent.is_dir():
+            path.parent.rmdir()
 
     def prepare_for_send(self, attachment: MessageAttachment) -> MessageAttachment:
         """Revalidate an owned screenshot and refresh harmless stale file metadata.

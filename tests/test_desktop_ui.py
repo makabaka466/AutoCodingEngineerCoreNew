@@ -1603,6 +1603,59 @@ def test_incident_screenshot_paste_attaches_image_and_allows_image_only_send(
     assert client.attachment_frame.winfo_manager() == ""
 
 
+def test_uploaded_and_pasted_images_preview_remove_send_and_reopen(root, tmp_path, monkeypatch):
+    from PIL import Image, ImageGrab
+
+    from autocoding_agent.incident_attachments import IncidentAttachmentStore
+
+    store = IncidentAttachmentStore(root=tmp_path / "copies")
+    source = tmp_path / "upload.png"
+    with Image.new("RGB", (320, 150), "red") as image:
+        image.save(source)
+    monkeypatch.setattr("autocoding_agent.interfaces.desktop_ui.filedialog.askopenfilenames",
+                        lambda **_: (str(source),))
+    monkeypatch.setattr(ImageGrab, "grabclipboard", lambda: Image.new("RGB", (1000, 200), "blue"))
+    application = FakeIncidentApplication()
+    client = DesktopClient(root, FakeApplication(), application, attachment_store=store,
+                           workspace_service=FakeWorkspaceService(tmp_path))
+    client._select_flow(FlowKind.INCIDENT)
+    client._choose_images()
+    client._on_prompt_paste(None)
+    removed, kept = client._pending_attachments
+    first, second = client.attachment_tiles.winfo_children()
+    assert first.photo is not None and second.photo is not None
+    thumbnail = next(w for w in second.winfo_children() if isinstance(w, tk.Button))
+    thumbnail.invoke()
+    viewer = root.children["ace_image_preview"]
+    assert viewer.source.size == (1000, 200)
+    viewer.toggle.invoke()
+    assert not viewer.fit
+    viewer.destroy()
+
+    next(w for w in first.winfo_children() if w.cget("text") == "×").invoke()
+    assert client._pending_attachments == [kept] and source.is_file()
+    assert not Path(removed.path).exists()
+    assert len(client.attachment_tiles.winfo_children()) == 1
+    operations = _capture_operation(client)
+    client._send_message()
+    operations[0]()
+    assert application.attachments == [[kept]] and Path(kept.path).is_file()
+    assert len(client._chat_renderer.image_tiles) == 1
+
+    session = IncidentSession(workspace=str(tmp_path), project="ace-test", problem="保存报错",
+        messages=[ChatMessage(role=MessageRole.USER, content="检查这张图", attachments=[kept])])
+    client._render_incident_session(session)
+    client._render_transcript()
+    tile, = client._chat_renderer.image_tiles
+    assert tile.photo is not None and all(w.cget("text") != "×" for w in tile.winfo_children())
+    next(w for w in tile.winfo_children() if isinstance(w, tk.Button)).invoke()
+    assert root.children["ace_image_preview"].source.getpixel((1, 1))[:3] == (0, 0, 255)
+    root.children["ace_image_preview"].destroy()
+    Path(kept.path).unlink()
+    client._render_incident_session(session)
+    assert client._chat_renderer.image_tiles[0].photo is None
+
+
 def test_development_text_paste_does_not_invoke_image_clipboard(
     root: tk.Toplevel,
 ) -> None:

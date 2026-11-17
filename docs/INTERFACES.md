@@ -1542,3 +1542,7 @@ AgentApplication.events / IncidentApplication.events新增可选关键字after_s
 开发、异常和紧凑续聊的 Claude Code 输出契约要求 call_summary，包含 checked、finding、next_step。新 runtime_completed 事件记录 call_number 和本次小结，兼容旧模型返回的简短消息。失败、中断记录保留原因。历史任务不追补模型输出。
 
 异常诊断可附 screenshot_clues（图号、主要或关联页面、可见线索、候选路径）和 impact。桌面详情按图号展示，HTTP 仍可从任务详情和事件接口读到已有审计。SQL 草案在桌面详情中完整保留。
+
+## 0.28.0 桌面截图交互
+
+异常对话支持 Ctrl+V 和“添加图片”多选。消息继续使用 attachments 的原有顺序和身份。待发送缩略图支持逐张移除，历史缩略图可点击查看。附件丢失时对应位置显示“图片不可用”。
