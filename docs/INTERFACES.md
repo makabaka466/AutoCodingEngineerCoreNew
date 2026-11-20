@@ -1550,3 +1550,7 @@ AgentApplication.events / IncidentApplication.events新增可选关键字after_s
 ## 0.28.1
 
 异常决策新增可选 clarification_kind，用于区分绑定库可核实的事实、环境、业务选择和其他现场条件。历史记录兼容空值。桌面与任务详情摘要显示本周期成功业务查询的数据源和配置环境。
+
+## 0.29.0 桌面消息附件
+
+开发流程的 Python 应用入口 `start` 和 `send` 接受可选关键字参数 `attachments`。附件类型支持 `image` 和 `file`，未指定类型的历史图片沿用原格式。两种工作流均按单条消息统计附件总数，图片与文件分别编号。

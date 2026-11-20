@@ -29,6 +29,7 @@ class HandlerContext:
     additional_dirs: tuple[str, ...] = ()
     run_id: str | None = None
     runtime_event_sink: Callable[[RuntimeActivity], None] | None = None
+    attachment_paths: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -62,6 +63,7 @@ class StateHandler:
             permission_mode=profile.permission_mode,
             capability_dir=context.capability_dir,
             additional_dirs=list(context.additional_dirs),
+            attachment_paths=list(context.attachment_paths),
         )
         observed = getattr(self.runtime, "run_observed", None)
         if (

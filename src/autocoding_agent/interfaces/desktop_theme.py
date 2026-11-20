@@ -117,8 +117,11 @@ class IconButton(tk.Button):
 class RoundedTextBlock(tk.Canvas):
     """正文中的可选择文本块；用户气泡与代码块共用，不参与消息存储。"""
 
-    def __init__(self, parent: tk.Text, content: str, *, code: bool = False):
+    def __init__(self, parent: tk.Text, content: str, *, code: bool = False,
+                 reply: bool = False, details=None):
         self.parent_text, self.code = parent, code
+        self.reply = reply
+        self.details = None
         self.fill = "#F6F7F9" if code else COLORS["user"]
         super().__init__(parent, bg=COLORS["surface"], bd=0, highlightthickness=0, height=60)
         self.text = tk.Text(self, bg=self.fill, fg=COLORS["text"], relief="flat", bd=0,
@@ -143,9 +146,13 @@ class RoundedTextBlock(tk.Canvas):
         self._layout_width = 0
         self._height_pending = False
         self.bind("<Configure>", self._layout)
+        if details is not None:
+            self.details = IconButton(self, "more", "查看调查详情", details)
+            self.details.configure(bg=self.fill, width=28, height=22)
+            self.details_window = self.create_window(0, 0, anchor="se", window=self.details)
 
     def _scroll_chat(self, event):
-        self.parent_text.yview_scroll(-int(event.delta / 120), "units")
+        self.parent_text.event_generate("<MouseWheel>", delta=event.delta)
         return "break"
 
     def _layout(self, _event=None):
@@ -153,6 +160,9 @@ class RoundedTextBlock(tk.Canvas):
         if width != self._layout_width:
             self._layout_width = width
             self.itemconfigure(self.text_window, width=width - 28)
+            for child in self.text.winfo_children():
+                if isinstance(child, RoundedTextBlock):
+                    child.configure(width=max(80, width - 44))
             if not self._height_pending:
                 self._height_pending = True
                 self.after_idle(self._fit_height)
@@ -161,12 +171,12 @@ class RoundedTextBlock(tk.Canvas):
         self._height_pending = False
         if not self.winfo_exists():
             return
-        rows = self.text.count("1.0", "end", "displaylines")
-        lines = max(1, rows[0] if rows else 1)
-        # Tk Text 按字体计算请求高度，无需猜测系统 DPI。
-        self.text.configure(height=lines)
-        text_height = self.text.winfo_reqheight()
+        # 标题、表格和内嵌代码块可能具有不同高度，使用 Tk 的实际排版像素。
+        text_height = max(1, self.text.count("1.0", "end", "update", "ypixels"))
         height = text_height + (66 if self.code else 28)
+        if self.details is not None:
+            height += 23
+            self.coords(self.details_window, self.winfo_width() - 10, height - 6)
         if int(self.cget("height")) != height:
             self.configure(height=height)
         self.itemconfigure(self.text_window, height=text_height)

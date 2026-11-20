@@ -58,6 +58,47 @@ class AnalysisSection:
     steps: list[AnalysisStep] = field(default_factory=list)
 
 
+def group_conversation_turns(
+    entries: list[tuple[str, str]], times: list[datetime | None], sections,
+) -> tuple[dict[int, AnalysisSection], set[int]]:
+    """每次用户发言保留最后一条实质答复，期间的进度和较早答复仍在此轮详情可读。"""
+    users = [(i, times[i]) for i, (role, _) in enumerate(entries)
+             if role == "user" and i < len(times) and times[i] is not None]
+    groups = {i: AnalysisSection(f"turn:{ordinal}", stamp)
+              for ordinal, (i, stamp) in enumerate(users, 1)}
+    for section in sections:
+        if section.steps:
+            index = next((i for i, stamp in reversed(users) if stamp <= section.time),
+                         users[0][0] if users else -1)
+            if index not in groups:
+                groups[index] = AnalysisSection("legacy:" + section.key, section.time)
+            groups[index].steps.extend(section.steps)
+
+    interim = set()
+    # 历史快照把宿主正在执行的查询通知也存为 assistant。
+    query_updates = {"Agent 已形成最小只读查询计划，正在自动核对数据库证据。",
+                     "Agent formed a bounded read-only query plan. The host is executing it "
+                     "automatically; the user does not need to run SQL."}
+    for ordinal, (index, start_time) in enumerate(users):
+        end = users[ordinal + 1][0] if ordinal + 1 < len(users) else len(entries)
+        replies = [i for i in range(index + 1, end) if entries[i][0] == "assistant"]
+        final = next((i for i in reversed(replies) if entries[i][1] not in query_updates), None)
+        for i in replies:
+            if i == final:
+                continue
+            interim.add(i)
+            content = entries[i][1]
+            step_time = times[i] if i < len(times) and times[i] else start_time
+            groups[index].steps.append(AnalysisStep(
+                key=f"reply:{groups[index].key}:{i}", time=step_time, source="对话记录",
+                title="查询进度" if content in query_updates else "本轮较早回复",
+                summary=public_text(content, 180), detail=public_text(content, len(content)),
+            ))
+        if len(replies) > 1 or final is None and replies:
+            groups[index].steps.sort(key=lambda step: step.time)
+    return groups, interim
+
+
 class AnalysisTrace:
     """每个窗口持有当前任务的投影，序号排重；历史事实继续由事件库保存。"""
 

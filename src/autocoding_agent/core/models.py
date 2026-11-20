@@ -56,6 +56,7 @@ class MessageRole(StrEnum):
 
 class AttachmentKind(StrEnum):
     IMAGE = "image"
+    FILE = "file"
 
 
 class MessageAttachment(BaseModel):

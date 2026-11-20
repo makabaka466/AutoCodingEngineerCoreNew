@@ -55,6 +55,7 @@ from autocoding_agent.core.models import (
     ApprovalScope,
     ChatMessage,
     EventType,
+    MessageAttachment,
     MessageRole,
     utc_now,
 )
@@ -103,6 +104,11 @@ from autocoding_agent.database_models import (
     sql_fingerprint,
 )
 from autocoding_agent.datasources import TaskDatabaseAccess, query_source
+from autocoding_agent.incident_attachments import (
+    IncidentAttachmentError,
+    message_with_attachments,
+    validate_attachments,
+)
 from autocoding_agent.knowledge_rag.models import KnowledgeDomain
 from autocoding_agent.knowledge_rag.ports import KnowledgeRetriever
 from autocoding_agent.ports.database import DatabaseReader
@@ -211,12 +217,14 @@ class AgentEngine:
         source_entry: InvestigationEntry | None = None,
         session_id: str | None = None,
         progress_sink: ProgressSink | None = None,
+        attachments: list[MessageAttachment] | None = None,
     ) -> AgentOutcome:
         canonical = Path(workspace).expanduser().resolve(strict=True)
         if not canonical.is_dir():
             raise ValueError(f"Workspace is not a directory: {canonical}")
         if not message.strip():
             raise ValueError("Task message cannot be empty.")
+        attachments = validate_attachments(attachments or [])
         session = AgentSession(
             id=session_id or str(uuid4()),
             workspace=str(canonical),
@@ -254,7 +262,7 @@ class AgentEngine:
         self.database_access.bind(session)
         self.sessions.create(session)
         return self._run_command(
-            session, message.strip(), AgentMode.INSPECT, command, progress_sink
+            session, message.strip(), AgentMode.INSPECT, command, progress_sink, attachments
         )
 
     @exclusive_task
@@ -265,6 +273,7 @@ class AgentEngine:
         command_id: str | None = None,
         *,
         progress_sink: ProgressSink | None = None,
+        attachments: list[MessageAttachment] | None = None,
     ) -> AgentOutcome:
         session = self.sessions.load(session_id)
         if duplicate := self._duplicate_command_outcome(session, command_id):
@@ -273,6 +282,7 @@ class AgentEngine:
             raise ValueError("Message cannot be empty.")
         if session.task_state == TaskState.CANCELLED:
             raise ValueError("This task was cancelled and cannot be reopened.")
+        attachments = validate_attachments(attachments or [])
         # 等待审批时收到普通回复，表示用户正在修改原要求，而不是默认批准。
         session.pending_approval = None
         command = AgentCommand(
@@ -284,7 +294,7 @@ class AgentEngine:
         if session.task_state == TaskState.COMPLETED:
             self._reopen_completed_cycle(session, message.strip(), command)
         return self._run_command(
-            session, message.strip(), AgentMode.INSPECT, command, progress_sink
+            session, message.strip(), AgentMode.INSPECT, command, progress_sink, attachments
         )
 
     @staticmethod
@@ -642,6 +652,7 @@ class AgentEngine:
         mode: AgentMode,
         command: AgentCommand,
         progress_sink: ProgressSink | None = None,
+        attachments: list[MessageAttachment] | None = None,
     ) -> AgentOutcome:
         """执行一个具备幂等语义的用户命令，并持久化最终命令回执。"""
 
@@ -654,7 +665,7 @@ class AgentEngine:
             ),
         )
         try:
-            self._execute(session, user_message, mode, command, progress_sink)
+            self._execute(session, user_message, mode, command, progress_sink, attachments)
         except Exception:
             emit_progress(
                 progress_sink,
@@ -733,6 +744,7 @@ class AgentEngine:
         mode: AgentMode,
         command: AgentCommand,
         progress_sink: ProgressSink | None = None,
+        attachments: list[MessageAttachment] | None = None,
     ) -> AgentOutcome:
         """推进一次开发对话，直到得到可持久化、可向用户展示的结果。"""
 
@@ -745,7 +757,9 @@ class AgentEngine:
         self._enter_mode_state(session, mode, command)
         if not any(event.command_id == command.id and event.data.get("scheduled")
                    for event in session.events[-4:]):
-            session.messages.append(ChatMessage(role=MessageRole.USER, content=user_message))
+            session.messages.append(ChatMessage(
+                role=MessageRole.USER, content=user_message, attachments=attachments or [],
+            ))
             session.events.append(
                 AgentEvent(
                     type=EventType.TURN_STARTED,
@@ -775,7 +789,13 @@ class AgentEngine:
         # 能力目录位于目标工作区之外，只在没有写入/命令工具的只读轮次中挂载；
         # 后续恢复轮次仍可使用之前已经读取到的上下文。
         readable_capability_dir = str(capability_dir) if mode == AgentMode.INSPECT else None
-        pending_message = user_message
+        attachments = attachments or []
+        try:
+            pending_message = message_with_attachments(user_message, attachments)
+        except IncidentAttachmentError as exc:
+            return self._fail(session, str(exc), command.id)
+        attachment_dirs = tuple(dict.fromkeys(str(Path(item.path).parent) for item in attachments))
+        image_paths = tuple(item.path for item in attachments if item.kind == "image")
         knowledge_context = self._retrieve_knowledge(
             session,
             user_message,
@@ -861,6 +881,7 @@ class AgentEngine:
                             )
                         ),
                         capability_dir=readable_capability_dir,
+                        additional_dirs=attachment_dirs, attachment_paths=image_paths,
                         run_id=run.id,
                         runtime_event_sink=lambda activity, active_run=run: (
                             self.runtime_lifecycle.record_activity(
@@ -869,6 +890,7 @@ class AgentEngine:
                                 activity,
                                 command_id=command.id,
                                 mode=mode.value,
+                                attachment_paths=image_paths,
                                 progress_sink=progress_sink,
                             )
                         ),

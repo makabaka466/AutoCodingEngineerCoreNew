@@ -10,7 +10,7 @@ from tkinter import messagebox
 
 from PIL import Image, ImageTk
 
-from autocoding_agent.core.models import MessageAttachment
+from autocoding_agent.core.models import AttachmentKind, MessageAttachment
 from autocoding_agent.incident_attachments import MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_PIXELS
 from autocoding_agent.interfaces.desktop_theme import COLORS, Tooltip
 
@@ -45,26 +45,34 @@ class AttachmentTile(tk.Frame):
                          highlightbackground=COLORS["border"])
         path = Path(item.path)
         self.photo = None
-        try:
-            self.photo = ImageTk.PhotoImage(_thumbnail(path, path.stat().st_mtime_ns), master=self)
-        except (OSError, ValueError, Image.DecompressionBombError):
-            pass
-        button = tk.Button(self, image=self.photo, text="" if self.photo else "图片不可用",
-                           bg=COLORS["surface_subtle"], fg=COLORS["muted"], bd=0,
-                           relief="flat", highlightthickness=0, cursor="hand2",
-                           command=lambda: self._open(path, number))
-        button.place(x=0, y=0, relwidth=1, relheight=1)
-        Tooltip(button, f"查看图{number}")
-        caption = tk.Label(self, text=f"图{number}", bg=COLORS["surface"], fg=COLORS["muted"],
-                           font=("Microsoft YaHei UI", 8), cursor="hand2")
-        caption.place(x=1, rely=1, y=-1, anchor="sw")
-        caption.bind("<Button-1>", lambda _: button.invoke())
+        if item.kind == AttachmentKind.FILE:
+            caption = tk.Label(self, text=item.name if path.is_file() else "文件不可用",
+                               wraplength=TILE_WIDTH - 10, bg=COLORS["surface_subtle"],
+                               fg=COLORS["text"], font=("Microsoft YaHei UI", 8))
+            caption.place(x=0, y=0, relwidth=1, relheight=1)
+            Tooltip(caption, f"文件{number} · {item.name}")
+        else:
+            try:
+                thumb = _thumbnail(path, path.stat().st_mtime_ns)
+                self.photo = ImageTk.PhotoImage(thumb, master=self)
+            except (OSError, ValueError, Image.DecompressionBombError):
+                pass
+            button = tk.Button(self, image=self.photo, text="" if self.photo else "图片不可用",
+                               bg=COLORS["surface_subtle"], fg=COLORS["muted"], bd=0,
+                               relief="flat", highlightthickness=0, cursor="hand2",
+                               command=lambda: self._open(path, number))
+            button.place(x=0, y=0, relwidth=1, relheight=1)
+            Tooltip(button, f"查看图{number}")
+            caption = tk.Label(self, text=f"图{number}", bg=COLORS["surface"], fg=COLORS["muted"],
+                               font=("Microsoft YaHei UI", 8), cursor="hand2")
+            caption.place(x=1, rely=1, y=-1, anchor="sw")
+            caption.bind("<Button-1>", lambda _: button.invoke())
         if remove:
             close = tk.Button(self, text="×", command=lambda: remove(item.id),
                               font=("Segoe UI", 10, "bold"), relief="flat", bd=0,
                               bg=COLORS["surface"], fg=COLORS["text"], cursor="hand2")
             close.place(relx=1, x=-1, y=1, anchor="ne", width=20, height=20)
-            Tooltip(close, f"移除图{number}")
+            Tooltip(close, f"移除 {item.name}")
 
     def _open(self, path: Path, number: int) -> None:
         owner = self.winfo_toplevel()

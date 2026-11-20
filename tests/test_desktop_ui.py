@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import time
 import tkinter as tk
 from collections.abc import Callable, Iterator
 from datetime import datetime, timedelta, timezone
@@ -472,14 +473,16 @@ def test_analysis_history_is_under_each_turn_and_restores_without_duplicates(roo
     assert [role for role, _ in client._chat_renderer.entries] == [
         "user", "analysis", "assistant", "user", "analysis",
     ]
-    assert client.transcript.get("1.0", "end").count("展开分析过程") == 2
+    assert client.transcript.get("1.0", "end").count("调查过程") == 2
     original = list(client._chat_renderer.entries)
     first_key = original[1][1]
-    client._chat_renderer.toggle("analysis:" + first_key)
-    assert "收起分析过程" in client.transcript.get("1.0", "end")
+    client._chat_renderer.analysis_bubbles[first_key].details.invoke()
+    assert client._detail_visible
+    assert "先确认入口与计数规则" in client.analysis_text.get("1.0", "end")
+    assert "用户停止，状态已保存" not in client.analysis_text.get("1.0", "end")
     client._render_session(session)
     assert client._chat_renderer.entries == original
-    assert "analysis:" + first_key in client._chat_renderer.expanded
+    assert client._detail_key == first_key and client._detail_visible
     client._render_welcome()
     assert not client._chat_renderer.analysis_sections
     client._render_session(session)
@@ -633,9 +636,10 @@ def test_chat_markdown_styles_do_not_parse_code_or_user_input(root: tk.Toplevel)
     assert "**这是原始输入**" in visible
     assert "## 修改结果" not in visible and "修改结果" in visible
     assert "# literal" in visible and "```" not in visible
-    assert widget.tag_ranges("chat_heading")
-    assert widget.tag_ranges("chat_bold") and widget.tag_ranges("chat_inline_code")
-    assert widget.tag_ranges("chat_code")
+    reply_text = renderer.blocks[-1].text
+    assert reply_text.tag_ranges("chat_heading")
+    assert reply_text.tag_ranges("chat_bold") and reply_text.tag_ranges("chat_inline_code")
+    assert reply_text.tag_ranges("chat_code")
 
 
 def test_chat_expansion_survives_refresh_without_changing_message_data(root: tk.Toplevel) -> None:
@@ -1256,7 +1260,8 @@ def test_chat_preserves_reading_position_and_copies_literal_code(root: tk.Toplev
     renderer.render(entries)
     root.update()
     assert "需要保留的用户原文" in widget.get("1.0", "end")
-    block = next(block for block in renderer.blocks if block.code)
+    reply = next(block for block in renderer.blocks if block.reply)
+    block = next(child for child in reply.text.winfo_children() if child.code)
     block.copy.invoke()
     assert root.clipboard_get() == code.rstrip("\n")
     widget.yview_moveto(.25)
@@ -1585,7 +1590,7 @@ def test_incident_screenshot_paste_attaches_image_and_allows_image_only_send(
 
     assert client._on_prompt_paste(object()) == "break"  # type: ignore[arg-type]
     assert client.attachment_frame.winfo_manager() == "grid"
-    assert "1 张异常截图" in client.attachment_status_var.get()
+    assert "1 个附件" in client.attachment_status_var.get()
     client._send_message()
     outcome = operations[0]()
 
@@ -1656,17 +1661,17 @@ def test_uploaded_and_pasted_images_preview_remove_send_and_reopen(root, tmp_pat
     assert client._chat_renderer.image_tiles[0].photo is None
 
 
-def test_development_text_paste_does_not_invoke_image_clipboard(
+def test_development_text_paste_preserves_tk_text_behavior(
     root: tk.Toplevel,
 ) -> None:
-    class FailingAttachmentStore:
+    class TextOnlyClipboard:
         def capture_clipboard_images(self, remaining: int) -> list[MessageAttachment]:
-            raise AssertionError("development paste must keep Tk text behavior")
+            return []
 
     client = DesktopClient(
         root,
         FakeApplication(),  # type: ignore[arg-type]
-        attachment_store=FailingAttachmentStore(),  # type: ignore[arg-type]
+        attachment_store=TextOnlyClipboard(),  # type: ignore[arg-type]
     )
 
     assert client._on_prompt_paste(object()) is None  # type: ignore[arg-type]
@@ -1999,7 +2004,7 @@ def test_same_page_switch_preserves_draft_attachment_and_expanded_analysis(root,
     client._pending_attachments.append(attachment)
     client._refresh_attachment_display()
     trace_key = next(iter(client._chat_renderer.analysis_sections))
-    client._chat_renderer.toggle("analysis:" + trace_key)
+    client._chat_renderer.analysis_bubbles[trace_key].details.invoke()
     child = client._open_task_window(session=incidents[1], flow=FlowKind.INCIDENT)
     child.prompt_input.insert("1.0", "第二个会话的草稿")
     assert client._visible_client is child and child.root.winfo_manager() == "place"
@@ -2008,8 +2013,8 @@ def test_same_page_switch_preserves_draft_attachment_and_expanded_analysis(root,
     assert client._visible_client is client and not child.root.winfo_manager()
     assert client.prompt_input.get("1.0", "end").strip() == "尚未发送的现场补充"
     assert client._pending_attachments == [attachment]
-    assert "analysis:" + trace_key in client._chat_renderer.expanded
-    assert "收起分析过程" in client.transcript.get("1.0", "end")
+    assert client._detail_key == trace_key and client._detail_visible
+    assert "先核对订单入口" in client.analysis_text.get("1.0", "end")
     child._show_conversation()
     assert child.prompt_input.get("1.0", "end").strip() == "第二个会话的草稿"
     child._on_close()
@@ -2307,3 +2312,153 @@ def test_history_measures_long_titles_once_per_width(root: tk.Toplevel, monkeypa
     lengths.clear()
     client._filter_history()
     assert not lengths
+
+
+@pytest.mark.parametrize("flow", [FlowKind.DEVELOPMENT, FlowKind.INCIDENT])
+def test_text_file_selection_and_history_use_message_copy(root, tmp_path, monkeypatch, flow):
+    from autocoding_agent.incident_attachments import IncidentAttachmentStore
+
+    class DevelopmentApp(FakeApplication):
+        def start(self, workspace, message, project=None, *, attachments=None, progress_sink=None):
+            outcome = super().start(workspace, message, project, progress_sink=progress_sink)
+            saved = self.get_session(outcome.session_id)
+            saved.messages = [ChatMessage(role="user", content=message, attachments=attachments)]
+            return outcome
+
+    source = tmp_path / "诊断.log"
+    source.write_text("工位 23 的结果已保存", encoding="utf8")
+    monkeypatch.setattr("autocoding_agent.interfaces.desktop_ui.filedialog.askopenfilenames",
+                        lambda **_: (str(source),))
+    app = DevelopmentApp()
+    incident = FakeIncidentApplication()
+    client = DesktopClient(root, app, incident, workspace_service=FakeWorkspaceService(tmp_path),
+                           attachment_store=IncidentAttachmentStore(root=tmp_path / "copies"))
+    client._select_flow(flow)
+    client._choose_files()
+    item, = client._pending_attachments
+    assert item.name == source.name and item.kind.value == "file"
+    client._clear_pending_attachments(item.id)
+    assert source.exists() and not Path(item.path).exists()
+    client._choose_files()
+    item, = client._pending_attachments
+    commands = _capture_operation(client)
+    client._send_message()
+    result = commands[0]()
+    if flow == FlowKind.DEVELOPMENT:
+        client._render_session(app.get_session(result.session_id))
+    else:
+        assert incident.attachments == [[item]]
+        session = IncidentSession(workspace=str(tmp_path), problem="诊断", project="ace-test",
+            messages=[ChatMessage(role="user", content="读取日志", attachments=[item])])
+        client._render_incident_session(session)
+    tile, = client._chat_renderer.image_tiles
+    assert any(isinstance(w, tk.Label) and w.cget("text") == source.name
+               for w in tile.winfo_children())
+    assert source.read_bytes() == Path(item.path).read_bytes()
+
+
+def test_first_send_is_visible_before_id_and_across_open_pages(root, tmp_path, monkeypatch):
+    import threading
+
+    ready, finish = threading.Event(), threading.Event()
+    app = FakeApplication()
+    original = app.start
+    replies = []
+
+    def slow_start(*args, **kwargs):
+        result = original(*args, **kwargs)
+        replies.append(result)
+        ready.set()
+        finish.wait(timeout=12)
+        return result
+
+    monkeypatch.setattr(app, "start", slow_start)
+    main = DesktopClient(root, app, workspace_service=FakeWorkspaceService(tmp_path))
+    other = main._open_task_window()
+    main._show_conversation()
+    try:
+        main.prompt_input.insert("1.0", "核对标准表\n仅核对开发库")
+        main._send_message()
+        assert ready.wait(2)
+        temporary = main._session_ids[0]
+        assert other._session_ids == [temporary]
+        assert main.sessions_list.get(0) == "核对标准表"
+        assert main.sessions_list.curselection() == (0,)
+        other._show_conversation()
+        assert other.history_indicators.states[temporary] == "running"
+        other.sessions_list.selection_set(0)
+        other._select_session(None)
+        assert main._visible_client is main and main._busy
+        final_id = replies[0].session_id
+        main._present_progress(ProgressEvent.for_phase(
+            ProgressWorkflow.DEVELOPMENT, ProgressPhase.QUEUED, task_id=final_id,
+        ), immediate=True)
+        assert main._session_ids == other._session_ids == [final_id]
+        assert other.history_indicators.states[final_id] == "queued"
+        assert main._active_task_id == final_id
+        finish.set()
+        deadline = time.monotonic() + 3
+        while main._busy and time.monotonic() < deadline:
+            root.update()
+        assert not main._busy and main.session_id == final_id
+        assert main._session_ids == other._session_ids == [final_id]
+        assert other.history_indicators.states[final_id] != "running"
+    finally:
+        finish.set()
+
+
+def test_start_failure_keeps_history_and_restores_form(root, tmp_path, monkeypatch):
+    app = FakeApplication()
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("启动失败")
+
+    monkeypatch.setattr(app, "start", fail)
+    monkeypatch.setattr("tkinter.messagebox.showerror", lambda *_args, **_kwargs: None)
+    main = DesktopClient(root, app, workspace_service=FakeWorkspaceService(tmp_path))
+    text = "核对当前数据源\n再读取目标方法"
+    main.prompt_input.insert("1.0", text)
+    main._send_message()
+    deadline = time.monotonic() + 3
+    while main._busy and time.monotonic() < deadline:
+        root.update()
+    assert not main._busy
+    assert main.prompt_input.get("1.0", "end-1c") == text
+    assert main.sessions_list.get(0) == "核对当前数据源"
+    assert main.history_indicators.states[main._session_ids[0]] == "failed"
+
+
+def test_only_final_reply_is_in_chat_and_old_details_return_to_approved_target(root):
+    session = _session(AgentStatus.APPROVAL_REQUIRED)
+    session.pending_approval = ApprovalRequest(
+        scope=ApprovalScope.VERIFY, reason="核对刷新", proposed_actions=["pytest"],
+    )
+    session.pending_approval_snapshot = snapshot_approval(session, session.pending_approval)
+    session.messages = [
+        ChatMessage(role="user", content="核对列表刷新"),
+        ChatMessage(role="assistant",
+                    content="Agent 已形成最小只读查询计划，正在自动核对数据库证据。"),
+        ChatMessage(role="assistant", content="请确认刷新后是否保留选中行？"),
+        ChatMessage(role="user", content="保留选中行"),
+        ChatMessage(role="assistant", content="已提交方案，请审阅。"),
+    ]
+    app = FakeApplication([session])
+    client = DesktopClient(root, app)
+    root.geometry("1350x800")
+    root.deiconify()
+    client.session_id = session.id
+    client._render_session(session)
+    root.update()
+    renderer = client._chat_renderer
+    results = [content for role, content in renderer.entries if role == "assistant"]
+    assert results == ["请确认刷新后是否保留选中行？", "已提交方案，请审阅。"]
+    review_key = client._approval_content_key
+    renderer.analysis_bubbles["turn:1"].details.invoke()
+    root.update()
+    assert client.transcript_panel.winfo_ismapped() and client.analysis_panel.winfo_ismapped()
+    assert "查询进度" in client.analysis_text.get("1.0", "end")
+    assert "已提交方案" not in client.analysis_text.get("1.0", "end")
+    client.analysis_review_button.invoke()
+    root.update()
+    assert client.approval_frame.winfo_ismapped() and client._approval_content_key == review_key
+    assert not app.calls

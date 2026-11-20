@@ -19,7 +19,7 @@ from autocoding_agent.core.artifacts.models import ArtifactRecord
 from autocoding_agent.core.artifacts.recorder import ArtifactRecorder
 from autocoding_agent.core.audit.models import ChangeExplanation
 from autocoding_agent.core.engine import AgentEngine
-from autocoding_agent.core.models import AgentEvent, AgentOutcome, AgentSession
+from autocoding_agent.core.models import AgentEvent, AgentOutcome, AgentSession, MessageAttachment
 from autocoding_agent.core.policies import ExecutionPolicy
 from autocoding_agent.core.progress import ProgressSink
 from autocoding_agent.core.recovery.manager import RecoveryManager
@@ -179,6 +179,7 @@ class AgentApplication:
         project: str | None = None,
         *,
         session_id: str | None = None,
+        attachments: list[MessageAttachment] | None = None,
         progress_sink: ProgressSink | None = None,
     ) -> AgentOutcome:
         session_id = session_id or str(uuid4())
@@ -195,6 +196,7 @@ class AgentApplication:
             project,
             session_id=session_id,
             progress_sink=progress_sink,
+            attachments=attachments,
         )
 
     def send(
@@ -203,6 +205,7 @@ class AgentApplication:
         message: str,
         command_id: str | None = None,
         *,
+        attachments: list[MessageAttachment] | None = None,
         progress_sink: ProgressSink | None = None,
     ) -> AgentOutcome:
         return self._engine.send(
@@ -210,6 +213,7 @@ class AgentApplication:
             message,
             command_id,
             progress_sink=progress_sink,
+            attachments=attachments,
         )
 
     def approve(

@@ -15,7 +15,7 @@ from collections.abc import Callable
 from datetime import datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
-from tkinter import filedialog, messagebox, simpledialog, ttk
+from tkinter import filedialog, messagebox, simpledialog
 
 from autocoding_agent.application import AgentApplication, build_application
 from autocoding_agent.core.data_repair import data_repair_text
@@ -25,6 +25,7 @@ from autocoding_agent.core.models import (
     AgentSession,
     AgentStatus,
     ApprovalScope,
+    AttachmentKind,
     MessageAttachment,
     MessageRole,
 )
@@ -57,17 +58,21 @@ from autocoding_agent.incident.models import (
     IncidentStatus,
 )
 from autocoding_agent.incident_attachments import (
+    SUPPORTED_TEXT_SUFFIXES,
     IncidentAttachmentError,
     IncidentAttachmentStore,
+    numbered_attachments,
 )
-from autocoding_agent.interfaces.analysis_trace import AnalysisTrace
+from autocoding_agent.interfaces.analysis_trace import AnalysisTrace, group_conversation_turns
 from autocoding_agent.interfaces.attachment_preview import TILE_WIDTH, AttachmentTile
 from autocoding_agent.interfaces.chat_transcript import ChatTranscript, insert_markdown
 from autocoding_agent.interfaces.desktop_diagnostics import monitor_mainloop, timed_ui
 from autocoding_agent.interfaces.desktop_theme import COLORS, IconButton, Tooltip
+from autocoding_agent.interfaces.history_indicators import HistoryIndicators
 from autocoding_agent.interfaces.knowledge_management_ui import KnowledgeManagementDialog
 from autocoding_agent.interfaces.proposal_presentation import format_approval_details
 from autocoding_agent.interfaces.system_settings_ui import SystemSettingsDialog
+from autocoding_agent.interfaces.workspace_controls import PopupMenu, SlimScrollbar, rounded_points
 from autocoding_agent.knowledge_rag.service import (
     KnowledgeRAGService,
     build_configured_rag_service,
@@ -110,43 +115,6 @@ def _format_query_observation(item: QueryObservation) -> str:
         suffix += " · 完整" if info.get("complete") else " · 不完整"
         suffix += f" · {info.get('fetched_at', '')}"
     return f"• [{stage}] {item.query_name}: {item.returned_rows} 行{suffix}"
-
-
-def _rounded_points(
-    x1: float,
-    y1: float,
-    x2: float,
-    y2: float,
-    radius: float,
-) -> list[float]:
-    """Return one reusable smooth-polygon path for native rounded surfaces."""
-
-    return [
-        x1 + radius,
-        y1,
-        x2 - radius,
-        y1,
-        x2,
-        y1,
-        x2,
-        y1 + radius,
-        x2,
-        y2 - radius,
-        x2,
-        y2,
-        x2 - radius,
-        y2,
-        x1 + radius,
-        y2,
-        x1,
-        y2,
-        x1,
-        y2 - radius,
-        x1,
-        y1 + radius,
-        x1,
-        y1,
-    ]
 
 
 def _blend_hex(start: str, end: str, amount: float) -> str:
@@ -216,7 +184,7 @@ class GlassPanel(tk.Canvas):
                                height=max(1, height-self._padding*2))
             return
         self.create_polygon(
-            _rounded_points(5, 7, width - 2, height - 2, self._radius),
+            rounded_points(5, 7, width - 2, height - 2, self._radius),
             smooth=True,
             splinesteps=24,
             fill=COLORS["shadow_soft"],
@@ -224,7 +192,7 @@ class GlassPanel(tk.Canvas):
             tags="glass_surface",
         )
         self.create_polygon(
-            _rounded_points(2, 2, width - 5, height - 5, self._radius),
+            rounded_points(2, 2, width - 5, height - 5, self._radius),
             smooth=True,
             splinesteps=24,
             fill=self._fill,
@@ -404,6 +372,23 @@ class FlowPill(tk.Canvas):
         self.create_polygon(points, smooth=True, splinesteps=24, **kwargs)
 
 
+def _fit_sidebar_title(title: str, font: tkfont.Font, width: int) -> str:
+    """从短前缀探测，超长需求只测量接近可视宽度的文本。"""
+    high = min(32, len(title))
+    while high < len(title) and font.measure(title[:high] + "…") <= width:
+        high = min(2 * high, len(title))
+    if high == len(title) and font.measure(title) <= width:
+        return title
+    low = 0
+    while low < high:
+        mid = (low + high + 1) // 2
+        if font.measure(title[:mid] + "…") <= width:
+            low = mid
+        else:
+            high = mid - 1
+    return title[:low] + "…"
+
+
 class RoundedButton(tk.Canvas):
     """Keyboard-accessible rounded button that keeps the small Tk dependency surface."""
 
@@ -425,7 +410,11 @@ class RoundedButton(tk.Canvas):
         foreground: str,
         anchor: str = "center",
         width: int = 0,
+        outline: str | None = None,
+        dropdown: bool = False,
     ) -> None:
+        self._outline = outline
+        self._dropdown = dropdown
         requested_width = width or max(88, len(text) * 14 + 34)
         super().__init__(
             parent,
@@ -491,14 +480,14 @@ class RoundedButton(tk.Canvas):
         return super().cget(key)
 
     def invoke(self) -> None:
-        if self._button_options["state"] == "normal":
+        if self._button_options["state"] != "disabled":
             command = self._button_options["command"]
             if callable(command):
                 command()
 
     def configure_cursor(self) -> None:
         self.configure_base(
-            cursor="hand2" if self._button_options["state"] == "normal" else "arrow"
+            cursor="hand2" if self._button_options["state"] != "disabled" else "arrow"
         )
 
     def configure_base(self, **kwargs: object) -> None:
@@ -526,13 +515,13 @@ class RoundedButton(tk.Canvas):
         state = str(self._button_options["state"])
         fill = str(self._button_options["background"])
         foreground = str(self._button_options["foreground"])
-        if state != "normal":
+        if state == "disabled":
             fill = COLORS["panel"]
             foreground = str(self._button_options["disabledforeground"])
         elif self._hovered:
             fill = str(self._button_options["activebackground"])
         outline = (
-            COLORS["border_strong"] if self._focused else fill
+            COLORS["border_strong"] if self._focused else (self._outline or fill)
         )
         canvas_width = max(self.winfo_width(), self.winfo_reqwidth())
         canvas_height = max(self.winfo_height(), 36)
@@ -547,10 +536,16 @@ class RoundedButton(tk.Canvas):
             width=2 if self._focused else 1,
         )
         left_aligned = self._button_options["anchor"] == "w"
+        label = str(self._button_options["text"])
+        if self._dropdown:
+            x, y = canvas_width - 19, canvas_height / 2
+            self.create_line(x - 4, y - 2, x, y + 2, x + 4, y - 2, fill=foreground, width=1.5)
+            font = tkfont.Font(font=("Microsoft YaHei UI", 9, "bold"))
+            label = _fit_sidebar_title(label, font, canvas_width - 46)
         self.create_text(
             16 if left_aligned else canvas_width / 2,
             canvas_height / 2,
-            text=str(self._button_options["text"]),
+            text=label,
             fill=foreground,
             font=("Microsoft YaHei UI", 9, "bold"),
             anchor="w" if left_aligned else "center",
@@ -567,7 +562,7 @@ class RoundedButton(tk.Canvas):
         **kwargs: object,
     ) -> None:
         self.create_polygon(
-            _rounded_points(x1, y1, x2, y2, radius),
+            rounded_points(x1, y1, x2, y2, radius),
             smooth=True,
             splinesteps=24,
             **kwargs,
@@ -639,6 +634,8 @@ class DesktopClient:
             FlowKind.INCIDENT: None,
         }
         self._session_ids: list[str] = []
+        self._pending_history_title = ""
+        self._history_failed = False
         self._recent_sessions: list[AgentSession | IncidentSession] = []
         self._trend_counts: list[int] = [0] * 7
         self._overview_visible = False
@@ -648,6 +645,10 @@ class DesktopClient:
         self._approval_content_key = None
         self._review_split = 0.5
         self._review_layout = None
+        self._detail_key: str | None = None
+        self._detail_task_id: str | None = None
+        self._detail_visible = False
+        self._detail_anchor = None
         self._responsive_width = 0
         self._layout_pending = False
         self._sash_dragging = False
@@ -661,6 +662,7 @@ class DesktopClient:
         self._model_ready_cache = window_group[0]._model_ready_cache if window_group else None
         self._database_ready_cache = window_group[0]._database_ready_cache if window_group else None
         self._history_generation = 0
+        self._history_updates: dict[str, AgentSession | IncidentSession] | None = None
         self._displayed_incident: IncidentSession | None = None
         self._result_queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self._stop_pending = False
@@ -822,15 +824,21 @@ class DesktopClient:
         self.project_row.grid_columnconfigure(0, weight=1)
         tk.Label(self.project_row, text="项目", bg=COLORS["sidebar"], fg=COLORS["muted"],
                  font=("Microsoft YaHei UI", 9)).grid(row=0, sticky="w", pady=(0, 6))
-        self.project_combo = ttk.Combobox(self.project_row, textvariable=self.project_var,
-                                         state="readonly", width=20,
-                                         font=("Microsoft YaHei UI", 10))
-        self.project_combo.grid(row=1, column=0, sticky="ew", ipady=4)
-        self.project_combo.bind("<<ComboboxSelected>>", self._on_project_selected)
+        self.project_combo = RoundedButton(
+            self.project_row, "", self._show_project_menu, foreground=COLORS["text"],
+            background="#FFFFFF", active_background="#F5F6F8", anchor="w",
+            outline="#BCC0C5", dropdown=True,
+        )
+        self.project_combo.grid(row=1, column=0, sticky="ew")
+        self.project_combo.bind("<Down>", lambda _: self.project_combo.invoke())
         Tooltip(self.project_combo, self.project_path_var)
-        self.new_task_button = self._button(
-            sidebar, "新建对话", self._new_task, background=COLORS["panel"],
-            active_background=COLORS["panel_hover"], anchor="w")
+        self.project_var.trace_add(
+            "write", lambda *_: self.project_combo.configure(text=self.project_var.get()),
+        )
+        self.new_task_button = RoundedButton(
+            sidebar, "新建对话", self._new_task, background="#FCFCFD", foreground=COLORS["text"],
+            active_background="#F1F3F6", anchor="w", outline="#A9ADB2",
+        )
         self.new_task_button.grid(row=2, column=0, sticky="ew", padx=18, pady=(0, 12))
         search = tk.Frame(sidebar, bg=COLORS["sidebar"])
         search.grid(row=3, column=0, sticky="ew", padx=18, pady=(0, 18))
@@ -854,19 +862,27 @@ class DesktopClient:
                  font=("Microsoft YaHei UI", 9)).grid(row=4, sticky="w", padx=22, pady=(0, 8))
         sessions_frame = tk.Frame(sidebar, bg=COLORS["sidebar"])
         sessions_frame.grid(row=5, sticky="nsew", padx=(16, 8), pady=(0, 16))
-        sessions_frame.grid_columnconfigure(0, weight=1)
+        sessions_frame.grid_columnconfigure(1, weight=1)
         sessions_frame.grid_rowconfigure(0, weight=1)
         self.sessions_list = tk.Listbox(
             sessions_frame, bg=COLORS["sidebar"], fg=COLORS["text"],
             selectbackground=COLORS["panel_hover"], selectforeground=COLORS["text"],
             borderwidth=0, highlightthickness=0, font=("Microsoft YaHei UI", 11),
             activestyle="none", exportselection=False, selectborderwidth=0, width=1)
-        self.sessions_list.grid(row=0, column=0, sticky="nsew")
+        self.sessions_list.grid(row=0, column=1, sticky="nsew")
+        self.history_indicators = HistoryIndicators(sessions_frame, self.sessions_list)
+        self.history_indicators.grid(row=0, column=0, sticky="ns")
+        Tooltip(self.history_indicators, self.history_indicators.hint)
         self.sessions_list.bind("<<ListboxSelect>>", self._select_session)
         self.sessions_list.bind("<Configure>", self._resize_history)
-        scroll = ttk.Scrollbar(sessions_frame, orient="vertical", command=self.sessions_list.yview)
-        scroll.grid(row=0, column=1, sticky="ns")
-        self.sessions_list.configure(yscrollcommand=scroll.set)
+        scroll = SlimScrollbar(sessions_frame, command=self.sessions_list.yview)
+        scroll.grid(row=0, column=2, sticky="ns")
+
+        def history_scroll(first, last):
+            scroll.set(first, last)
+            self.history_indicators.paint()
+
+        self.sessions_list.configure(yscrollcommand=history_scroll)
         tk.Label(sidebar, text="本地工作空间", fg=COLORS["subtle"], bg=COLORS["sidebar"],
                  font=("Microsoft YaHei UI", 9)).grid(row=6, sticky="w", padx=22, pady=(0, 20))
 
@@ -1088,8 +1104,8 @@ class DesktopClient:
             selectforeground="#FFFFFF",
         )
         self.transcript.grid(row=1, column=0, sticky="nsew")
-        transcript_scroll = ttk.Scrollbar(
-            transcript_frame, orient="vertical", command=self.transcript.yview
+        transcript_scroll = SlimScrollbar(
+            transcript_frame, command=self.transcript.yview
         )
         transcript_scroll.grid(row=1, column=1, sticky="ns")
         self.transcript.configure(yscrollcommand=transcript_scroll.set)
@@ -1185,6 +1201,32 @@ class DesktopClient:
         )
         self.transcript_menu.add_command(label="全选对话", command=self._select_all_transcript)
 
+        self.analysis_panel = tk.Frame(self.conversation_panes, bg=COLORS["surface"])
+        self.analysis_panel.grid_columnconfigure(0, weight=1)
+        self.analysis_panel.grid_rowconfigure(1, weight=1)
+        analysis_header = tk.Frame(self.analysis_panel, bg=COLORS["surface"])
+        analysis_header.grid(row=0, column=0, columnspan=2, sticky="ew", padx=10, pady=8)
+        tk.Label(analysis_header, text="调查详情", bg=COLORS["surface"], fg=COLORS["text"],
+                 font=("Microsoft YaHei UI", 11, "bold")).pack(side="left")
+        close_detail = self._button(analysis_header, "收起", self._close_analysis,
+                                    background=COLORS["surface"],
+                                    active_background=COLORS["panel_hover"])
+        close_detail.pack(side="right")
+        self.analysis_review_button = self._button(
+            analysis_header, "待审批方案", self._return_to_review,
+            background=COLORS["panel"], active_background=COLORS["panel_hover"],
+        )
+        self.analysis_text = tk.Text(
+            self.analysis_panel, wrap="word", width=1, relief="flat", bd=0,
+            highlightthickness=0, font=("Microsoft YaHei UI", 10), bg=COLORS["surface"],
+            fg=COLORS["text"], padx=8, pady=6, exportselection=False,
+        )
+        self.analysis_text.grid(row=1, column=0, sticky="nsew")
+        analysis_scroll = SlimScrollbar(self.analysis_panel, command=self.analysis_text.yview)
+        analysis_scroll.grid(row=1, column=1, sticky="ns")
+        self.analysis_text.configure(yscrollcommand=analysis_scroll.set)
+        self.detail_renderer = ChatTranscript(self.analysis_text, detail_view=True)
+
         self.approval_frame = tk.Frame(
             self.conversation_panes,
             bg=COLORS["surface"],
@@ -1205,11 +1247,15 @@ class DesktopClient:
             bg=COLORS["surface"],
         )
         self.approval_title.grid(row=0, column=0, sticky="ew")
+        self.review_analysis_button = self._button(
+            approval_header, "调查详情", lambda: self._open_analysis(self._detail_key),
+            background=COLORS["surface"], active_background=COLORS["panel_hover"],
+        )
         self.collapse_approval_button = self._button(
             approval_header, "收起方案", self._toggle_review,
             background=COLORS["surface"], active_background=COLORS["panel_hover"],
         )
-        self.collapse_approval_button.grid(row=0, column=1, padx=(8, 0))
+        self.collapse_approval_button.grid(row=0, column=2, padx=(8, 0))
         self.approval_text = tk.Text(
             self.approval_frame,
             height=9,
@@ -1226,8 +1272,8 @@ class DesktopClient:
             pady=6,
         )
         self.approval_text.grid(row=1, column=0, sticky="nsew", padx=(8, 0))
-        approval_scroll = ttk.Scrollbar(
-            self.approval_frame, orient="vertical", command=self.approval_text.yview
+        approval_scroll = SlimScrollbar(
+            self.approval_frame, command=self.approval_text.yview
         )
         approval_scroll.grid(row=1, column=1, sticky="ns", padx=(0, 8))
         self.approval_text.configure(yscrollcommand=approval_scroll.set, state="disabled")
@@ -1378,7 +1424,7 @@ class DesktopClient:
         action_row.grid(row=5, column=0, sticky="ew", padx=12, pady=(0, 11))
         action_row.grid_columnconfigure(0, weight=1)
         self.context_button = IconButton(
-            action_row, "more", "上下文与版本操作", self._show_context_menu)
+            action_row, "plus", "添加图片、文件或使用项目工具", self._show_context_menu)
         self.context_button.grid(row=0, column=0, sticky="w")
         self.model_shortcut = tk.Button(
             action_row, text="模型设置",
@@ -1735,7 +1781,55 @@ class DesktopClient:
 
     def _toggle_review(self) -> None:
         self._remember_review_split()
+        if self._detail_visible:
+            self._return_to_review()
+            return
         self._review_reading = not self._review_reading
+        self._update_responsive_layout()
+
+    def _open_analysis(self, key: str | None) -> None:
+        if key is None:
+            key = next(reversed(self._chat_renderer.analysis_sections), None)
+        if key not in self._chat_renderer.analysis_sections:
+            return
+        self._detail_anchor = self._chat_renderer.reading_anchor("analysis:" + key)
+        self._detail_key = key
+        self._detail_task_id = self.session_id or self._active_task_id
+        self._detail_visible = True
+        self._update_responsive_layout()
+        self._render_analysis_detail(reset=True)
+
+    def _render_analysis_detail(self, *, reset=False) -> None:
+        section = self._chat_renderer.analysis_sections.get(self._detail_key)
+        if not section:
+            return
+        if section.steps:
+            self.detail_renderer.analysis_sections = {section.key: section}
+            if reset:
+                self.detail_renderer.expanded = {
+                    "analysis-step:" + step.key for step in section.steps
+                    if step.source in {"模型判断", "模型公开说明"}
+                }
+            self.detail_renderer.expanded.add("analysis:" + section.key)
+            self.detail_renderer.render([("analysis", section.key)], preserve_scroll=not reset)
+            if reset:
+                self.analysis_text.yview_moveto(0)
+        else:
+            self.detail_renderer.render([])
+            self.analysis_text.configure(state="normal")
+            self.analysis_text.insert("end", self._chat_renderer.summary(section.key),
+                                      "chat_muted")
+            self.analysis_text.configure(state="disabled")
+
+    def _close_analysis(self) -> None:
+        self._detail_visible = False
+        self._review_reading = False
+        self._update_responsive_layout()
+        self._chat_renderer.restore_anchor(self._detail_anchor)
+
+    def _return_to_review(self) -> None:
+        self._detail_visible = False
+        self._review_reading = True
         self._update_responsive_layout()
 
     def _begin_review_drag(self, event) -> None:
@@ -1793,22 +1887,32 @@ class DesktopClient:
         self.overview_panel.grid_remove()
         self.main_frame.grid_columnconfigure(0, weight=1)
         self.main_frame.grid_columnconfigure(1, weight=0, minsize=0)
+        if hasattr(self, "_chat_renderer") and self._chat_renderer.analysis_sections:
+            self.review_analysis_button.grid(row=0, column=1, padx=4)
+        else:
+            self.review_analysis_button.grid_remove()
         if self._approval_visible:
+            self.analysis_review_button.pack(side="right", padx=3)
             self.review_toggle.grid()
             self.review_toggle.configure(
-                text="收起方案" if self._review_reading else "查看方案 · 待处理",
+                text="收起方案" if self._review_reading and not self._detail_visible
+                else "查看方案 · 待处理",
             )
         else:
+            self.analysis_review_button.pack_forget()
             self.review_toggle.grid_remove()
             if self._overview_visible and available >= 900:
                 self.overview_panel.grid()
                 self.main_frame.grid_columnconfigure(1, minsize=320)
         show_review = self._approval_visible and self._review_reading
-        desired = (
-            (self.transcript_panel, self.approval_frame) if show_review and available >= 1000
-            else (self.approval_frame,) if show_review
-            else (self.transcript_panel,)
+        side = self.analysis_panel if self._detail_visible else (
+            self.approval_frame if show_review else None
         )
+        # 分隔栏内只需容纳对话与详情的最小可读宽度。
+        together = (self.conversation_panes.winfo_width() >= 650 if self._detail_visible
+                    else available >= 1000)
+        desired = ((self.transcript_panel, side) if side is not None and together
+                   else (side,) if side is not None else (self.transcript_panel,))
         # 只在显示组合变化时重新挂载，进度刷新不会重置分隔位置或阅读位置。
         if desired != self._review_layout:
             self._remember_review_split()
@@ -1834,23 +1938,53 @@ class DesktopClient:
             self.prompt_placeholder.place_forget()
 
     def _show_context_menu(self) -> None:
-        menu = tk.Menu(self.root, tearoff=False)
-        if self.flow == FlowKind.INCIDENT:
-            menu.add_command(label="添加图片…", command=self._choose_images,
-                             state="disabled" if self._busy else "normal")
-            menu.add_command(label="粘贴截图", command=lambda: self._on_prompt_paste(None),
-                             state="disabled" if self._busy else "normal")
-            menu.add_separator()
+        menu = PopupMenu(self.context_button, above=True, return_focus=self.prompt_input)
+        menu.add_item("添加图片…", self._choose_images, enabled=not self._busy)
+        menu.add_item("选择文件…", self._choose_files, enabled=not self._busy)
+        menu.add_item("粘贴截图", lambda: self._on_prompt_paste(None), enabled=not self._busy)
+        menu.add_separator()
         for label, button in (("更新代码", self.git_sync_button),
                               ("提交并推送", self.git_publish_button)):
-            menu.add_command(label=label, command=button.invoke, state=button.cget("state"))
-        menu.add_separator()
-        menu.add_command(label="项目知识", command=self._open_knowledge_management,
-                         state="disabled" if self._busy else "normal")
-        try:
-            menu.tk_popup(self.context_button.winfo_rootx(), self.context_button.winfo_rooty())
-        finally:
-            menu.grab_release()
+            menu.add_item(label, button.invoke, enabled=str(button.cget("state")) != "disabled")
+        menu.add_item("项目知识", self._open_knowledge_management, enabled=not self._busy)
+        menu.show()
+
+    @property
+    def _history_key(self) -> str | None:
+        if self.session_id:
+            return self.session_id
+        if self._task_operation and self._active_task_id:
+            return self._active_task_id
+        # 临时键只在桌面进程内导航，永远不传入任务 API。
+        return f"pending:{id(self)}" if self._pending_history_title else None
+
+    def _history_scope(self):
+        return self.flow, self._flow_projects[self.flow]
+
+    def _update_open_histories(self, session=None) -> None:
+        """将本轮的临时行或刚取得的正式快照同步给同项目的会话页。"""
+        for page in self._window_group:
+            if page._history_scope() != self._history_scope() or page._closed:
+                continue
+            if session is not None:
+                if page._history_updates is not None:
+                    page._history_updates[session.id] = session
+                page._recent_sessions = [session, *(row for row in page._recent_sessions
+                                                    if row.id != session.id)]
+                if page is self or page._overview_visible:
+                    page._refresh_overview()
+            page._filter_history(reveal_current=page is self)
+
+    def _history_activity(self) -> str | None:
+        if self._history_failed:
+            return "failed"
+        if not self._busy or not self._task_operation:
+            return None
+        phase = self._progress_event.phase if self._progress_event else None
+        if phase in {ProgressPhase.QUEUED, ProgressPhase.WAITING_INPUT,
+                     ProgressPhase.WAITING_APPROVAL, ProgressPhase.FAILED, ProgressPhase.COMPLETED}:
+            return phase.value
+        return "running"
 
     def _resize_history(self, event) -> None:
         width = max(20, event.width - 8)
@@ -1859,7 +1993,7 @@ class DesktopClient:
         if self._history_resize_job is None:
             self._history_resize_job = self.sessions_list.after_idle(self._filter_history)
 
-    def _filter_history(self) -> None:
+    def _filter_history(self, *, reveal_current=True) -> None:
         if self._history_resize_job is not None:
             self.sessions_list.after_cancel(self._history_resize_job)
             self._history_resize_job = None
@@ -1870,10 +2004,20 @@ class DesktopClient:
             self.history_search_hint.place(x=2, y=0)
         else:
             self.history_search_hint.place_forget()
-        sessions = [item for item in self._recent_sessions if not query or query in
-                    (item.goal if isinstance(item, AgentSession) else item.problem).casefold()]
+        rows = {item.id: item.goal if isinstance(item, AgentSession) else item.problem
+                for item in self._recent_sessions}
+        # 首次任务返回前，左栏直接引用其页面。已入库的同行始终以任务 ID 合并。
+        peers = [page for page in self._window_group
+                 if page._history_scope() == self._history_scope()]
+        pending = {page._history_key: page._pending_history_title for page in reversed(peers)
+                   if page._pending_history_title}
+        titles = {**pending, **rows}
+        top_key = None
+        if not reveal_current and self._session_ids:
+            top_key = self._session_ids[self.sessions_list.nearest(0)]
+        self._session_ids = [key for key, title in titles.items()
+                             if not query or query in title.casefold()]
         self.sessions_list.delete(0, "end")
-        self._session_ids = [item.id for item in sessions]
         title_font = tkfont.Font(font=self.sessions_list.cget("font"))
         width = max(20, self.sessions_list.winfo_width() - 8)
         if self.sessions_list.winfo_width() <= 1:
@@ -1882,31 +2026,28 @@ class DesktopClient:
         if self._history_metrics != metrics:
             self._history_metrics = metrics
             self._history_label_cache.clear()
-        for session in sessions:
-            raw = session.goal if isinstance(session, AgentSession) else session.problem
-            cached = self._history_label_cache.get(session.id)
+        for key in self._session_ids:
+            raw = titles[key]
+            cached = self._history_label_cache.get(key)
             if cached is None or cached[0] != raw:
-                title = " ".join(raw.split()) or "未命名对话"
-                label = title
-                # 从短前缀探测，超长需求只测量接近可视宽度的文本。
-                high = min(32, len(title))
-                while high < len(title) and title_font.measure(title[:high] + "…") <= width:
-                    high = min(2 * high, len(title))
-                if high < len(title) or title_font.measure(title) > width:
-                    low = 0
-                    while low < high:
-                        mid = (low + high + 1) // 2
-                        if title_font.measure(title[:mid] + "…") <= width:
-                            low = mid
-                        else:
-                            high = mid - 1
-                    label = title[:low] + "…"
-                self._history_label_cache[session.id] = raw, label
-            self.sessions_list.insert("end", self._history_label_cache[session.id][1])
-        if self.session_id in self._session_ids:
-            index = self._session_ids.index(self.session_id)
+                title = " ".join(raw.lstrip().partition("\n")[0].split()) or "未命名对话"
+                label = _fit_sidebar_title(title, title_font, width)
+                self._history_label_cache[key] = raw, label
+            self.sessions_list.insert("end", self._history_label_cache[key][1])
+        self.history_indicators.keys = self._session_ids
+        self.history_indicators.states = {row.id: row.task_state for row in self._recent_sessions}
+        for page in peers:
+            state = page._history_activity()
+            if state and page._history_key:
+                self.history_indicators.states[page._history_key] = state
+        self.history_indicators.paint()
+        if self._history_key in self._session_ids:
+            index = self._session_ids.index(self._history_key)
             self.sessions_list.selection_set(index)
-            self.sessions_list.see(index)
+            if reveal_current:
+                self.sessions_list.see(index)
+        if top_key in self._session_ids:
+            self.sessions_list.yview(self._session_ids.index(top_key))
 
     @staticmethod
     def _button(
@@ -2005,8 +2146,6 @@ class DesktopClient:
 
     def _refresh_project_options(self) -> None:
         self.projects = self.workspace_service.list_projects()
-        names = [p.name for p in self.projects]
-        self.project_combo.configure(values=names)
         selected_id = self._flow_projects[self.flow]
         project = next((p for p in self.projects if p.id == selected_id), None)
         if project is None and self.projects:
@@ -2017,7 +2156,16 @@ class DesktopClient:
         if hasattr(self, "knowledge_health_label"):
             self._refresh_overview()
 
-    def _on_project_selected(self, _event: tk.Event[tk.Misc]) -> None:
+    def _show_project_menu(self) -> None:
+        menu = PopupMenu(self.project_combo, width=self.project_combo.winfo_width())
+        for project in self.projects:
+            menu.add_item(project.name, lambda name=project.name: self._on_project_selected(name),
+                          selected=project.id == self._flow_projects[self.flow])
+        menu.show()
+
+    def _on_project_selected(self, selection=None) -> None:
+        if isinstance(selection, str):
+            self.project_var.set(selection)
         project = next((p for p in self.projects if p.name == self.project_var.get()), None)
         if project is None or project.id == self._flow_projects[self.flow]:
             return
@@ -2129,7 +2277,7 @@ class DesktopClient:
                 MessageRole.ASSISTANT: "assistant",
                 MessageRole.SYSTEM: "system",
             }[item.role]
-            content = self._message_display_content(item)
+            content = item.content
             if session.source_incident_key and item is session.messages[0]:
                 content = session.goal.split("\n", 1)[0] + "\n已关联诊断资料，先准备修复方案。"
             entries.append((role, content))
@@ -2166,6 +2314,8 @@ class DesktopClient:
         self._restore_analysis(session)
         self._replace_transcript(
             entries, message_times=[item.created_at for item in session.messages],
+            attachments={i: item.attachments for i, item in enumerate(session.messages)
+                         if item.attachments},
         )
         self._restore_session_project(session)
         title = " ".join(session.goal.split()) or "未命名任务"
@@ -2376,15 +2526,6 @@ class DesktopClient:
         else:
             self.workflow_detail_var.set("历史会话未声明证据等级，可继续对话补充调查。")
 
-    @staticmethod
-    def _message_display_content(message: object) -> str:
-        content = str(getattr(message, "content", ""))
-        attachments = list(getattr(message, "attachments", []))
-        if not attachments:
-            return content
-        names = "、".join(f"图{i} {item.name}" for i, item in enumerate(attachments, 1))
-        return f"{content}\n[异常截图：{names}]"
-
     def _restore_analysis(self, session: AgentSession | IncidentSession | None) -> None:
         """从同一任务的持久事件恢复视图，并使旧窗口请求失效。"""
         self._analysis_generation += 1
@@ -2410,28 +2551,25 @@ class DesktopClient:
         self._render_transcript()
 
     @timed_ui
-    def _render_transcript(self) -> None:
+    def _render_transcript(self, *, progress_only: bool = False) -> None:
         """把分析过程放在对应用户轮次下方，刷新只影响展示，不重新加载任务。"""
         if not hasattr(self, "_chat_renderer"):
-            self._chat_renderer = ChatTranscript(self.transcript)
-        sections = self._analysis_trace.sections
-        prefix = f"{self._analysis_identity}:"
-        self._chat_renderer.analysis_sections = {
-            prefix + key: section for key, section in sections.items() if section.steps
-        }
-        insertions: dict[int, list[str]] = {}
-        for key, section in self._chat_renderer.analysis_sections.items():
-            index = -1
-            for i, (role, _) in enumerate(self._transcript_entries):
-                if (role == "user" and i < len(self._transcript_times)
-                        and self._transcript_times[i] is not None
-                        and self._transcript_times[i] <= section.time):
-                    index = i
-            insertions.setdefault(index, []).append(key)
+            self._chat_renderer = ChatTranscript(self.transcript, open_analysis=self._open_analysis)
+        grouped, interim = group_conversation_turns(
+            self._transcript_entries, self._transcript_times,
+            self._analysis_trace.sections.values(),
+        )
+        self._chat_renderer.analysis_sections = {item.key: item for item in grouped.values()}
+        self._chat_renderer.running_section = (
+            grouped[max(grouped)].key if grouped and self._busy and self._task_operation else None
+        )
+        insertions = {i: [item.key] for i, item in grouped.items()}
         entries = [("analysis", key) for key in insertions.get(-1, [])]
         timestamps = [""] * len(entries)
         self._chat_renderer.attachments = {}
         for i, entry in enumerate(self._transcript_entries):
+            if i in interim:
+                continue
             if i in self._transcript_attachments:
                 self._chat_renderer.attachments[len(entries)] = self._transcript_attachments[i]
             entries.append(entry)
@@ -2451,16 +2589,32 @@ class DesktopClient:
         else:
             self.latest_reply_button.configure(text="最新回应")
         self._displayed_conversation = key
-        self._chat_renderer.render(
-            entries, details_open=self.flow == FlowKind.INCIDENT and self._show_incident_details,
-            preserve_scroll=previous == key or key in self._conversation_positions,
-        )
+        if progress_only and previous == key and entries == self._chat_renderer.entries:
+            self._chat_renderer.update_analysis_summaries()
+        else:
+            self._chat_renderer.render(
+                entries,
+                details_open=self.flow == FlowKind.INCIDENT and self._show_incident_details,
+                preserve_scroll=previous == key or key in self._conversation_positions,
+            )
+        task_id = self.session_id or self._active_task_id
+        if (self._detail_key not in self._chat_renderer.analysis_sections
+                or (self._detail_task_id and self._detail_task_id != task_id)):
+            self._detail_key = None
+            self._detail_task_id = None
+            if self._detail_visible:
+                self._detail_visible = False
+                self._update_responsive_layout()
+        elif self._detail_visible and not self.analysis_text.tag_ranges("sel"):
+            self._detail_task_id = task_id
+            self._render_analysis_detail()
         if previous != key and key in self._conversation_positions:
             self.transcript.yview_moveto(self._conversation_positions[key])
 
     @timed_ui
     def _load_recent_sessions(self, select_current: bool = False, *, background=False) -> None:
         self._history_generation += 1
+        self._history_updates = {} if background else None
         if background:
             generation = self._history_generation
             application = self._active_application()
@@ -2495,9 +2649,8 @@ class DesktopClient:
             return
         session_id = self._session_ids[selection[0]]
         for client in self._window_group:
-            if client.flow == self.flow and session_id in {
-                client.session_id, client._active_task_id if client._busy else None,
-            }:
+            if (client._history_scope() == self._history_scope()
+                    and session_id == client._history_key):
                 client._show_conversation()
                 return
         try:
@@ -2521,13 +2674,16 @@ class DesktopClient:
 
     def _conversation_in_use(self) -> bool:
         """已绑定任务或有草稿的页面不能被导航操作清空。"""
-        return bool(self._busy or self.session_id or self._pending_attachments
+        return bool(self._busy or self._history_key or self._pending_attachments
                     or self.prompt_input.get("1.0", "end-1c").strip())
 
     def _reset_conversation(self) -> None:
         """只在当前页没有执行操作时复位；关闭会话不会删除持久历史。"""
         self.session_id = None
         self._active_task_id = None
+        self._pending_history_title = ""
+        self._history_failed = False
+        self._update_open_histories()
         self._flow_session_ids[self.flow] = None
         self.prompt_input.configure(state="normal")
         self.prompt_input.delete("1.0", "end")
@@ -2587,10 +2743,11 @@ class DesktopClient:
             self.root.place(x=0, y=0, relwidth=1, relheight=1)
             self.root.lift()
         primary._visible_client = self
+        self.history_indicators.paint()
         primary.root.title("ACE · " + self.task_title_var.get()[:42])
         if self._analysis_dirty and not self.transcript.tag_ranges("sel"):
             self._analysis_dirty = False
-            self._render_transcript()
+            self._render_transcript(progress_only=True)
         self._update_responsive_layout()
         self.prompt_input.focus_set()
         if self._deferred_error:
@@ -2853,7 +3010,7 @@ class DesktopClient:
             return
         message = self.prompt_input.get("1.0", "end-1c").strip()
         attachments = list(self._pending_attachments)
-        if self.flow == FlowKind.INCIDENT and attachments:
+        if attachments:
             try:
                 attachments = [self.attachment_store.prepare_for_send(item) for item in attachments]
             except IncidentAttachmentError as exc:
@@ -2864,8 +3021,12 @@ class DesktopClient:
                 )
                 self.status_var.set(str(exc))
                 return
-        if not message and self.flow == FlowKind.INCIDENT and attachments:
-            message = "请根据粘贴的异常界面截图定位并诊断问题。"
+        if not message and attachments:
+            if self.flow == FlowKind.INCIDENT and all(a.kind == AttachmentKind.IMAGE
+                                                      for a in attachments):
+                message = "请根据粘贴的异常界面截图定位并诊断问题。"
+            else:
+                message = "请根据本条消息的附件分析问题。"
         if not message:
             self.status_var.set("请先输入任务内容。")
             return
@@ -2896,6 +3057,7 @@ class DesktopClient:
                         path,
                         message,
                         project,
+                        **({"attachments": attachments} if attachments else {}),
                         progress_sink=self._queue_progress,
                     )
 
@@ -2921,6 +3083,7 @@ class DesktopClient:
                     return self.application.send(
                         session_id,
                         message,
+                        **({"attachments": attachments} if attachments else {}),
                         progress_sink=self._queue_progress,
                     )
 
@@ -2947,7 +3110,14 @@ class DesktopClient:
         self.prompt_input.delete("1.0", "end")
         self._pending_attachments.clear()
         self._refresh_attachment_display()
+        if self.session_id is None:
+            self._pending_history_title = message.splitlines()[0]
+            if self.history_search_var.get():
+                self.history_search_var.set("")
+            self.task_title_var.set(self._pending_history_title[:60])
+        self._history_failed = False
         self._append_optimistic_user_message(message, attachments)
+        self._update_open_histories()
         self._run_in_background(operation, "Claude Code 正在分析")
 
     def _sync_git(self) -> None:
@@ -3072,37 +3242,47 @@ class DesktopClient:
         return "break"
 
     def _choose_images(self) -> None:
-        if self.flow != FlowKind.INCIDENT or self._busy:
+        if self._busy:
             return
         paths = filedialog.askopenfilenames(
-            parent=self.root.winfo_toplevel(), title="添加异常截图",
+            parent=self.root.winfo_toplevel(), title="添加图片",
             filetypes=[("图片", "*.png *.jpg *.jpeg *.webp *.gif")],
         )
         if paths:
             self._add_images([Path(path) for path in paths])
 
+    def _choose_files(self) -> None:
+        if self._busy:
+            return
+        patterns = " ".join("*" + suffix for suffix in sorted(SUPPORTED_TEXT_SUFFIXES))
+        paths = filedialog.askopenfilenames(parent=self.root.winfo_toplevel(), title="选择文件",
+                                            filetypes=[("文本、日志和源码", patterns)])
+        if paths:
+            self._add_attachments(self.attachment_store.import_text_files,
+                                  [Path(path) for path in paths])
+
     def _on_prompt_paste(self, _event: tk.Event[tk.Misc]) -> str | None:
-        if self.flow != FlowKind.INCIDENT or self._busy:
+        if self._busy:
             return None
         return self._add_images()
 
     def _add_images(self, paths: list[Path] | None = None) -> str | None:
-        remaining = 5 - len(self._pending_attachments)
+        if paths:
+            return self._add_attachments(self.attachment_store.import_image_files, paths)
+        return self._add_attachments(self.attachment_store.capture_clipboard_images)
+
+    def _add_attachments(self, loader, *args) -> str | None:
         try:
-            images = (self.attachment_store.import_image_files(paths, remaining) if paths
-                      else self.attachment_store.capture_clipboard_images(remaining))
-        except IncidentAttachmentError as exc:
+            items = loader(*args, 5 - len(self._pending_attachments))
+        except (ValueError, OSError) as exc:
             self.status_var.set(str(exc))
             return "break"
-        except Exception as exc:
-            self.status_var.set(f"添加异常截图失败：{exc}")
-            return "break"
-        if not images:
+        if not items:
             return None
-        self._pending_attachments.extend(images)
+        self._pending_attachments.extend(items)
         self._refresh_attachment_display()
         self._hide_prompt_placeholder()
-        self.status_var.set("截图已附加，可点击缩略图查看。")
+        self.status_var.set("附件已添加。")
         return "break"
 
     def _clear_pending_attachments(self, attachment_id: str | None = None) -> None:
@@ -3117,9 +3297,9 @@ class DesktopClient:
                     logger.warning("Unable to remove draft attachment copy: %s", item.id)
         self._refresh_attachment_display()
         if self._pending_attachments:
-            self.status_var.set(f"待发送 {len(self._pending_attachments)} 张截图。")
+            self.status_var.set(f"待发送 {len(self._pending_attachments)} 个附件。")
         else:
-            self.status_var.set("待发送截图已清空。")
+            self.status_var.set("待发送附件已清空。")
             self._restore_prompt_placeholder()
 
     def _layout_attachment_tiles(self, _event=None) -> None:
@@ -3131,12 +3311,12 @@ class DesktopClient:
         for tile in self.attachment_tiles.winfo_children():
             tile.destroy()
         count = len(self._pending_attachments)
-        if not count or self.flow != FlowKind.INCIDENT:
+        if not count:
             self.attachment_status_var.set("")
             self.attachment_frame.grid_remove()
             return
-        self.attachment_status_var.set(f"{count} 张异常截图")
-        for number, item in enumerate(self._pending_attachments, 1):
+        self.attachment_status_var.set(f"待发送 · {count} 个附件")
+        for number, item in numbered_attachments(self._pending_attachments):
             AttachmentTile(self.attachment_tiles, item, number, self._clear_pending_attachments)
         self._layout_attachment_tiles()
         self.attachment_frame.grid()
@@ -3168,6 +3348,8 @@ class DesktopClient:
         target._restore_session_project(incident)
         target.flow_caption_var.set("异常处理 · 正在核对诊断并准备修复方案")
         target.task_title_var.set("异常处理：" + incident.problem[:48])
+        target._pending_history_title = target.task_title_var.get()
+        target._update_open_histories()
         source = self.incident_application
 
         def prepare():
@@ -3313,6 +3495,7 @@ class DesktopClient:
         if self._closed or self._close_after_stop:
             return
         self._task_operation = True
+        self._history_failed = False
         self._active_task_id = self.session_id
         self._analysis_generation += 1
         self._analysis_next_poll = 0.0
@@ -3346,10 +3529,16 @@ class DesktopClient:
                 if kind == "history":
                     generation, rows, error = payload
                     if generation == self._history_generation:
+                        # 读取历史期间其他会话可完成，按 ID 合并最新快照及其余历史。
+                        updates = self._history_updates or {}
+                        self._history_updates = None
                         if error:
                             self.status_var.set(f"读取历史任务失败：{error}")
                         else:
-                            self._refresh_overview(rows)
+                            self._refresh_overview([
+                                *reversed(updates.values()),
+                                *(s for s in rows if s.id not in updates),
+                            ])
                             self._filter_history()
                     continue
                 if kind == "progress":
@@ -3398,17 +3587,34 @@ class DesktopClient:
                     self.session_id = outcome.session_id
                     self._flow_session_ids[self.flow] = outcome.session_id
                     session = self._active_application().get_session(outcome.session_id)
+                    self._pending_history_title = ""
+                    self._history_failed = False
                     self._render_active_session(session)
-                    self._load_recent_sessions(select_current=True)
+                    self._update_open_histories(session)
                 else:
+                    self._history_failed = True
+                    if not self.session_id and self._active_task_id:
+                        self.session_id = self._active_task_id
+                        self._flow_session_ids[self.flow] = self.session_id
+                    if (not self.session_id and self._pending_history_title
+                            and self._transcript_entries
+                            and self._transcript_entries[-1][0] == "user"):
+                        # 创建任务前失败，草稿和附件可编辑重发，避免留下重复的已发送消息。
+                        last = len(self._transcript_entries) - 1
+                        self.prompt_input.insert("1.0", self._transcript_entries[last][1])
+                        self._pending_attachments = self._transcript_attachments.pop(last, [])
+                        self._replace_transcript(
+                            self._transcript_entries[:last],
+                            message_times=self._transcript_times[:last],
+                            attachments=self._transcript_attachments,
+                        )
+                        self._refresh_attachment_display()
+                    self._update_open_histories()
                     self.status_var.set(f"操作失败：{payload}")
                     if self._window_group[0]._visible_client is self:
                         messagebox.showerror("操作失败", str(payload), parent=self.root)
                     else:
                         self._deferred_error = str(payload)
-                    if not self.session_id and self._active_task_id:
-                        self.session_id = self._active_task_id
-                        self._flow_session_ids[self.flow] = self.session_id
                     if self.session_id:
                         try:
                             session = self._active_application().get_session(self.session_id)
@@ -3435,7 +3641,7 @@ class DesktopClient:
         if (self._analysis_dirty and self._window_group[0]._visible_client is self
                 and not self.transcript.tag_ranges("sel")):
             self._analysis_dirty = False
-            self._render_transcript()
+            self._render_transcript(progress_only=True)
         if (self._closed or not self._busy or not self._task_operation
                 or not self._active_task_id or self._analysis_poll_pending
                 or time.monotonic() < self._analysis_next_poll):
@@ -3463,6 +3669,8 @@ class DesktopClient:
 
     def _set_busy(self, busy: bool, label: str = "") -> None:
         self._busy = busy
+        if self._task_operation:
+            self._analysis_dirty = True
         if not busy:
             self._task_operation = False
             self._stop_pending = False
@@ -3528,7 +3736,10 @@ class DesktopClient:
         if self._task_operation and event.task_id:
             if self._active_task_id and self._active_task_id != event.task_id:
                 return  # 窗口只能接收本次任务的进度，不能改变停止或审批目标。
+            first_id = self._active_task_id is None
             self._active_task_id = event.task_id
+            if first_id and self._pending_history_title:
+                self._update_open_histories()
             if self._stop_when_ready:
                 self._stop_when_ready = False
                 self._request_stop()
@@ -3603,6 +3814,13 @@ class DesktopClient:
     def _apply_progress_copy(self, event: ProgressEvent) -> None:
         self._progress_event = event
         self._progress_changed_at = time.monotonic()
+        key, state = self._history_key, self._history_activity()
+        if key and state:
+            for page in self._window_group:
+                if page._history_scope() == self._history_scope() and not page._closed:
+                    page.history_indicators.states[key] = state
+                    if self._window_group[0]._visible_client is page:
+                        page.history_indicators.paint()
         self.activity_var.set(event.label)
         self.activity_detail_var.set(event.detail or "")
         self.status_var.set(event.label)
@@ -3632,6 +3850,10 @@ class DesktopClient:
                 fill="#B8C2D1",
                 state="normal",
             )
+        if self._primary_window and self._window_group:
+            # 整个工作台共享一个历史转圈时钟，仅更新可见会话的可见行。
+            visible = self._visible_client
+            visible.history_indicators.animate()
         self.root.after(80, self._animate_progress_pulse)
 
     def _set_status(self, status: AgentStatus | IncidentStatus | None) -> None:
@@ -3882,6 +4104,8 @@ class DesktopClient:
         primary = self._window_group[0]
         if self in self._window_group:
             self._window_group.remove(self)
+        if not self._primary_window and self._pending_history_title:
+            self._update_open_histories()
         self.root.destroy()
         if (not self._primary_window and not primary._close_after_stop
                 and primary._visible_client is self):
